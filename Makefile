@@ -1,22 +1,27 @@
 # GLM-OCR two-container load-test harness
 # Usage: make up  |  make smoke  |  make load-asyncio  |  ...
 
+ifeq ($(OS),Windows_NT)
+SHELL := C:/PROGRA~1/Git/bin/bash.exe
+else
 SHELL := /bin/bash
+endif
+.SHELLFLAGS := -c
 COMPOSE := docker compose
-COMPOSE_MS := docker compose -f docker-compose.yml -f docker-compose.ministack.yml
 
 CPU_URL ?= http://localhost:5002
 SGL_URL ?= http://localhost:30000
 
 .PHONY: help up down build logs ps smoke runtime runtime-full \
-        load-asyncio load-locust load-k6 \
+        omnidoc-asyncio omnidoc-locust omnidoc-k6 \
+        obs-open \
         datasets datasets-funsd datasets-omnidocbench \
-        ministack-up ministack-down register-tasks \
+        register-tasks \
         clean
 
 help:
 	@echo "Targets:"
-	@echo "  up                - build + start CPU + GPU containers (docker compose up -d)"
+	@echo "  up                - build + start CPU + GPU + Prometheus + Grafana (docker compose up -d)"
 	@echo "  down              - stop + remove containers"
 	@echo "  build             - build images only"
 	@echo "  logs              - tail compose logs"
@@ -25,11 +30,10 @@ help:
 	@echo "  runtime           - terse integrity report (env vs live process/SGLang)"
 	@echo "  runtime-full      - full runtime JSON including Prometheus metrics"
 	@echo "  datasets          - pull FUNSD + OmniDocBench into ./datasets"
-	@echo "  load-asyncio      - run aiohttp bench script"
-	@echo "  load-locust       - run locust headless for 2 minutes"
-	@echo "  load-k6           - run k6 scenario"
-	@echo "  ministack-up      - bring up CPU + GPU + ministack sidecar"
-	@echo "  ministack-down    - stop the ministack stack"
+	@echo "  omnidoc-asyncio   - OmniDocBench asyncio load test (sampled pool)"
+	@echo "  omnidoc-locust    - OmniDocBench locust load test (sampled pool)"
+	@echo "  omnidoc-k6        - OmniDocBench k6 load test (sampled pool)"
+	@echo "  obs-open          - print Prometheus + Grafana URLs"
 	@echo "  register-tasks    - register ECS task defs against \$$ECS_ENDPOINT"
 	@echo "  clean             - prune containers, volumes, loadtest results"
 
@@ -49,43 +53,38 @@ ps:
 	$(COMPOSE) ps
 
 smoke:
-	bash scripts/smoke_test.sh "$(CPU_URL)"
+	"$(SHELL)" scripts/smoke_test.sh "$(CPU_URL)"
 
 runtime:
-	CPU_URL=$(CPU_URL) MODE=summary bash scripts/runtime_probe.sh
+	CPU_URL=$(CPU_URL) MODE=summary "$(SHELL)" scripts/runtime_probe.sh
 
 runtime-full:
-	CPU_URL=$(CPU_URL) MODE=full bash scripts/runtime_probe.sh
+	CPU_URL=$(CPU_URL) MODE=full "$(SHELL)" scripts/runtime_probe.sh
 
 datasets: datasets-funsd
 
 datasets-funsd:
-	bash scripts/fetch_datasets.sh funsd
+	"$(SHELL)" scripts/fetch_datasets.sh funsd
 
 datasets-omnidocbench:
-	bash scripts/fetch_datasets.sh omnidocbench
+	"$(SHELL)" scripts/fetch_datasets.sh omnidocbench
 
-load-asyncio:
-	python loadtest/asyncio/bench.py --host $(CPU_URL) --concurrency 16 --total 128
+obs-open:
+	@echo "Prometheus : http://localhost:$${PROMETHEUS_PORT:-9090}"
+	@echo "Grafana    : http://localhost:$${GRAFANA_PORT:-3000}"
+	@echo "Dashboard  : http://localhost:$${GRAFANA_PORT:-3000}/d/glmocr-load/glm-ocr-load-test"
 
-load-locust:
-	cd loadtest/locust && \
-	  locust -f locustfile.py --headless -u 50 -r 5 -t 2m \
-	    --host $(CPU_URL) --csv ../results/locust
+omnidoc-asyncio:
+	CPU_URL=$(CPU_URL) "$(SHELL)" scripts/omnidoc_asyncio.sh
 
-load-k6:
-	k6 run loadtest/k6/ocr_load.js \
-	  -e HOST=$(CPU_URL) \
-	  --summary-export=loadtest/results/k6.json
+omnidoc-locust:
+	CPU_URL=$(CPU_URL) "$(SHELL)" scripts/omnidoc_locust.sh
 
-ministack-up:
-	$(COMPOSE_MS) up -d --build
-
-ministack-down:
-	$(COMPOSE_MS) down
+omnidoc-k6:
+	CPU_URL=$(CPU_URL) "$(SHELL)" scripts/omnidoc_k6.sh
 
 register-tasks:
-	bash aws/register-tasks.sh
+	"$(SHELL)" aws/register-tasks.sh
 
 clean:
 	$(COMPOSE) down -v
