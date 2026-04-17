@@ -22,6 +22,7 @@ services:
       SGL_MAX_TOTAL_TOKENS: ${SGL_MAX_TOTAL_TOKENS}
       SGL_MEM_FRACTION_STATIC: ${SGL_MEM_FRACTION_STATIC}
       SGL_CHUNKED_PREFILL: ${SGL_CHUNKED_PREFILL}
+      SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE}
       SGL_SCHEDULE_POLICY: ${SGL_SCHEDULE_POLICY}
       HF_TOKEN: ${HF_TOKEN}
       HF_HOME: /root/.cache/huggingface
@@ -74,11 +75,29 @@ services:
       LAYOUT_ENABLED: ${LAYOUT_ENABLED}
       LAYOUT_DEVICE: ${LAYOUT_DEVICE}
       LAYOUT_USE_POLYGON: ${LAYOUT_USE_POLYGON}
+      LAYOUT_MODEL_DIR: ${LAYOUT_MODEL_DIR:-PaddlePaddle/PP-DocLayoutV3_safetensors}
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN}
       SGLANG_HOST: ${SGLANG_HOST}
       SGLANG_PORT: ${SGLANG_PORT}
       SGLANG_SCHEME: ${SGLANG_SCHEME}
+      GLMOCR_PIPELINE_METRICS: "true"
+      # Mirror SGL batching knobs into the CPU container so runtime_app can
+      # expose them as glmocr_config_sgl_* gauges on the dashboard. These
+      # are read-only here — the actual cap is enforced by SGLang itself.
+      SGL_MAX_RUNNING_REQUESTS: ${SGL_MAX_RUNNING_REQUESTS}
+      SGL_MAX_TOTAL_TOKENS: ${SGL_MAX_TOTAL_TOKENS}
+      SGL_MAX_PREFILL_TOKENS: ${SGL_MAX_PREFILL_TOKENS}
+      SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE:-8192}
     volumes:
-      - ./loadtest/samples:/app/samples:ro
+      - ./scripts/smoke_test.png:/app/smoke_test.png:ro
+      # Share the HF cache with the sglang container so the layout model
+      # download persists across rebuilds (and doesn't get duplicated).
+      - ./hf-cache:/root/.cache/huggingface
+      # OmniDocBench (and other benchmarks) are addressable at
+      # file:///app/datasets/... from inside the container, so the
+      # load-test orchestrator can hand the drivers container-visible URLs.
+      - ./datasets:/app/datasets:ro
     depends_on:
       sglang:
         condition: service_healthy
@@ -90,6 +109,148 @@ services:
       start_period: 30s
     networks: [glmocr]
 
+  prometheus:
+    # Scrapes SGLang's /metrics and the CPU container's /metrics every 5s.
+    # Data is ephemeral — restart loses history. That's fine for a local
+    # load-test harness; Grafana dashboards are the real output.
+    image: prom/prometheus:latest
+    container_name: glmocr-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+      # Accept k6's --out experimental-prometheus-rw during load runs.
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - sglang
+      - cpu
+    networks: [glmocr]
+
+  alloy:
+    # Grafana Alloy — scrapes the same targets as the local Prometheus and
+    # remote_writes to Grafana Cloud Mimir. Only starts shipping when the
+    # three GRAFANA_CLOUD_PROM_* vars are set in .env. The local Prometheus
+    # is the source of truth for local Grafana; Alloy handles cloud egress.
+    image: grafana/alloy:latest
+    container_name: glmocr-alloy
+    restart: unless-stopped
+    ports:
+      # Alloy's built-in UI for inspecting scrape targets and remote_write
+      # queue health. Handy for debugging "why aren't my metrics in Cloud".
+      - "${ALLOY_PORT:-12345}:12345"
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --stability.level=generally-available
+      - /etc/alloy/config.alloy
+    environment:
+      - GRAFANA_CLOUD_PROM_URL=${GRAFANA_CLOUD_PROM_URL:-}
+      - GRAFANA_CLOUD_PROM_USER=${GRAFANA_CLOUD_PROM_USER:-}
+      - GRAFANA_CLOUD_PROM_TOKEN=${GRAFANA_CLOUD_PROM_TOKEN:-}
+    volumes:
+      - ./docker/alloy/config.alloy:/etc/alloy/config.alloy:ro
+    depends_on:
+      - sglang
+      - cpu
+    networks: [glmocr]
+
+  pushgateway:
+    # Short-lived jobs (the asyncio bench script) push their final stats
+    # here; Prometheus scrapes pushgateway on the usual cadence so the
+    # summary appears on the dashboard without needing the bench process
+    # to stay alive.
+    image: prom/pushgateway:latest
+    container_name: glmocr-pushgateway
+    restart: unless-stopped
+    ports:
+      - "${PUSHGATEWAY_PORT:-9091}:9091"
+    networks: [glmocr]
+
+  locust-exporter:
+    # Scrapes Locust's web API (which the orchestrator explicitly runs on
+    # the host via --web-port 8089) and exposes /metrics for Prometheus.
+    # host.docker.internal resolves to the Docker Desktop host.
+    image: containersol/locust_exporter:latest
+    container_name: glmocr-locust-exporter
+    restart: unless-stopped
+    environment:
+      LOCUST_EXPORTER_URI: http://host.docker.internal:${LOCUST_WEB_PORT:-8089}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [glmocr]
+
+  cadvisor:
+    # Per-container CPU / memory / network / disk stats. Reads the docker
+    # daemon via the mounted socket + cgroups.
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: glmocr-cadvisor
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "${CADVISOR_PORT:-8088}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [glmocr]
+
+  nvidia-gpu-exporter:
+    # NVIDIA's official DCGM exporter. Emits metrics as DCGM_FI_DEV_* —
+    # GPU util, VRAM, temperature, power, SM clocks, etc. Robust against
+    # newer driver versions that break simpler nvidia-smi wrappers.
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.5-3.4.0-ubuntu22.04
+    container_name: glmocr-gpu-exporter
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "${GPU_EXPORTER_PORT:-9835}:9400"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    networks: [glmocr]
+
+  grafana:
+    # Provisioned datasource (Prometheus) + dashboard (GLM-OCR Load Test).
+    # Annotations land in Grafana's built-in SQLite store so driver
+    # start/end markers show as vertical lines on every panel.
+    image: grafana/grafana:latest
+    container_name: glmocr-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Consumed by provisioning/datasources/prometheus.yml for the second
+      # (Grafana Cloud Mimir) datasource. Leave empty = datasource inert.
+      GRAFANA_CLOUD_PROM_URL_READ: ${GRAFANA_CLOUD_PROM_URL_READ:-}
+      GRAFANA_CLOUD_PROM_USER: ${GRAFANA_CLOUD_PROM_USER:-}
+      GRAFANA_CLOUD_PROM_TOKEN: ${GRAFANA_CLOUD_PROM_TOKEN:-}
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks: [glmocr]
+
 networks:
   glmocr:
     driver: bridge
+
+volumes:
+  grafana-data:

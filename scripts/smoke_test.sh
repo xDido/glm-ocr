@@ -4,7 +4,7 @@
 set -euo pipefail
 
 CPU_URL="${1:-${CPU_URL:-http://localhost:5002}}"
-IMAGES_JSON="${IMAGES_JSON:-{\"images\":[\"file:///app/samples/receipt.png\"]}}"
+IMAGES_JSON="${IMAGES_JSON:-{\"images\":[\"file:///app/smoke_test.png\"]}}"
 
 echo "[smoke] CPU   : ${CPU_URL}"
 echo "[smoke] body  : ${IMAGES_JSON}"
