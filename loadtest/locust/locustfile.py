@@ -5,7 +5,7 @@ Run headless:
            --host http://localhost:5002 --csv ../results/locust
 
 Env overrides:
-    LOCUST_IMAGES  - comma-separated image URLs (defaults to in-container samples)
+    LOCUST_IMAGES  - comma-separated image URLs (required; set by scripts/omnidoc_locust.sh)
 """
 from __future__ import annotations
 
@@ -16,12 +16,12 @@ from locust import HttpUser, between, events, task
 
 
 def _images() -> list[str]:
-    raw = os.environ.get(
-        "LOCUST_IMAGES",
-        "file:///app/samples/receipt.png,"
-        "file:///app/samples/table.png,"
-        "file:///app/samples/invoice.pdf",
-    )
+    raw = os.environ.get("LOCUST_IMAGES")
+    if not raw:
+        raise RuntimeError(
+            "locustfile.py: LOCUST_IMAGES env var is required. Run via "
+            "scripts/omnidoc_locust.sh, or set LOCUST_IMAGES=<csv> yourself."
+        )
     return [u.strip() for u in raw.split(",") if u.strip()]
 
 

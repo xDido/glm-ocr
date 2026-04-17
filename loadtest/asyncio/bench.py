@@ -6,8 +6,9 @@ request, prints throughput + p50/p95/p99. Lightweight, no Locust/k6
 required — good for fast concurrency sweeps while tuning SGLang batching.
 
 Examples:
-    python bench.py --host http://localhost:5002 --concurrency 16 --total 128
-    python bench.py --host http://localhost:5002 --image-url file:///app/samples/receipt.png
+    scripts/omnidoc_asyncio.sh        # full OmniDocBench run
+    python bench.py --host http://localhost:5002 --concurrency 16 --total 128 \
+        --image-url file:///app/datasets/OmniDocBench/images/<name>.jpg
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import argparse
 import asyncio
 import json
 import math
+import random
 import statistics
 import sys
 import time
@@ -38,14 +40,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--total", type=int, default=64,
                    help="total requests to send")
     p.add_argument("--image-url", action="append",
-                   help="image URL(s) sent in the request body; repeatable. "
-                        "defaults to the samples served inside the container")
+                   help="image URL(s) to sample from; repeatable. Each "
+                        "request picks one at random. Defaults to the "
+                        "samples served inside the container.")
+    p.add_argument("--image-list-file", type=Path, default=None,
+                   help="File with one image URL per line. Merged with "
+                        "--image-url. Useful when the pool is large.")
     p.add_argument("--timeout", type=float, default=300.0,
                    help="per-request timeout (s)")
     p.add_argument("--warmup", type=int, default=2,
                    help="warmup requests (excluded from stats)")
     p.add_argument("--json-out", type=Path, default=None,
                    help="write results as JSON")
+    p.add_argument("--pushgateway-url", type=str, default=None,
+                   help="Prometheus pushgateway URL (e.g. "
+                        "http://localhost:9091). When set, pushes final "
+                        "summary as glmocr_asyncio_* metrics so Grafana can "
+                        "chart them alongside server-side metrics.")
+    p.add_argument("--run-id", type=str, default="",
+                   help="Run identifier label applied to pushed metrics.")
     return p.parse_args()
 
 
@@ -76,16 +89,33 @@ async def one_call(session: aiohttp.ClientSession, url: str,
         return False, time.perf_counter() - start, 0, repr(exc)
 
 
+def _resolve_image_pool(args: argparse.Namespace) -> list[str]:
+    pool: list[str] = list(args.image_url or [])
+    if args.image_list_file:
+        with args.image_list_file.open("r", encoding="utf-8") as fh:
+            pool.extend(line.strip() for line in fh if line.strip()
+                        and not line.lstrip().startswith("#"))
+    if not pool:
+        sys.stderr.write(
+            "bench.py: no image pool — pass --image-url or --image-list-file, "
+            "or run via scripts/omnidoc_asyncio.sh\n"
+        )
+        sys.exit(2)
+    return pool
+
+
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     url = args.host.rstrip("/") + args.endpoint
-    images = args.image_url or ["file:///app/samples/receipt.png"]
-    body = {"images": images}
+    pool = _resolve_image_pool(args)
 
     sem = asyncio.Semaphore(args.concurrency)
     results: list[tuple[bool, float, int, str | None]] = []
 
     async with aiohttp.ClientSession() as session:
         async def worker(_i: int) -> None:
+            # Each request independently samples one image from the pool;
+            # same URL when pool size == 1, random otherwise.
+            body = {"images": [random.choice(pool)]}
             async with sem:
                 results.append(await one_call(session, url, body, args.timeout))
 
@@ -94,7 +124,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             await asyncio.gather(*[worker(-1) for _ in range(args.warmup)])
             results.clear()
 
-        print(f"[bench] host={args.host} total={args.total} concurrency={args.concurrency}")
+        print(f"[bench] host={args.host} total={args.total} "
+              f"concurrency={args.concurrency} pool_size={len(pool)}")
         wall_start = time.perf_counter()
         await asyncio.gather(*[worker(i) for i in range(args.total)])
         wall = time.perf_counter() - wall_start
@@ -144,6 +175,56 @@ def print_summary(s: dict[str, Any]) -> None:
     print("=" * 60)
 
 
+def push_to_pushgateway(url: str, run_id: str, summary: dict[str, Any]) -> None:
+    """Push final summary as glmocr_asyncio_* metrics to Prometheus
+    Pushgateway. Silently no-op if prometheus_client isn't installed."""
+    try:
+        from prometheus_client import (  # type: ignore
+            CollectorRegistry, Gauge, push_to_gateway,
+        )
+    except ImportError:
+        print("[bench] prometheus_client not installed; skipping pushgateway "
+              "(pip install prometheus-client to enable)",
+              file=sys.stderr)
+        return
+
+    registry = CollectorRegistry()
+    common_labels = ["run_id"]
+    label_values = [run_id or ""]
+
+    flat = {
+        "throughput_rps":  summary.get("throughput_rps", 0.0),
+        "successes":       summary.get("successes", 0),
+        "failures":        summary.get("failures", 0),
+        "concurrency":     summary.get("concurrency", 0),
+        "wall_seconds":    summary.get("wall_seconds", 0.0),
+        "latency_p50_ms":  summary["latency_ms"].get("p50", 0.0),
+        "latency_p90_ms":  summary["latency_ms"].get("p90", 0.0),
+        "latency_p95_ms":  summary["latency_ms"].get("p95", 0.0),
+        "latency_p99_ms":  summary["latency_ms"].get("p99", 0.0),
+        "latency_mean_ms": summary["latency_ms"].get("mean", 0.0),
+        "latency_max_ms":  summary["latency_ms"].get("max", 0.0),
+    }
+    for name, value in flat.items():
+        try:
+            fval = float(value) if value == value else 0.0  # NaN guard
+        except (TypeError, ValueError):
+            continue
+        g = Gauge(
+            f"glmocr_asyncio_{name}",
+            f"asyncio bench: {name}",
+            labelnames=common_labels,
+            registry=registry,
+        )
+        g.labels(*label_values).set(fval)
+
+    try:
+        push_to_gateway(url, job="glmocr_asyncio", registry=registry)
+        print(f"[bench] pushed summary to {url}")
+    except Exception as exc:  # pragma: no cover
+        print(f"[bench] pushgateway push failed: {exc!r}", file=sys.stderr)
+
+
 def main() -> int:
     args = parse_args()
     summary = asyncio.run(run(args))
@@ -152,6 +233,8 @@ def main() -> int:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(summary, indent=2))
         print(f"[bench] wrote {args.json_out}")
+    if args.pushgateway_url:
+        push_to_pushgateway(args.pushgateway_url, args.run_id, summary)
     return 0 if summary["failures"] == 0 else 1
 
 
