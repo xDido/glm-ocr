@@ -9,8 +9,6 @@ deploying to AWS ECS.
   for every region — no model weights live here.
 - **GPU container** — `lmsysorg/sglang` serving `zai-org/GLM-OCR` on an
   OpenAI-compatible `/v1/chat/completions` endpoint.
-- **ministack overlay** — local AWS emulator. Register the shipped ECS task
-  definitions against it to validate wiring before real AWS.
 - **Load tests** — Locust (UI + CSV), k6 (thresholds), asyncio (fast sweep).
 
 ```
@@ -32,7 +30,7 @@ make up                   # builds CPU image + starts CPU + GPU; first GPU boot
 make logs                 # tail until you see SGLang "server is fired up"
 make smoke                # end-to-end OCR on a sample image
 make runtime              # integrity check: env vs live process + SGLang state
-make load-asyncio         # fast concurrency sweep
+make omnidoc-asyncio      # fast concurrency sweep
 ```
 
 The GPU service runs `lmsysorg/sglang:${SGL_IMAGE_TAG}` (default `latest`)
@@ -129,30 +127,22 @@ Datasets land in `./datasets/` (git-ignored). The model weights land in
 
 ## Load tests
 
-```bash
-make load-asyncio     # python loadtest/asyncio/bench.py --concurrency 16 --total 128
-make load-locust      # locust headless, 50 users, 5/s ramp, 2 minutes
-make load-k6          # k6 ramping VUs with p95 threshold
-```
-
-Results land in `loadtest/results/`. The asyncio script prints p50/p95/p99
-directly. Sweep `OCR_MAX_WORKERS × SGL_MAX_RUNNING_REQUESTS` to build the
-sizing table for ECS.
-
-## ministack / ECS wiring test
+All load tests sample from OmniDocBench. Run `make datasets-omnidocbench`
+once before the first run.
 
 ```bash
-make ministack-up     # adds ministack sidecar on :4566
-make register-tasks   # registers ecs-task-{cpu,gpu}.json + Cloud Map services
-aws --endpoint-url http://localhost:4566 --region us-east-1 \
-    ecs list-task-definitions
+make omnidoc-asyncio      # aiohttp bench; pushes summary to Pushgateway
+make omnidoc-locust       # locust headless, 50 users / 5-ramp, scraped by locust_exporter
+make omnidoc-k6           # k6; remote-writes metrics to Prometheus
 ```
 
-**Caveat**: ministack accepts the GPU `resourceRequirements` in the task def
-but has no way to schedule onto a real NVIDIA host. Expect
-`DESIRED=1 / RUNNING=0` for the GPU service. ministack here validates API
-shape and service-discovery wiring; **workload** tests go through plain
-`docker compose` above.
+Each script samples `OMNIDOC_SAMPLE_POOL` images (default 64) and runs
+for `OMNIDOC_DURATION` seconds (default 120). Results land under
+`loadtest/results/omnidoc-<timestamp>-<driver>.*`. Grafana annotations
+mark each driver's start and end on the "GLM-OCR Load Test" dashboard.
+
+Sweep `OCR_MAX_WORKERS × SGL_MAX_RUNNING_REQUESTS` to build the sizing
+table for ECS.
 
 ## Windows + NVIDIA Docker notes
 
@@ -171,5 +161,5 @@ The repo targets Windows 10 + Docker Desktop. Before `make up`:
   upstream `lmsysorg/sglang` image; the sibling `Dockerfile` is kept only for
   environments that can't bind-mount)
 - `aws/` — ECS task definitions + registration script
-- `loadtest/` — Locust, k6, asyncio bench; samples; results
-- `scripts/` — smoke test, wait-for, ministack bootstrap
+- `loadtest/` — Locust, k6, asyncio bench; results
+- `scripts/` — smoke test, wait-for, dataset fetcher
