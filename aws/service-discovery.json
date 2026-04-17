@@ -1,0 +1,32 @@
+{
+  "namespace": {
+    "Name": "glmocr.local",
+    "Description": "Service discovery for GLM-OCR CPU + GPU containers"
+  },
+  "services": [
+    {
+      "Name": "sglang",
+      "Description": "GPU SGLang inference service",
+      "DnsConfig": {
+        "NamespaceId": "${NAMESPACE_ID}",
+        "DnsRecords": [
+          {"Type": "A", "TTL": 10}
+        ],
+        "RoutingPolicy": "MULTIVALUE"
+      },
+      "HealthCheckCustomConfig": {"FailureThreshold": 1}
+    },
+    {
+      "Name": "cpu",
+      "Description": "CPU glmocr preprocessing service",
+      "DnsConfig": {
+        "NamespaceId": "${NAMESPACE_ID}",
+        "DnsRecords": [
+          {"Type": "A", "TTL": 10}
+        ],
+        "RoutingPolicy": "MULTIVALUE"
+      },
+      "HealthCheckCustomConfig": {"FailureThreshold": 1}
+    }
+  ]
+}

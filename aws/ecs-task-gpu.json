@@ -1,0 +1,86 @@
+{
+  "family": "glmocr-gpu",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["EC2"],
+  "cpu": "8192",
+  "memory": "32768",
+  "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+  "taskRoleArn": "${TASK_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "glmocr-sglang",
+      "image": "${GPU_IMAGE_URI}",
+      "essential": true,
+      "resourceRequirements": [
+        {"type": "GPU", "value": "1"}
+      ],
+      "portMappings": [
+        {"containerPort": 30000, "hostPort": 30000, "protocol": "tcp", "name": "sglang"}
+      ],
+      "command": [
+        "python3", "-m", "sglang.launch_server",
+        "--model-path",            "${SGL_MODEL_PATH}",
+        "--served-model-name",     "${SGL_SERVED_MODEL_NAME}",
+        "--host",                  "0.0.0.0",
+        "--port",                  "30000",
+        "--tp-size",               "${SGL_TP_SIZE}",
+        "--dtype",                 "${SGL_DTYPE}",
+        "--trust-remote-code",
+        "--enable-metrics",
+        "--max-running-requests",  "${SGL_MAX_RUNNING_REQUESTS}",
+        "--max-prefill-tokens",    "${SGL_MAX_PREFILL_TOKENS}",
+        "--max-total-tokens",      "${SGL_MAX_TOTAL_TOKENS}",
+        "--mem-fraction-static",   "${SGL_MEM_FRACTION_STATIC}",
+        "--schedule-policy",       "${SGL_SCHEDULE_POLICY}"
+      ],
+      "linuxParameters": {
+        "sharedMemorySize": 32768
+      },
+      "ulimits": [
+        {"name": "memlock", "softLimit": -1, "hardLimit": -1},
+        {"name": "stack",   "softLimit": 67108864, "hardLimit": 67108864}
+      ],
+      "environment": [
+        {"name": "SGL_MODEL_PATH",           "value": "${SGL_MODEL_PATH}"},
+        {"name": "SGL_SERVED_MODEL_NAME",    "value": "${SGL_SERVED_MODEL_NAME}"},
+        {"name": "SGL_TP_SIZE",              "value": "${SGL_TP_SIZE}"},
+        {"name": "SGL_DTYPE",                "value": "${SGL_DTYPE}"},
+        {"name": "SGL_MAX_RUNNING_REQUESTS", "value": "${SGL_MAX_RUNNING_REQUESTS}"},
+        {"name": "SGL_MAX_PREFILL_TOKENS",   "value": "${SGL_MAX_PREFILL_TOKENS}"},
+        {"name": "SGL_MAX_TOTAL_TOKENS",     "value": "${SGL_MAX_TOTAL_TOKENS}"},
+        {"name": "SGL_MEM_FRACTION_STATIC",  "value": "${SGL_MEM_FRACTION_STATIC}"},
+        {"name": "SGL_CHUNKED_PREFILL",      "value": "${SGL_CHUNKED_PREFILL}"},
+        {"name": "SGL_SCHEDULE_POLICY",      "value": "${SGL_SCHEDULE_POLICY}"},
+        {"name": "HF_HOME",                  "value": "/root/.cache/huggingface"}
+      ],
+      "secrets": [
+        {"name": "HF_TOKEN", "valueFrom": "${HF_TOKEN_SECRET_ARN}"}
+      ],
+      "mountPoints": [
+        {"sourceVolume": "hf-cache", "containerPath": "/root/.cache/huggingface"}
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:30000/health || exit 1"],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 40,
+        "startPeriod": 600
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/glmocr-gpu",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "glmocr-gpu",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "hf-cache",
+      "host": {"sourcePath": "/var/lib/ecs/hf-cache"}
+    }
+  ]
+}

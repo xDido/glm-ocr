@@ -1,0 +1,20 @@
+services:
+
+  ministack:
+    image: ministack/ministack:latest
+    container_name: glmocr-ministack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"
+      - "4510-4559:4510-4559"
+    environment:
+      SERVICES: "ecs,ec2,iam,logs,servicediscovery,cloudmap,ssm,secretsmanager"
+      DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      DEBUG: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ministack-data:/var/lib/ministack
+    networks: [glmocr]
+
+volumes:
+  ministack-data:

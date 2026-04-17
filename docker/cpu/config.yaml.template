@@ -1,0 +1,36 @@
+server:
+  host: 0.0.0.0
+  port: ${GLMOCR_PORT}
+  debug: false
+
+logging:
+  level: INFO
+
+pipeline:
+  maas:
+    enabled: false
+
+  ocr_api:
+    api_scheme: ${SGLANG_SCHEME}
+    api_host: ${SGLANG_HOST}
+    api_port: ${SGLANG_PORT}
+    api_path: /v1/chat/completions
+    api_mode: openai
+    model: ${OCR_MODEL_NAME}
+
+    connect_timeout: ${OCR_CONNECT_TIMEOUT}
+    request_timeout: ${OCR_REQUEST_TIMEOUT}
+
+    retry_max_attempts: ${OCR_RETRY_MAX}
+    retry_backoff_base_seconds: ${OCR_RETRY_BACKOFF_BASE}
+    retry_backoff_max_seconds: ${OCR_RETRY_BACKOFF_MAX}
+    retry_status_codes: [429, 500, 502, 503, 504]
+
+    connection_pool_size: ${OCR_CONN_POOL}
+    ssl_verify: false
+
+  max_workers: ${OCR_MAX_WORKERS}
+
+  layout:
+    device: ${LAYOUT_DEVICE}
+    use_polygon: ${LAYOUT_USE_POLYGON}

@@ -1,0 +1,17 @@
+.env
+hf-cache/*
+!hf-cache/.gitkeep
+datasets/*
+!datasets/.gitkeep
+loadtest/results/*
+!loadtest/results/.gitkeep
+loadtest/samples/*
+!loadtest/samples/.gitkeep
+!loadtest/samples/README.md
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+*.log
+node_modules/

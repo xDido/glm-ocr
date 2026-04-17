@@ -1,0 +1,95 @@
+services:
+
+  sglang:
+    # Official lmsysorg/sglang image, used directly — no local build step.
+    # Pull once via Docker Desktop (or `docker pull lmsysorg/sglang:latest`)
+    # and compose just runs it.
+    image: lmsysorg/sglang:${SGL_IMAGE_TAG:-latest}
+    container_name: glmocr-sglang
+    restart: unless-stopped
+    ports:
+      - "${SGL_PORT:-30000}:30000"
+    # Bind-mounted entrypoint. `bash` explicitly so we don't rely on the exec
+    # bit surviving a Windows/WSL2 bind-mount.
+    entrypoint: ["bash", "/glm-ocr-entrypoint.sh"]
+    environment:
+      SGL_MODEL_PATH: ${SGL_MODEL_PATH}
+      SGL_SERVED_MODEL_NAME: ${SGL_SERVED_MODEL_NAME}
+      SGL_TP_SIZE: ${SGL_TP_SIZE}
+      SGL_DTYPE: ${SGL_DTYPE}
+      SGL_MAX_RUNNING_REQUESTS: ${SGL_MAX_RUNNING_REQUESTS}
+      SGL_MAX_PREFILL_TOKENS: ${SGL_MAX_PREFILL_TOKENS}
+      SGL_MAX_TOTAL_TOKENS: ${SGL_MAX_TOTAL_TOKENS}
+      SGL_MEM_FRACTION_STATIC: ${SGL_MEM_FRACTION_STATIC}
+      SGL_CHUNKED_PREFILL: ${SGL_CHUNKED_PREFILL}
+      SGL_SCHEDULE_POLICY: ${SGL_SCHEDULE_POLICY}
+      HF_TOKEN: ${HF_TOKEN}
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ./docker/gpu/entrypoint.sh:/glm-ocr-entrypoint.sh:ro
+      # Bind-mount the model cache INSIDE the repo so weights land next to the
+      # code and survive `docker compose down`. First boot downloads ~1.8 GB.
+      - ./hf-cache:/root/.cache/huggingface
+    shm_size: "32gb"
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:30000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 600s
+    networks: [glmocr]
+
+  cpu:
+    build:
+      context: ./docker/cpu
+    image: glmocr-cpu:local
+    container_name: glmocr-cpu
+    restart: unless-stopped
+    ports:
+      - "${GLMOCR_PORT:-5002}:5002"
+    environment:
+      CPU_WORKERS: ${CPU_WORKERS}
+      CPU_THREADS: ${CPU_THREADS}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT}
+      GLMOCR_PORT: "5002"
+      OCR_MAX_WORKERS: ${OCR_MAX_WORKERS}
+      OCR_CONNECT_TIMEOUT: ${OCR_CONNECT_TIMEOUT}
+      OCR_REQUEST_TIMEOUT: ${OCR_REQUEST_TIMEOUT}
+      OCR_RETRY_MAX: ${OCR_RETRY_MAX}
+      OCR_RETRY_BACKOFF_BASE: ${OCR_RETRY_BACKOFF_BASE}
+      OCR_RETRY_BACKOFF_MAX: ${OCR_RETRY_BACKOFF_MAX}
+      OCR_CONN_POOL: ${OCR_CONN_POOL}
+      OCR_MODEL_NAME: ${OCR_MODEL_NAME}
+      LAYOUT_ENABLED: ${LAYOUT_ENABLED}
+      LAYOUT_DEVICE: ${LAYOUT_DEVICE}
+      LAYOUT_USE_POLYGON: ${LAYOUT_USE_POLYGON}
+      SGLANG_HOST: ${SGLANG_HOST}
+      SGLANG_PORT: ${SGLANG_PORT}
+      SGLANG_SCHEME: ${SGLANG_SCHEME}
+    volumes:
+      - ./loadtest/samples:/app/samples:ro
+    depends_on:
+      sglang:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5002/health || curl -fsS -o /dev/null http://localhost:5002/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [glmocr]
+
+networks:
+  glmocr:
+    driver: bridge
