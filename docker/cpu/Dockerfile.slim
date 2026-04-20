@@ -40,13 +40,22 @@ RUN pip install \
 
 # Now install glmocr and friends. pip sees torch is already satisfied and
 # skips the CUDA-inclusive wheel.
+# onnxruntime + onnx + onnxscript power the optional LAYOUT_BACKEND=onnx
+# path — a raw torch.onnx.export of PP-DocLayoutV3 gives ~1.76× on CPU
+# vs eager torch. We avoid `optimum` because it pins transformers<5 while
+# glmocr needs 5.5.4 for the `pp_doclayout_v3` model type.
 RUN pip install \
       "glmocr[selfhosted,server]" \
       "gunicorn>=21.2,<23" \
       "psutil>=5.9" \
       "pyyaml>=6" \
       "prometheus-flask-exporter>=0.23" \
-      "prometheus-client>=0.19"
+      "prometheus-client>=0.19" \
+      "onnxruntime>=1.18" \
+      "onnx>=1.16" \
+      "onnxscript>=0.1"
+
+COPY export_layout_onnx.py /app/export_layout_onnx.py
 
 COPY wsgi.py /app/wsgi.py
 COPY runtime_app.py /app/runtime_app.py

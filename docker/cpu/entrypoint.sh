@@ -6,6 +6,7 @@ set -euo pipefail
 : "${CPU_THREADS:=8}"
 : "${GUNICORN_TIMEOUT:=180}"
 : "${LAYOUT_ENABLED:=true}"
+: "${LAYOUT_BACKEND:=torch}"
 
 # Render the config. Two template variants let us toggle layout detection
 # without carrying an awkward conditional inside the YAML.
@@ -22,6 +23,13 @@ echo "[entrypoint] rendered /app/config.yaml:"
 sed 's/^/  | /' /app/config.yaml
 
 export GLMOCR_CONFIG=/app/config.yaml
+
+# Optional: export the layout model to ONNX on first boot. Idempotent — the
+# script skips if the target already exists in the HF cache volume.
+if [[ "${LAYOUT_ENABLED,,}" == "true" && "${LAYOUT_BACKEND,,}" == "onnx" ]]; then
+    echo "[entrypoint] LAYOUT_BACKEND=onnx -> running export (idempotent)"
+    python /app/export_layout_onnx.py
+fi
 
 # Multi-worker Prometheus metrics need a shared tmpfs-style dir. Wipe it on
 # start so stale dead-worker values from previous boots don't pollute the

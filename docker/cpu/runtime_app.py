@@ -451,6 +451,97 @@ def instrument_pipeline(pipeline) -> None:
     # in this benchmark anyway.
     ld = getattr(pipeline, "layout_detector", None)
     if ld is not None and hasattr(ld, "process"):
+        # Optional ONNX Runtime backend. Swaps ld._model with a thin wrapper
+        # that runs the same forward via an onnxruntime InferenceSession.
+        # The export (docker/cpu/export_layout_onnx.py, triggered from the
+        # entrypoint) produces a file at:
+        #   ${HF_HOME}/glmocr-layout-onnx/pp_doclayout_v3.onnx
+        # Measured ~1.76× vs eager torch on single-threaded CPU. We pin
+        # intra_op_num_threads=1 to match the production OMP/MKL throttle
+        # so concurrent workers don't oversubscribe cores.
+        if os.environ.get("LAYOUT_BACKEND", "torch").lower() == "onnx":
+            try:
+                import onnxruntime as _ort
+                from types import SimpleNamespace as _SNS
+                import torch as _torch
+
+                hf_home = (os.environ.get("HF_HOME")
+                           or "/root/.cache/huggingface")
+                onnx_path = os.path.join(
+                    hf_home, "glmocr-layout-onnx", "pp_doclayout_v3.onnx",
+                )
+                if not os.path.exists(onnx_path):
+                    raise FileNotFoundError(
+                        f"ONNX graph missing at {onnx_path}; "
+                        "entrypoint should have produced it"
+                    )
+
+                ort_opts = _ort.SessionOptions()
+                ort_opts.intra_op_num_threads = int(
+                    os.environ.get("LAYOUT_ONNX_THREADS", "1")
+                )
+                _sess = _ort.InferenceSession(
+                    onnx_path, ort_opts, providers=["CPUExecutionProvider"],
+                )
+                _orig_model = ld._model
+                _orig_config = getattr(_orig_model, "config", None)
+
+                class _OnnxLayoutModel:
+                    """Drop-in replacement for PPDocLayoutV3ForObjectDetection.
+
+                    glmocr calls `self._model(**inputs)` then reads
+                    `out.logits` + `out.pred_boxes` from the returned HF
+                    output object; a `SimpleNamespace` with those fields
+                    is sufficient. We keep `.config` pointing at the
+                    original model's config so `id2label` lookups still
+                    work unchanged.
+                    """
+
+                    config = _orig_config
+
+                    def __call__(self, pixel_values=None, **_kw):
+                        # onnxruntime needs a contiguous float32 numpy
+                        # array; the processor already provides that.
+                        np_in = pixel_values.detach().cpu().numpy()
+                        logits, pred_boxes, order_logits, out_masks, last_hs = (
+                            _sess.run(None, {"pixel_values": np_in})
+                        )
+                        return _SNS(
+                            logits=_torch.from_numpy(logits),
+                            pred_boxes=_torch.from_numpy(pred_boxes),
+                            order_logits=_torch.from_numpy(order_logits),
+                            out_masks=_torch.from_numpy(out_masks),
+                            last_hidden_state=_torch.from_numpy(last_hs),
+                        )
+
+                    def to(self, _device):
+                        return self  # ORT manages its own threading/device
+
+                    def eval(self):
+                        return self
+
+                ld._model = _OnnxLayoutModel()
+                # Drop the last reference to the torch model so its ~600 MB
+                # of fp32 weight tensors can be freed back to torch's
+                # allocator. Without this, each gunicorn worker keeps two
+                # full copies of the weights (torch eager + ORT session)
+                # resident for the container's lifetime.
+                del _orig_model
+                import gc as _gc
+                _gc.collect()
+                print(
+                    f"[layout] onnxruntime backend enabled "
+                    f"(path={onnx_path}, intra_op={ort_opts.intra_op_num_threads}); "
+                    f"torch model weights released",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[layout] onnxruntime backend unavailable, "
+                    f"falling back to torch: {e}",
+                    flush=True,
+                )
+
         # Optional torch.compile on the underlying HF model. PP-DocLayoutV3
         # takes ~9s/page on CPU and is the single dominant phase; compile
         # typically yields 1.2–1.5× on CPU transformer detectors. First

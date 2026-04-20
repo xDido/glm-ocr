@@ -1031,34 +1031,112 @@ def _render_stage_b(args, trials, plt, png_dir, now,
 """
 
 
+def _render_stage_c_bar_panels(plt, c_trials: list[dict],
+                               png_dir: pathlib.Path) -> dict[str, str]:
+    """Stage-G-style panels adapted for a 1-D c-sweep. One PNG per
+    metric with one bar per concurrency cell, labelled with the value.
+    Mirrors `_render_stage_g_heatmaps` visually but is a simple bar
+    chart since only `c` varies."""
+    if not c_trials:
+        return {}
+    cs = sorted({int(t["summary"].get("concurrency", 0) or 0) for t in c_trials})
+    by_c = {
+        int(t["summary"].get("concurrency", 0) or 0): t for t in c_trials
+    }
+    rel: dict[str, str] = {}
+    for metric_name, fn, fmt, color in [
+        ("rps", _trial_rps, "{:.2f}", "#2a9d8f"),
+        ("p99 ms", _trial_p99, "{:.0f}", "#e76f51"),
+        ("fail%", _trial_fail_rate, "{:.0%}", "#f4a261"),
+    ]:
+        values = [fn(by_c[c]) for c in cs]
+        fig, ax = plt.subplots(figsize=(max(4, len(cs) * 1.2 + 2), 3.2))
+        bars = ax.bar([str(c) for c in cs], values, color=color)
+        for bar, v in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height(),
+                    fmt.format(v),
+                    ha="center", va="bottom", fontsize=10)
+        ax.set_xlabel("concurrency")
+        ax.set_title(f"Stage C — {metric_name}")
+        ax.margins(y=0.15)
+        fig.tight_layout()
+        safe = metric_name.replace(" ", "_").replace("%", "pct")
+        out_png = png_dir / f"stage-c-{safe}.png"
+        fig.savefig(out_png, dpi=120)
+        plt.close(fig)
+        rel[metric_name] = out_png.name
+    return rel
+
+
 def _render_stage_c(args, trials, plt, png_dir, now,
                     resource_png, resource_table) -> str:
     c_trials = [t for t in trials if t.get("kind", "").startswith("stage-c")]
-    fixed = c_trials[0]["knobs"] if c_trials else {}
+    # Strip non-knob metadata before rendering "Fixed config" so the
+    # cell-varying fields (concurrency, bottleneck) don't clutter it.
+    fixed_raw = dict(c_trials[0]["knobs"]) if c_trials else {}
+    for ephemeral in ("concurrency", "bottleneck", "endpoint"):
+        fixed_raw.pop(ephemeral, None)
 
-    chart_section = ""
+    # Heatmap-equivalent panels (1-D bar charts): rps / p99 / fail%.
+    panels_section = ""
+    if plt is not None and c_trials:
+        rels = _render_stage_c_bar_panels(plt, c_trials, png_dir)
+        panels_section = "\n\n".join(
+            f"### {name}\n\n![{name}]({png_dir.name}/{p})"
+            for name, p in rels.items()
+        )
+
+    # Legacy c-curve line chart (rps + p99 vs c on twin axes). Useful
+    # alongside the bar panels when the sweep has many points.
+    curve_section = ""
     if plt is not None and c_trials:
         rel = _render_stage_c_chart(plt, c_trials, png_dir)
-        chart_section = f"![c-curve]({png_dir.name}/{rel})"
+        curve_section = f"![c-curve]({png_dir.name}/{rel})"
 
+    # Rich grid mirroring stage-g / stage-e: utilization + bottleneck +
+    # SLO verdict. Data comes from `summary.utilization` and
+    # `summary.bottleneck` which stage_c attaches per cell.
     rows = [
-        "| c | ok | fail | fail% | rps | p50 ms | p95 ms | p99 ms | mean ms | wall s | rps·mean/c |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| # | c | ok | fail | fail% | rps | p50 | p95 | p99 | mean ms | wall s | GPU% | VRAM% | batch% | SLO | bottleneck |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
-    for t in c_trials:
+    slo_winners = []
+    for i, t in enumerate(c_trials, 1):
         s = t["summary"]
-        c = int(s.get("concurrency", 0)) or 1
-        mean_s = _trial_mean(t) / 1000.0
-        little = (_trial_rps(t) * mean_s) / c if c else float("nan")
+        util = s.get("utilization") or {}
+        c = int(s.get("concurrency", 0)) or int(t.get("knobs", {}).get("concurrency", 0))
+        slo_ok = _trial_meets_slo(t)
+        if slo_ok:
+            slo_winners.append((i, t))
         rows.append(
-            f"| {c} | {s.get('successes', 0)} | {s.get('failures', 0)} | "
+            f"| {i} | {c} | {s.get('successes', 0)} | {s.get('failures', 0)} | "
             f"{_trial_fail_rate(t):.0%} | {_trial_rps(t):.3f} | "
             f"{_trial_p50(t):.0f} | {_trial_p95(t):.0f} | {_trial_p99(t):.0f} | "
-            f"{_trial_mean(t):.0f} | {_trial_wall(t):.1f} | {little:.2f} |"
+            f"{_trial_mean(t):.0f} | {_trial_wall(t):.1f} | "
+            f"{util.get('gpu_compute', 0) * 100:.0f} | "
+            f"{util.get('gpu_memory', 0) * 100:.0f} | "
+            f"{util.get('sgl_batch', 0) * 100:.0f} | "
+            f"{'✅' if slo_ok else '❌'} | {s.get('bottleneck', '-')} |"
         )
     table_md = "\n".join(rows)
 
-    fixed_md = "\n".join(f"- `{k}` = `{v}`" for k, v in fixed.items()) or "_(none)_"
+    # Winner: SLO-compliant cell with highest rps.
+    winner_md = "_(no SLO-compliant cell)_"
+    if slo_winners:
+        wi, wt = max(slo_winners, key=lambda x: _trial_rps(x[1]))
+        ws = wt["summary"]
+        wc = int(ws.get("concurrency", 0)) or int(wt.get("knobs", {}).get("concurrency", 0))
+        wu = ws.get("utilization") or {}
+        winner_md = (
+            f"**Cell {wi}** — `concurrency={wc}` — "
+            f"rps={_trial_rps(wt):.3f}, p99={_trial_p99(wt):.0f}ms, "
+            f"mean={_trial_mean(wt):.0f}ms, fail={_trial_fail_rate(wt):.0%}, "
+            f"GPU%={wu.get('gpu_compute', 0) * 100:.0f}, "
+            f"VRAM%={wu.get('gpu_memory', 0) * 100:.0f}."
+        )
+
+    fixed_md = "\n".join(f"- `{k}` = `{v}`" for k, v in fixed_raw.items()) or "_(baseline env)_"
 
     resource_md = ""
     if resource_table:
@@ -1069,7 +1147,13 @@ def _render_stage_c(args, trials, plt, png_dir, now,
     return f"""# GLM-OCR stage-C c-curve — {args.run_id}
 
 **Completed:** {now}  \\
-**Source:** `{args.trials}`
+**Source:** `{args.trials}`  \\
+**Shape:** {len(c_trials)} cells  \\
+**Axes:** `c`
+
+## Winner
+
+{winner_md}
 
 ## Fixed config
 
@@ -1079,16 +1163,30 @@ def _render_stage_c(args, trials, plt, png_dir, now,
 
 {_knob_glossary_md()}
 
-## Curve
+## Panels
 
-{chart_section or "_(matplotlib unavailable — see table below)_"}
+{panels_section or "_(matplotlib unavailable — see grid table below)_"}
+
+## Grid
 
 {table_md}
 
-The **rps·mean/c** column is the Little's-Law sanity check: for a
-saturated, steady-state system it should be ≈ 1.0. Large deviations mean
-the sample was not steady-state — usually a single slow document
-skewed the wall (see v1 report's discrepancy section).
+## Curve
+
+{curve_section or "_(matplotlib unavailable — see table above)_"}
+
+The classic c-curve view: throughput (rps, left axis) and tail
+latency (p99, right axis) plotted against concurrency. The knee is
+where p99 starts rising faster than rps — past that point, adding
+concurrency only grows the queue without adding throughput.
+
+## How to read
+
+- **rps** is the production-throughput metric. Higher = more docs/sec per replica.
+- **p99** / **mean** show latency tail vs typical. p99 ≤ 120s is the SLO.
+- **batch%** is SGLang's continuous-batching fill rate = running_reqs / cap. Low batch% doesn't necessarily mean bad throughput — spec decoding compresses time each slot spends running.
+- **VRAM%** near 80–95% = KV cache is at capacity. This is normal on 8 GB hardware.
+- **SLO ✅** = p99 ≤ 120s AND fail ≤ 10% AND not aborted.
 {resource_md}
 ## Observability pointers
 

@@ -22,7 +22,7 @@ services:
       SGL_MAX_TOTAL_TOKENS: ${SGL_MAX_TOTAL_TOKENS}
       SGL_MEM_FRACTION_STATIC: ${SGL_MEM_FRACTION_STATIC}
       SGL_CHUNKED_PREFILL: ${SGL_CHUNKED_PREFILL}
-      SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE}
+      SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE:-8192}
       SGL_SCHEDULE_POLICY: ${SGL_SCHEDULE_POLICY}
       SGL_SPECULATIVE: ${SGL_SPECULATIVE:-}
       SGL_SPEC_ALGORITHM: ${SGL_SPEC_ALGORITHM:-}
@@ -93,6 +93,8 @@ services:
       LAYOUT_DEVICE: ${LAYOUT_DEVICE}
       LAYOUT_USE_POLYGON: ${LAYOUT_USE_POLYGON}
       LAYOUT_MODEL_DIR: ${LAYOUT_MODEL_DIR:-PaddlePaddle/PP-DocLayoutV3_safetensors}
+      LAYOUT_BACKEND: ${LAYOUT_BACKEND:-torch}
+      LAYOUT_ONNX_THREADS: ${LAYOUT_ONNX_THREADS:-1}
       LAYOUT_COMPILE: ${LAYOUT_COMPILE:-false}
       LAYOUT_BATCH_ENABLED: ${LAYOUT_BATCH_ENABLED:-false}
       LAYOUT_BATCH_MAX: ${LAYOUT_BATCH_MAX:-4}
@@ -132,7 +134,7 @@ services:
         # moves back to cuda on a 16 GB+ target.
         limits:
           cpus: "8"
-          memory: 20G
+          memory: 24G
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5002/health || curl -fsS -o /dev/null http://localhost:5002/ || exit 1"]
       interval: 10s
