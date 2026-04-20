@@ -32,5 +32,7 @@ pipeline:
   max_workers: ${OCR_MAX_WORKERS}
 
   layout:
+    # HF model id or local dir. Required — glmocr validates this at start().
+    model_dir: ${LAYOUT_MODEL_DIR}
     device: ${LAYOUT_DEVICE}
     use_polygon: ${LAYOUT_USE_POLYGON}

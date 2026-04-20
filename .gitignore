@@ -12,3 +12,10 @@ __pycache__/
 .vscode/
 *.log
 node_modules/
+
+# MCP server config contains Grafana Cloud token
+.mcp.json
+
+# Claude Code session state + ephemeral fetch dir
+.claude/
+.tmp_fetch/

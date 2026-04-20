@@ -10,13 +10,20 @@ knobs set via .env actually took effect inside the running process:
                     RSS; glmocr Pipeline introspection if reachable
   sglang          - SGLang's own /get_server_info + /metrics (live batching)
 
-This is deliberately side-effect-free: it only reads.
+Also exposes GET /metrics in Prometheus text format via
+prometheus-flask-exporter. Auto HTTP counters/histograms are emitted by the
+exporter; custom pipeline gauges (queue depth, pipeline_up) are attached via
+a dedicated collector when GLMOCR_PIPELINE_METRICS=true.
+
+This module is deliberately side-effect-free with respect to glmocr: it only
+reads.
 """
 from __future__ import annotations
 
 import json as _json
 import os
 import socket
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -148,18 +155,26 @@ def _http_get_text(url: str, timeout: float = 3.0) -> dict[str, Any]:
 
 
 def _filter_sglang_metrics(raw: str | None) -> dict[str, float | int]:
-    """Pick out the batching-relevant lines from SGLang's Prometheus exposition."""
+    """Pick out the batching-relevant lines from SGLang's Prometheus exposition.
+
+    Older SGLang builds export metric names with colons (`sglang:num_running_reqs`,
+    recording-rule-style). Newer builds switched to underscore (`sglang_num_running_reqs`).
+    Accept both so /runtime/summary keeps working across upgrades.
+    """
     if not raw:
         return {}
-    interesting_prefixes = (
-        "sglang:num_running_reqs",
-        "sglang:num_queue_reqs",
-        "sglang:num_used_tokens",
-        "sglang:token_usage",
-        "sglang:cache_hit_rate",
-        "sglang:max_running_requests",
-        "sglang:max_total_num_tokens",
-        "sglang:gen_throughput",
+    _bases = (
+        "num_running_reqs",
+        "num_queue_reqs",
+        "num_used_tokens",
+        "token_usage",
+        "cache_hit_rate",
+        "max_running_requests",
+        "max_total_num_tokens",
+        "gen_throughput",
+    )
+    interesting_prefixes = tuple(
+        f"sglang{sep}{base}" for sep in (":", "_") for base in _bases
     )
     out: dict[str, float | int] = {}
     for line in raw.splitlines():
@@ -218,6 +233,12 @@ def runtime_summary() -> Any:
     sgl_info_body = sgl["server_info"].get("body") or {}
     sgl_metrics = sgl.get("metrics_live") or {}
 
+    def _sgl_any(*names: str) -> float | int | None:
+        for n in names:
+            if n in sgl_metrics:
+                return sgl_metrics[n]
+        return None
+
     return jsonify({
         "cpu_workers":          {"env": env.get("CPU_WORKERS"),
                                  "actual": actual.get("worker_count")},
@@ -227,8 +248,8 @@ def runtime_summary() -> Any:
                                  "config": cfg.get("pipeline.max_workers")},
         "sglang_max_running":   {"env": env.get("SGL_MAX_RUNNING_REQUESTS"),
                                  "runtime": sgl_info_body.get("max_running_requests"),
-                                 "live_running": sgl_metrics.get("sglang:num_running_reqs"),
-                                 "live_queued":  sgl_metrics.get("sglang:num_queue_reqs")},
+                                 "live_running": _sgl_any("sglang:num_running_reqs", "sglang_num_running_reqs"),
+                                 "live_queued":  _sgl_any("sglang:num_queue_reqs",   "sglang_num_queue_reqs")},
         "sglang_batch_tokens":  {"env_prefill": env.get("SGL_MAX_PREFILL_TOKENS"),
                                  "env_total": env.get("SGL_MAX_TOTAL_TOKENS"),
                                  "runtime_prefill": sgl_info_body.get("max_prefill_tokens"),
@@ -247,19 +268,375 @@ def runtime_summary() -> Any:
     })
 
 
+# Histogram bucket boundaries (seconds) for auto-generated Flask request
+# latency metrics. Default prometheus_flask_exporter buckets top out at
+# 10 s — every request slower than that collapses into +Inf and all
+# histogram_quantile() values get pinned to 10, so p50/p95/p99 render as
+# a single flat line. Under real OCR load a cold-start request can easily
+# exceed a minute, so extend the tail.
+_FLASK_LATENCY_BUCKETS = (
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
+    20.0, 30.0, 60.0, 90.0, 120.0, 180.0,
+)
+
+
+def _install_prometheus(app):
+    """Attach a /metrics endpoint to the Flask app. Returns the metrics
+    instance (or None on failure)."""
+    multiproc_dir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+    try:
+        if multiproc_dir:
+            # GunicornInternalPrometheusMetrics serves /metrics on the main
+            # Flask app (same port as /runtime etc). Its sibling
+            # GunicornPrometheusMetrics is for a separate metrics HTTP
+            # server — it deliberately suppresses the Flask route, so
+            # using it here yields 404 on /metrics.
+            from prometheus_flask_exporter.multiprocess import (  # type: ignore
+                GunicornInternalPrometheusMetrics,
+            )
+            return GunicornInternalPrometheusMetrics(
+                app, path="/metrics", group_by="url_rule",
+                buckets=_FLASK_LATENCY_BUCKETS,
+            )
+        from prometheus_flask_exporter import PrometheusMetrics  # type: ignore
+        return PrometheusMetrics(
+            app, path="/metrics", group_by="url_rule",
+            buckets=_FLASK_LATENCY_BUCKETS,
+        )
+    except Exception as exc:  # pragma: no cover
+        print(
+            f"[runtime_app] prometheus-flask-exporter init failed: {exc!r}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _install_pipeline_gauges(app):
+    """Add glmocr-level Gauges backed by prometheus_client's multiprocess
+    files (works with gunicorn + multiple workers).
+
+    We use Gauge primitives (not a custom Collector) because in multiproc
+    mode PrometheusMetrics.generate_metrics builds a fresh registry with
+    only MultiProcessCollector attached, so custom Collectors on
+    self.registry are ignored. Gauges write to files in
+    PROMETHEUS_MULTIPROC_DIR which MultiProcessCollector reads.
+    """
+    try:
+        from prometheus_client import Gauge  # type: ignore
+    except ImportError:
+        return
+
+    try:
+        pipeline_up = Gauge(
+            "glmocr_pipeline_up",
+            "1 if the worker's Pipeline has started and loaded the layout model.",
+            multiprocess_mode="max",
+        )
+        in_flight = Gauge(
+            "glmocr_in_flight_requests",
+            "Number of /glmocr/parse requests currently being processed by this worker.",
+            multiprocess_mode="livesum",
+        )
+    except ValueError:
+        # Already registered (module re-imported in the same process).
+        return
+
+    # Mark pipeline up when install() runs (wsgi.py calls install AFTER
+    # _pipeline.start(), so by definition the layout detector is loaded).
+    pipeline = app.config.get("pipeline")
+    if pipeline is not None:
+        ld = getattr(pipeline, "layout_detector", None)
+        if ld is not None and getattr(ld, "_model", None) is not None:
+            pipeline_up.set(1)
+        else:
+            pipeline_up.set(0)
+    else:
+        pipeline_up.set(0)
+
+    def _track_parse_entry():
+        try:
+            if request.endpoint == "parse":  # /glmocr/parse handler name
+                in_flight.inc()
+        except Exception:  # pragma: no cover
+            pass
+
+    def _track_parse_exit(response):
+        try:
+            if request.endpoint == "parse":
+                in_flight.dec()
+        except Exception:  # pragma: no cover
+            pass
+        return response
+
+    from flask import request  # local import — only needed when enabled
+    app.before_request(_track_parse_entry)
+    app.after_request(_track_parse_exit)
+
+
 def install(app) -> None:
     """
-    Attach the runtime blueprint to the glmocr Flask app.
+    Attach the runtime blueprint + Prometheus metrics to the glmocr Flask app.
 
     Falls back to WSGI dispatch if the upstream app isn't a Flask instance,
-    so the endpoint still works without relying on glmocr internals.
+    so /runtime still works without relying on glmocr internals. /metrics is
+    only installed when we have a real Flask app (prometheus-flask-exporter
+    hooks into Flask's request lifecycle).
     """
     try:
         app.register_blueprint(bp)
-        return app
     except AttributeError:
         from flask import Flask
         from werkzeug.middleware.dispatcher import DispatcherMiddleware  # type: ignore
         side = Flask("glmocr_runtime_side")
         side.register_blueprint(bp)
         return DispatcherMiddleware(app, {"/runtime": side})
+
+    _install_prometheus(app)
+
+    if os.environ.get("GLMOCR_PIPELINE_METRICS", "false").lower() in ("true", "1", "yes"):
+        _install_pipeline_gauges(app)
+
+    _install_config_gauges()
+
+    return app
+
+
+# Per-stage timing histograms. The end-to-end request histogram already
+# comes from prometheus-flask-exporter; these break that total down into
+# the two stages that dominate wall time (layout inference on CPU, OCR
+# region calls to SGLang) so we can see where the request is spending
+# its time without a profiler.
+_LAYOUT_LATENCY_BUCKETS = (
+    0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0,
+)
+_OCR_REGION_LATENCY_BUCKETS = (
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0,
+)
+
+
+def instrument_pipeline(pipeline) -> None:
+    """Wrap the Pipeline's layout + OCR entry points with Histograms so
+    /metrics exposes p50/p95/p99 for each stage in isolation.
+
+    Called from wsgi.py after pipeline.start() has loaded the layout
+    model. Safe to call multiple times per process — prometheus_client
+    raises on duplicate registration and we swallow it. NOT safe to call
+    from multiple processes simultaneously at import time; gunicorn fork
+    model means each worker calls it once post-fork, which is fine.
+    """
+    if pipeline is None:
+        return
+    try:
+        from prometheus_client import Histogram  # type: ignore
+    except ImportError:
+        return
+
+    try:
+        layout_hist = Histogram(
+            "glmocr_layout_seconds",
+            "Wall time spent inside LayoutDetector.process() per call.",
+            buckets=_LAYOUT_LATENCY_BUCKETS,
+        )
+        ocr_hist = Histogram(
+            "glmocr_ocr_region_seconds",
+            "Wall time spent inside OCRClient.process() per region call.",
+            buckets=_OCR_REGION_LATENCY_BUCKETS,
+        )
+    except ValueError:
+        # Already registered (re-import); nothing to do.
+        return
+
+    # Layout: one call per page-batch. We only care about wall time; the
+    # batch size is visible in other gauges and lots of batches are size 1
+    # in this benchmark anyway.
+    ld = getattr(pipeline, "layout_detector", None)
+    if ld is not None and hasattr(ld, "process"):
+        # Optional torch.compile on the underlying HF model. PP-DocLayoutV3
+        # takes ~9s/page on CPU and is the single dominant phase; compile
+        # typically yields 1.2–1.5× on CPU transformer detectors. First
+        # call captures the graph (slow) — the stage_c external warmup
+        # absorbs that so real-run p99 stays clean. `dynamic=True` keeps
+        # a single graph across varying batch sizes.
+        if os.environ.get("LAYOUT_COMPILE", "false").lower() == "true":
+            model = getattr(ld, "_model", None)
+            if model is not None:
+                try:
+                    import torch  # local import: runtime_app must not hard-depend on torch
+                    ld._model = torch.compile(
+                        model, mode="reduce-overhead", dynamic=True,
+                    )
+                    print("[layout] torch.compile enabled (mode=reduce-overhead, dynamic=True)",
+                          flush=True)
+                except Exception as e:
+                    print(f"[layout] torch.compile skipped: {e}", flush=True)
+
+        original_layout = ld.process
+
+        # Optional cross-request coalescer. Concurrent callers submit single
+        # images; one background thread pulls up to LAYOUT_BATCH_MAX of them
+        # within LAYOUT_BATCH_WINDOW_MS and calls process(images=[...]) once.
+        # The HF detector's `process()` already runs a batched forward pass
+        # internally, so coalescing N callers into one call amortizes the
+        # per-call preprocessor + postprocessor overhead and lets the model
+        # exploit batch-wise matmul efficiency.
+        if os.environ.get("LAYOUT_BATCH_ENABLED", "false").lower() == "true":
+            import queue as _queue
+            import threading as _threading
+            from concurrent.futures import Future as _Future
+
+            batch_max = max(1, int(os.environ.get("LAYOUT_BATCH_MAX", "4")))
+            window_s = max(0.0,
+                           float(os.environ.get("LAYOUT_BATCH_WINDOW_MS", "20"))
+                           / 1000.0)
+            q: "_queue.Queue" = _queue.Queue()
+
+            def _batcher_loop():
+                while True:
+                    first = q.get()
+                    if first is None:  # shutdown sentinel
+                        return
+                    batch = [first]
+                    deadline = time.monotonic() + window_s
+                    while len(batch) < batch_max:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            item = q.get(timeout=remaining)
+                            if item is None:
+                                return
+                            batch.append(item)
+                        except _queue.Empty:
+                            break
+                    images = [b[0] for b in batch]
+                    use_poly = batch[0][1]  # visualization-only; safe to share
+                    try:
+                        all_results, _vis = original_layout(
+                            images,
+                            save_visualization=False,
+                            global_start_idx=0,
+                            use_polygon=use_poly,
+                        )
+                        for (_, _, fut), result_i in zip(batch, all_results):
+                            # Caller submitted a single image and expects
+                            # the per-single-image return shape: a list of
+                            # length 1 of detection lists + empty vis dict.
+                            fut.set_result(([result_i], {}))
+                    except Exception as exc:
+                        for _, _, fut in batch:
+                            fut.set_exception(exc)
+
+            t = _threading.Thread(
+                target=_batcher_loop, name="layout-batcher", daemon=True,
+            )
+            t.start()
+            print(f"[layout] batcher enabled (max={batch_max}, "
+                  f"window_ms={int(window_s*1000)})", flush=True)
+
+            def _batched_layout(*args, **kwargs):
+                # Extract positional + keyword arguments matching
+                # glmocr's PPDocLayoutDetector.process signature.
+                if args:
+                    images = args[0]
+                    save_viz = (args[1] if len(args) > 1
+                                else kwargs.get("save_visualization", False))
+                    gsi = (args[2] if len(args) > 2
+                           else kwargs.get("global_start_idx", 0))
+                    use_poly = (args[3] if len(args) > 3
+                                else kwargs.get("use_polygon", False))
+                else:
+                    images = kwargs["images"]
+                    save_viz = kwargs.get("save_visualization", False)
+                    gsi = kwargs.get("global_start_idx", 0)
+                    use_poly = kwargs.get("use_polygon", False)
+                # Coalesce only single-image, no-vis calls — the common
+                # production path. Anything else passes straight through.
+                if len(images) != 1 or save_viz:
+                    return original_layout(
+                        images,
+                        save_visualization=save_viz,
+                        global_start_idx=gsi,
+                        use_polygon=use_poly,
+                    )
+                fut: "_Future" = _Future()
+                q.put((images[0], use_poly, fut))
+                return fut.result()
+
+            batched_entry = _batched_layout
+        else:
+            batched_entry = original_layout
+
+        def _timed_layout(*args, **kwargs):
+            t0 = time.perf_counter()
+            try:
+                return batched_entry(*args, **kwargs)
+            finally:
+                layout_hist.observe(time.perf_counter() - t0)
+
+        ld.process = _timed_layout
+
+    # OCR: one call per region. recognition_worker uses a ThreadPoolExecutor
+    # of size `pipeline.max_workers`, so these observations interleave across
+    # threads — Histogram is thread-safe.
+    oc = getattr(pipeline, "ocr_client", None)
+    if oc is not None and hasattr(oc, "process"):
+        original_ocr = oc.process
+
+        def _timed_ocr(*args, **kwargs):
+            t0 = time.perf_counter()
+            try:
+                return original_ocr(*args, **kwargs)
+            finally:
+                ocr_hist.observe(time.perf_counter() - t0)
+
+        oc.process = _timed_ocr
+
+
+# Config knobs exposed as gauges so the dashboard can show the current
+# tuning values in stat panels (workers, threads, batch caps, etc.).
+# Values come from env vars present at worker-start time and never change
+# during the process lifetime.
+_CONFIG_KNOBS: tuple[tuple[str, str, str], ...] = (
+    ("glmocr_config_cpu_workers",         "CPU_WORKERS",
+     "Gunicorn worker processes in the CPU container."),
+    ("glmocr_config_cpu_threads",         "CPU_THREADS",
+     "Gthread threads per gunicorn worker."),
+    ("glmocr_config_ocr_max_workers",     "OCR_MAX_WORKERS",
+     "Per-request SGLang fan-out pool."),
+    ("glmocr_config_ocr_conn_pool",       "OCR_CONN_POOL",
+     "HTTP connection pool size for SGLang calls."),
+    ("glmocr_config_sgl_max_running",     "SGL_MAX_RUNNING_REQUESTS",
+     "SGLang concurrent-request batching cap."),
+    ("glmocr_config_sgl_max_total_tokens",   "SGL_MAX_TOTAL_TOKENS",
+     "SGLang KV-cache total-token budget."),
+    ("glmocr_config_sgl_max_prefill_tokens", "SGL_MAX_PREFILL_TOKENS",
+     "SGLang prefill-token batch cap."),
+    ("glmocr_config_sgl_chunked_size",    "SGL_CHUNKED_PREFILL_SIZE",
+     "SGLang chunked-prefill chunk size (tokens)."),
+)
+
+
+def _install_config_gauges() -> None:
+    """Publish each tuning knob as a static gauge. Safe to call in every
+    gunicorn worker — Gauge with multiprocess_mode='max' collapses the
+    per-worker values into one (the values are identical anyway)."""
+    try:
+        from prometheus_client import Gauge  # type: ignore
+    except ImportError:
+        return
+
+    for metric_name, env_name, description in _CONFIG_KNOBS:
+        raw = os.environ.get(env_name, "") or ""
+        try:
+            value = float(raw)
+        except ValueError:
+            # Env var missing or non-numeric — skip registration entirely so
+            # the dashboard renders "No data" honestly instead of pretending
+            # the server runs with zero threads/workers/tokens.
+            continue
+        try:
+            g = Gauge(metric_name, description, multiprocess_mode="max")
+            g.set(value)
+        except ValueError:
+            # Already registered (re-import).
+            continue

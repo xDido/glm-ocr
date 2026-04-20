@@ -1,0 +1,92 @@
+// Grafana Alloy — scrape the GLM-OCR stack and remote_write to Grafana Cloud.
+//
+// Runs alongside the local Prometheus (which still feeds local Grafana and
+// receives k6's --out experimental-prometheus-rw pushes). Alloy is only
+// responsible for cloud egress.
+//
+// Credentials come from env vars passed through docker-compose:
+//   GRAFANA_CLOUD_PROM_URL, GRAFANA_CLOUD_PROM_USER, GRAFANA_CLOUD_PROM_TOKEN.
+
+// ---------------------------------------------------------------------------
+// Scrape jobs — one per target, job_name defaults to the component name.
+// ---------------------------------------------------------------------------
+
+prometheus.scrape "sglang" {
+	targets         = [{"__address__" = "sglang:30000"}]
+	metrics_path    = "/metrics"
+	scrape_interval = "5s"
+	scrape_timeout  = "4s"
+	forward_to      = [prometheus.relabel.cloud_allowlist.receiver]
+}
+
+prometheus.scrape "glmocr_cpu" {
+	targets         = [{"__address__" = "cpu:5002"}]
+	metrics_path    = "/metrics"
+	scrape_interval = "5s"
+	scrape_timeout  = "4s"
+	forward_to      = [prometheus.relabel.cloud_allowlist.receiver]
+}
+
+prometheus.scrape "cadvisor" {
+	targets         = [{"__address__" = "cadvisor:8080"}]
+	scrape_interval = "5s"
+	scrape_timeout  = "4s"
+	forward_to      = [prometheus.relabel.cloud_allowlist.receiver]
+}
+
+prometheus.scrape "gpu" {
+	targets         = [{"__address__" = "nvidia-gpu-exporter:9400"}]
+	scrape_interval = "5s"
+	scrape_timeout  = "4s"
+	forward_to      = [prometheus.relabel.cloud_allowlist.receiver]
+}
+
+// honor_labels so the `job` the bench pushed survives the scrape.
+prometheus.scrape "pushgateway" {
+	targets         = [{"__address__" = "pushgateway:9091"}]
+	honor_labels    = true
+	scrape_interval = "5s"
+	scrape_timeout  = "4s"
+	forward_to      = [prometheus.relabel.cloud_allowlist.receiver]
+}
+
+prometheus.scrape "locust_exporter" {
+	targets         = [{"__address__" = "locust-exporter:9646"}]
+	scrape_interval = "5s"
+	scrape_timeout  = "4s"
+	forward_to      = [prometheus.relabel.cloud_allowlist.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// Allowlist — keep cardinality under the free-tier 10k active-series cap by
+// only forwarding metrics the dashboard actually uses.
+// ---------------------------------------------------------------------------
+
+prometheus.relabel "cloud_allowlist" {
+	forward_to = [prometheus.remote_write.grafanacloud.receiver]
+
+	rule {
+		source_labels = ["__name__"]
+		// sglang[:_].* accepts both the legacy colon naming
+		// (sglang:num_running_reqs) and the newer underscore form
+		// (sglang_num_running_reqs) emitted by current lmsysorg/sglang
+		// builds — dashboard queries fall back between the two.
+		regex         = "glmocr_.*|sglang[:_].*|DCGM_FI_.*|container_(cpu|memory|network)_.*|locust_.*|flask_http_.*|up"
+		action        = "keep"
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ship to Grafana Cloud Mimir.
+// ---------------------------------------------------------------------------
+
+prometheus.remote_write "grafanacloud" {
+	endpoint {
+		url = sys.env("GRAFANA_CLOUD_PROM_URL")
+
+		basic_auth {
+			username = sys.env("GRAFANA_CLOUD_PROM_USER")
+			password = sys.env("GRAFANA_CLOUD_PROM_TOKEN")
+		}
+	}
+}

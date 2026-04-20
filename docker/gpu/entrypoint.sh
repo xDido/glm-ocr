@@ -24,10 +24,33 @@ ARGS=(
 [[ -n "${SGL_MEM_FRACTION_STATIC:-}"  ]] && ARGS+=(--mem-fraction-static   "${SGL_MEM_FRACTION_STATIC}")
 [[ -n "${SGL_SCHEDULE_POLICY:-}"      ]] && ARGS+=(--schedule-policy       "${SGL_SCHEDULE_POLICY}")
 
-# Presence-only flag (no value).
+# Chunked prefill: the bare --chunked-prefill flag was renamed to
+# --chunked-prefill-size N in modern SGLang. Enable when SGL_CHUNKED_PREFILL
+# is truthy; size comes from SGL_CHUNKED_PREFILL_SIZE (default 8192).
 CHUNKED="${SGL_CHUNKED_PREFILL:-false}"
 if [[ "${CHUNKED,,}" == "true" || "${CHUNKED}" == "1" ]]; then
-    ARGS+=(--chunked-prefill)
+    : "${SGL_CHUNKED_PREFILL_SIZE:=8192}"
+    ARGS+=(--chunked-prefill-size "${SGL_CHUNKED_PREFILL_SIZE}")
+fi
+
+# Speculative decoding. zai-org/GLM-OCR ships MTP/NEXTN heads baked into
+# the weights; enabling this turns them on for ~2–4x decode throughput on
+# typical OCR output with no change to the generated tokens. Defaults
+# mirror the upstream README's recommended launch line. Leave
+# SGL_SPECULATIVE unset/false to run plain autoregressive decoding.
+SPEC="${SGL_SPECULATIVE:-false}"
+if [[ "${SPEC,,}" == "true" || "${SPEC}" == "1" ]]; then
+    : "${SGL_SPEC_ALGORITHM:=NEXTN}"
+    : "${SGL_SPEC_NUM_STEPS:=3}"
+    : "${SGL_SPEC_EAGLE_TOPK:=1}"
+    : "${SGL_SPEC_NUM_DRAFT_TOKENS:=4}"
+    export SGLANG_ENABLE_SPEC_V2=1
+    ARGS+=(
+        --speculative-algorithm        "${SGL_SPEC_ALGORITHM}"
+        --speculative-num-steps        "${SGL_SPEC_NUM_STEPS}"
+        --speculative-eagle-topk       "${SGL_SPEC_EAGLE_TOPK}"
+        --speculative-num-draft-tokens "${SGL_SPEC_NUM_DRAFT_TOKENS}"
+    )
 fi
 
 echo "[entrypoint] launching SGLang with args:"

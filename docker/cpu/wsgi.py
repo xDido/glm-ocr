@@ -39,10 +39,21 @@ def _build_app():
 
 app = _build_app()
 
+# glmocr 0.1.5's create_app instantiates Pipeline but never calls start(), so
+# the layout detector's model is never loaded and every request trips
+# "Layout detector not started". Start it here (per-worker) and register stop
+# on exit. Each worker loads its own copy of the layout model.
+import atexit
+_pipeline = app.config.get("pipeline")
+if _pipeline is not None:
+    _pipeline.start()
+    atexit.register(_pipeline.stop)
+
 # Runtime-integrity endpoint. Non-fatal on failure — worker still serves OCR.
 try:
-    from runtime_app import install as _install_runtime
+    from runtime_app import install as _install_runtime, instrument_pipeline as _instrument
     app = _install_runtime(app)
+    _instrument(_pipeline)
 except Exception as _exc:  # pragma: no cover
     import sys
     print(f"[wsgi] runtime blueprint not installed: {_exc!r}", file=sys.stderr)

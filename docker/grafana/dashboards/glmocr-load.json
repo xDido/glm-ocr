@@ -1,0 +1,652 @@
+{
+  "uid": "glmocr-load",
+  "title": "GLM-OCR Load Test",
+  "tags": ["glmocr", "loadtest"],
+  "timezone": "",
+  "schemaVersion": 38,
+  "version": 2,
+  "refresh": "5s",
+  "time": {"from": "now-15m", "to": "now"},
+  "editable": true,
+  "graphTooltip": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "interval",
+        "label": "Rate interval",
+        "type": "interval",
+        "auto": false,
+        "query": "30s,1m,2m,5m",
+        "current": {"selected": true, "text": "1m", "value": "1m"},
+        "refresh": 2
+      },
+      {
+        "name": "container",
+        "label": "Container",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(container_last_seen{name=~\"glmocr-.*\"}, name)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {"selected": true, "text": "All", "value": "$__all"}
+      },
+      {
+        "name": "gpu",
+        "label": "GPU",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(DCGM_FI_DEV_GPU_UTIL, gpu)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2,
+        "current": {"selected": true, "text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Annotations & Alerts",
+        "datasource": {"type": "datasource", "uid": "grafana"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "red",
+        "type": "dashboard"
+      },
+      {
+        "name": "Load-test drivers",
+        "datasource": {"type": "datasource", "uid": "grafana"},
+        "enable": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "tags": ["driver"],
+        "type": "tags"
+      },
+      {
+        "name": "Run boundaries",
+        "datasource": {"type": "datasource", "uid": "grafana"},
+        "enable": true,
+        "iconColor": "rgba(255, 180, 0, 1)",
+        "tags": ["run"],
+        "type": "tags"
+      }
+    ]
+  },
+  "panels": [
+    {"id": 100, "type": "row", "title": "Drivers — k6 (live, remote-write)",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0}, "collapsed": false},
+
+    {"id": 101, "type": "stat", "title": "Peak RPS",
+     "description": "Driver-side request rate (k6). Shows load applied to the CPU container per second.",
+     "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "reqps", "decimals": 1}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "area"},
+     "targets": [
+       {"expr": "sum(rate(k6_http_reqs_total[1m]))", "refId": "A"}
+     ]},
+
+    {"id": 102, "type": "stat", "title": "Latency p95 (now)",
+     "description": "Recent p95 latency reported by k6. Thresholds: green <5s, amber <15s, red otherwise.",
+     "gridPos": {"h": 4, "w": 4, "x": 4, "y": 1},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {
+       "defaults": {
+         "unit": "ms",
+         "decimals": 0,
+         "thresholds": {"mode": "absolute", "steps": [
+           {"color": "green", "value": null},
+           {"color": "orange", "value": 5000},
+           {"color": "red", "value": 15000}]}
+       }
+     },
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "background", "graphMode": "area"},
+     "targets": [
+       {"expr": "max(k6_http_req_duration_p95)", "refId": "A"}
+     ]},
+
+    {"id": 103, "type": "stat", "title": "Error ratio",
+     "description": "Share of k6 responses flagged expected_response=false. Green <1%, amber <5%, red above.",
+     "gridPos": {"h": 4, "w": 4, "x": 8, "y": 1},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {
+       "defaults": {
+         "unit": "percentunit",
+         "decimals": 2,
+         "thresholds": {"mode": "absolute", "steps": [
+           {"color": "green", "value": null},
+           {"color": "orange", "value": 0.01},
+           {"color": "red", "value": 0.05}]}
+       }
+     },
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "background", "graphMode": "area"},
+     "targets": [
+       {"expr": "sum(rate(k6_http_reqs_total{expected_response=\"false\"}[1m])) / clamp_min(sum(rate(k6_http_reqs_total[1m])), 0.001)",
+        "refId": "A"}
+     ]},
+
+    {"id": 104, "type": "stat", "title": "Total requests",
+     "description": "Cumulative request count for this k6 run.",
+     "gridPos": {"h": 4, "w": 4, "x": 12, "y": 1},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "value", "graphMode": "area"},
+     "targets": [
+       {"expr": "sum(k6_http_reqs_total)", "refId": "A"}
+     ]},
+
+    {"id": 105, "type": "stat", "title": "Active VUs",
+     "description": "Virtual users currently executing iterations.",
+     "gridPos": {"h": 4, "w": 4, "x": 16, "y": 1},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "value", "graphMode": "area"},
+     "targets": [
+       {"expr": "sum(k6_vus)", "refId": "A"}
+     ]},
+
+    {"id": 106, "type": "stat", "title": "Max VUs",
+     "description": "Cap configured in the k6 scenario (ceiling for active VUs).",
+     "gridPos": {"h": 4, "w": 4, "x": 20, "y": 1},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "value", "graphMode": "area"},
+     "targets": [
+       {"expr": "max(k6_vus_max)", "refId": "A"}
+     ]},
+
+    {"id": 107, "type": "timeseries", "title": "k6 — RPS + VUs overlay",
+     "description": "Correlates load applied (VUs) with throughput (req/s). Watch for RPS plateauing as VUs keep rising — the sign of saturation.",
+     "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {
+       "defaults": {"custom": {"drawStyle": "line", "fillOpacity": 20}},
+       "overrides": [
+         {"matcher": {"id": "byName", "options": "active VUs"}, "properties": [
+           {"id": "custom.axisPlacement", "value": "right"},
+           {"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]},
+         {"matcher": {"id": "byName", "options": "req/s"}, "properties": [
+           {"id": "unit", "value": "reqps"},
+           {"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]}
+       ]
+     },
+     "targets": [
+       {"expr": "sum(rate(k6_http_reqs_total[$interval]))", "legendFormat": "req/s", "refId": "A"},
+       {"expr": "sum(k6_vus)",                             "legendFormat": "active VUs", "refId": "B"}
+     ]},
+
+    {"id": 108, "type": "timeseries", "title": "k6 — latency p50 / p90 / p95 / p99",
+     "description": "Full percentile family from k6. Tail growth (p99 vs p50) indicates queueing.",
+     "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "ms"}},
+     "targets": [
+       {"expr": "max(k6_http_req_duration_p50)",  "legendFormat": "p50",  "refId": "A"},
+       {"expr": "max(k6_http_req_duration_p90)",  "legendFormat": "p90",  "refId": "B"},
+       {"expr": "max(k6_http_req_duration_p95)",  "legendFormat": "p95",  "refId": "C"},
+       {"expr": "max(k6_http_req_duration_p99)",  "legendFormat": "p99",  "refId": "D"},
+       {"expr": "max(k6_http_req_duration_avg)",  "legendFormat": "avg",  "refId": "E"}
+     ]},
+
+    {"id": 109, "type": "table", "title": "k6 — HTTP requests by method & status",
+     "description": "Per-endpoint rate table. Sorts high-first so slow or failing endpoints stand out.",
+     "gridPos": {"h": 7, "w": 24, "x": 0, "y": 13},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "options": {"showHeader": true, "sortBy": [{"displayName": "Value", "desc": true}]},
+     "fieldConfig": {
+       "defaults": {"custom": {"align": "auto"}},
+       "overrides": [
+         {"matcher": {"id": "byName", "options": "Value"}, "properties": [
+           {"id": "displayName", "value": "req/s"},
+           {"id": "unit", "value": "reqps"},
+           {"id": "decimals", "value": 2}]}
+       ]
+     },
+     "targets": [
+       {"expr": "sum by (method, status, name) (rate(k6_http_reqs_total[$interval]))",
+        "format": "table", "instant": true, "refId": "A"}
+     ],
+     "transformations": [
+       {"id": "organize", "options": {"excludeByName": {"Time": true}}}
+     ]},
+
+    {"id": 150, "type": "row", "title": "Drivers — Locust (live via exporter)",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 20}, "collapsed": false},
+
+    {"id": 110, "type": "timeseries", "title": "Locust — RPS",
+     "description": "Current requests-per-second from Locust's own counters.",
+     "gridPos": {"h": 7, "w": 8, "x": 0, "y": 21},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "reqps"}},
+     "targets": [
+       {"expr": "sum(locust_requests_current_rps)",
+        "legendFormat": "current", "refId": "A"}
+     ]},
+
+    {"id": 111, "type": "timeseries", "title": "Locust — response time (ms)",
+     "description": "Percentile response times as reported by Locust for each configured task.",
+     "gridPos": {"h": 7, "w": 8, "x": 8, "y": 21},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "ms"}},
+     "targets": [
+       {"expr": "max by (percentile) (locust_response_time_percentile)",
+        "legendFormat": "p{{percentile}}", "refId": "A"}
+     ]},
+
+    {"id": 112, "type": "stat", "title": "Locust — users / failures",
+     "description": "Current VU count and failure rate (fail/s). Non-zero failures during a run are a red flag.",
+     "gridPos": {"h": 7, "w": 8, "x": 16, "y": 21},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "options": {
+       "reduceOptions": {"calcs": ["last"]},
+       "textMode": "auto",
+       "colorMode": "value"
+     },
+     "targets": [
+       {"expr": "sum(locust_users)",                "legendFormat": "users", "refId": "A"},
+       {"expr": "sum(locust_requests_current_fail_per_sec)", "legendFormat": "fail/s", "refId": "B"}
+     ]},
+
+    {"id": 170, "type": "row", "title": "Drivers — asyncio (last push)",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 28}, "collapsed": false},
+
+    {"id": 120, "type": "stat", "title": "asyncio — last run summary",
+     "description": "Final summary of the most recent bench.py run, pushed to Pushgateway. Updates once per driver invocation.",
+     "gridPos": {"h": 7, "w": 24, "x": 0, "y": 29},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "options": {
+       "reduceOptions": {"calcs": ["last"]},
+       "textMode": "auto",
+       "colorMode": "value",
+       "orientation": "horizontal"
+     },
+     "targets": [
+       {"expr": "max(glmocr_asyncio_throughput_rps)",  "legendFormat": "rps",    "refId": "A"},
+       {"expr": "max(glmocr_asyncio_latency_p50_ms)",  "legendFormat": "p50 ms", "refId": "B"},
+       {"expr": "max(glmocr_asyncio_latency_p95_ms)",  "legendFormat": "p95 ms", "refId": "C"},
+       {"expr": "max(glmocr_asyncio_latency_p99_ms)",  "legendFormat": "p99 ms", "refId": "D"},
+       {"expr": "max(glmocr_asyncio_successes)",       "legendFormat": "ok",     "refId": "E"},
+       {"expr": "max(glmocr_asyncio_failures)",        "legendFormat": "fail",   "refId": "F"}
+     ]},
+
+    {"id": 200, "type": "row", "title": "Client / glmocr (CPU container)",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 36}, "collapsed": false},
+
+    {"id": 201, "type": "timeseries", "title": "Request rate (by status)",
+     "description": "Server-measured RPS on /glmocr/parse, broken out by HTTP status. Ground truth vs the driver view.",
+     "gridPos": {"h": 7, "w": 8, "x": 0, "y": 37},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {
+       "defaults": {"unit": "reqps", "custom": {"drawStyle": "line", "fillOpacity": 30, "stacking": {"mode": "normal"}}}
+     },
+     "targets": [
+       {"expr": "sum by (status) (rate(flask_http_request_duration_seconds_count{url_rule=\"/glmocr/parse\"}[$interval]))",
+        "legendFormat": "{{status}}", "refId": "A"}
+     ]},
+
+    {"id": 202, "type": "timeseries", "title": "Status-code breakdown (stacked)",
+     "description": "Stacked 2xx/4xx/5xx area chart. Shape of errors over time.",
+     "gridPos": {"h": 7, "w": 8, "x": 8, "y": 37},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {
+       "defaults": {"unit": "reqps", "custom": {"drawStyle": "bars", "fillOpacity": 80, "stacking": {"mode": "normal"}}},
+       "overrides": [
+         {"matcher": {"id": "byFrameRefID", "options": "A"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+         {"matcher": {"id": "byFrameRefID", "options": "B"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
+         {"matcher": {"id": "byFrameRefID", "options": "C"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+       ]
+     },
+     "targets": [
+       {"expr": "sum(rate(flask_http_request_duration_seconds_count{url_rule=\"/glmocr/parse\",status=~\"2..\"}[$interval]))", "legendFormat": "2xx", "refId": "A"},
+       {"expr": "sum(rate(flask_http_request_duration_seconds_count{url_rule=\"/glmocr/parse\",status=~\"4..\"}[$interval]))", "legendFormat": "4xx", "refId": "B"},
+       {"expr": "sum(rate(flask_http_request_duration_seconds_count{url_rule=\"/glmocr/parse\",status=~\"5..\"}[$interval]))", "legendFormat": "5xx", "refId": "C"}
+     ]},
+
+    {"id": 203, "type": "timeseries", "title": "Latency p50 / p95 / p99 (s)",
+     "description": "Flask histogram-derived percentiles. What the server sees; differs from driver-side by network RTT.",
+     "gridPos": {"h": 7, "w": 8, "x": 16, "y": 37},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "s"}},
+     "targets": [
+       {"expr": "histogram_quantile(0.50, sum by (le) (rate(flask_http_request_duration_seconds_bucket{url_rule=\"/glmocr/parse\"}[$interval])))", "legendFormat": "p50", "refId": "A"},
+       {"expr": "histogram_quantile(0.95, sum by (le) (rate(flask_http_request_duration_seconds_bucket{url_rule=\"/glmocr/parse\"}[$interval])))", "legendFormat": "p95", "refId": "B"},
+       {"expr": "histogram_quantile(0.99, sum by (le) (rate(flask_http_request_duration_seconds_bucket{url_rule=\"/glmocr/parse\"}[$interval])))", "legendFormat": "p99", "refId": "C"}
+     ]},
+
+    {"id": 204, "type": "heatmap", "title": "Latency distribution heatmap",
+     "description": "Full duration distribution over time — reveals bimodality a single p99 line hides.",
+     "gridPos": {"h": 8, "w": 24, "x": 0, "y": 44},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "options": {
+       "calculate": false,
+       "cellGap": 1,
+       "color": {"mode": "scheme", "scheme": "Oranges", "steps": 64, "exponent": 0.5, "min": 0},
+       "yAxis": {"unit": "s", "decimals": 2, "axisLabel": "duration"},
+       "legend": {"show": true},
+       "tooltip": {"mode": "single"}
+     },
+     "targets": [
+       {"expr": "sum by (le) (increase(flask_http_request_duration_seconds_bucket{url_rule=\"/glmocr/parse\"}[$interval]))",
+        "format": "heatmap", "legendFormat": "{{le}}", "refId": "A"}
+     ]},
+
+    {"id": 300, "type": "row", "title": "glmocr pipeline internals",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 52}, "collapsed": false},
+
+    {"id": 301, "type": "timeseries", "title": "In-flight /glmocr/parse",
+     "description": "Requests currently being processed by each gunicorn worker (incremented on entry, decremented on exit).",
+     "gridPos": {"h": 7, "w": 16, "x": 0, "y": 53},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "min": 0}},
+     "targets": [
+       {"expr": "glmocr_in_flight_requests", "legendFormat": "in-flight", "refId": "A"}
+     ]},
+
+    {"id": 302, "type": "stat", "title": "Pipeline up",
+     "description": "1 when the layout detector has been loaded in a worker. If 0, that worker's requests will return empty OCR.",
+     "gridPos": {"h": 7, "w": 8, "x": 16, "y": 53},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "options": {"reduceOptions": {"calcs": ["last"]}, "textMode": "auto", "colorMode": "background"},
+     "fieldConfig": {
+       "defaults": {
+         "mappings": [{"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}],
+         "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+       }
+     },
+     "targets": [
+       {"expr": "max(glmocr_pipeline_up)", "refId": "A"}
+     ]},
+
+    {"id": 400, "type": "row", "title": "SGLang (GPU inference)",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 60}, "collapsed": false},
+
+    {"id": 401, "type": "timeseries", "title": "Running requests vs cap",
+     "description": "Concurrent requests SGLang is batching against the max_running_requests ceiling.",
+     "gridPos": {"h": 7, "w": 8, "x": 0, "y": 61},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "targets": [
+       {"expr": "sglang_num_running_reqs or sglang:num_running_reqs",     "legendFormat": "running", "refId": "A"},
+       {"expr": "glmocr_config_sgl_max_running", "legendFormat": "cap",     "refId": "B"}
+     ]},
+
+    {"id": 402, "type": "timeseries", "title": "Queue depth",
+     "description": "Requests waiting for a batch slot. Persistent non-zero = GPU is the bottleneck.",
+     "gridPos": {"h": 7, "w": 8, "x": 8, "y": 61},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "targets": [
+       {"expr": "sglang_num_queue_reqs or sglang:num_queue_reqs", "legendFormat": "queued", "refId": "A"}
+     ]},
+
+    {"id": 403, "type": "timeseries", "title": "Generation throughput (tok/s)",
+     "description": "Tokens emitted per second across the running batch.",
+     "gridPos": {"h": 7, "w": 8, "x": 16, "y": 61},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "targets": [
+       {"expr": "sglang_gen_throughput or sglang:gen_throughput", "legendFormat": "tok/s", "refId": "A"}
+     ]},
+
+    {"id": 404, "type": "timeseries", "title": "Cache hit rate",
+     "description": "Fraction of prompt tokens served from the RadixAttention cache. Higher = better prompt reuse.",
+     "gridPos": {"h": 7, "w": 8, "x": 0, "y": 68},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+     "targets": [
+       {"expr": "sglang_cache_hit_rate or sglang:cache_hit_rate", "legendFormat": "radix cache", "refId": "A"}
+     ]},
+
+    {"id": 405, "type": "timeseries", "title": "Token usage (%)",
+     "description": "Fraction of the token budget currently occupied by live requests.",
+     "gridPos": {"h": 7, "w": 8, "x": 8, "y": 68},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+     "targets": [
+       {"expr": "sglang_token_usage or sglang:token_usage", "legendFormat": "usage", "refId": "A"}
+     ]},
+
+    {"id": 406, "type": "timeseries", "title": "Used tokens vs cap",
+     "description": "Absolute KV-cache occupancy vs the profiled maximum.",
+     "gridPos": {"h": 7, "w": 8, "x": 16, "y": 68},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "targets": [
+       {"expr": "sglang_num_used_tokens or sglang:num_used_tokens",     "legendFormat": "used", "refId": "A"},
+       {"expr": "sglang_max_total_num_tokens or sglang:max_total_num_tokens", "legendFormat": "cap", "refId": "B"}
+     ]},
+
+    {"id": 500, "type": "row", "title": "Containers (cAdvisor)",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 75}, "collapsed": false},
+
+    {"id": 501, "type": "timeseries", "title": "CPU %",
+     "description": "Per-container CPU utilization. Use the container filter (top of dashboard) to focus on one process.",
+     "gridPos": {"h": 7, "w": 8, "x": 0, "y": 76},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "percentunit"}},
+     "targets": [
+       {"expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"$container\"}[$interval]))",
+        "legendFormat": "{{name}}", "refId": "A"}
+     ]},
+
+    {"id": 502, "type": "timeseries", "title": "Memory RSS",
+     "description": "Per-container resident memory. Watch the CPU container for memory growth during long runs.",
+     "gridPos": {"h": 7, "w": 8, "x": 8, "y": 76},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "bytes"}},
+     "targets": [
+       {"expr": "container_memory_rss{name=~\"$container\"}",
+        "legendFormat": "{{name}}", "refId": "A"}
+     ]},
+
+    {"id": 503, "type": "timeseries", "title": "Network I/O (bytes/s)",
+     "description": "Container-level rx/tx rates. Spikes align with driver traffic.",
+     "gridPos": {"h": 7, "w": 8, "x": 16, "y": 76},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "Bps"}},
+     "targets": [
+       {"expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\"$container\"}[$interval]))",
+        "legendFormat": "{{name}} rx", "refId": "A"},
+       {"expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\"$container\"}[$interval]))",
+        "legendFormat": "{{name}} tx", "refId": "B"}
+     ]},
+
+    {"id": 600, "type": "row", "title": "GPU (DCGM)",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 83}, "collapsed": false},
+
+    {"id": 601, "type": "timeseries", "title": "GPU utilization %",
+     "description": "Compute utilization and memory-copy utilization. When both are pinned near 100%, the GPU is saturated.",
+     "gridPos": {"h": 7, "w": 8, "x": 0, "y": 84},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}},
+     "targets": [
+       {"expr": "DCGM_FI_DEV_GPU_UTIL{gpu=~\"$gpu\"}",
+        "legendFormat": "GPU {{gpu}} compute", "refId": "A"},
+       {"expr": "DCGM_FI_DEV_MEM_COPY_UTIL{gpu=~\"$gpu\"}",
+        "legendFormat": "GPU {{gpu}} memory-copy", "refId": "B"}
+     ]},
+
+    {"id": 602, "type": "timeseries", "title": "VRAM used / free (MB)",
+     "description": "Frame-buffer memory used vs free. SGLang reserves most of it for the model + KV cache.",
+     "gridPos": {"h": 7, "w": 8, "x": 8, "y": 84},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "decmbytes"}},
+     "targets": [
+       {"expr": "DCGM_FI_DEV_FB_USED{gpu=~\"$gpu\"}",
+        "legendFormat": "used {{gpu}}", "refId": "A"},
+       {"expr": "DCGM_FI_DEV_FB_FREE{gpu=~\"$gpu\"}",
+        "legendFormat": "free {{gpu}}", "refId": "B"}
+     ]},
+
+    {"id": 603, "type": "timeseries", "title": "Temperature (°C) / Power (W)",
+     "description": "Thermal and power draw. Sustained >80 °C may trigger driver throttling.",
+     "gridPos": {"h": 7, "w": 8, "x": 16, "y": 84},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "targets": [
+       {"expr": "DCGM_FI_DEV_GPU_TEMP{gpu=~\"$gpu\"}",
+        "legendFormat": "°C {{gpu}}", "refId": "A"},
+       {"expr": "DCGM_FI_DEV_POWER_USAGE{gpu=~\"$gpu\"}",
+        "legendFormat": "W {{gpu}}", "refId": "B"}
+     ]},
+
+    {"id": 700, "type": "row", "title": "Recent runs",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 91}, "collapsed": false},
+
+    {"id": 701, "type": "annolist", "title": "Last driver / run events",
+     "description": "Grafana annotations tagged 'driver' or 'run'. Last 30 entries from `make omnidoc-load` invocations.",
+     "gridPos": {"h": 8, "w": 24, "x": 0, "y": 92},
+     "options": {
+       "onlyFromThisDashboard": false,
+       "onlyInTimeRange": false,
+       "tags": ["driver", "run"],
+       "limit": 30,
+       "navigateAfter": "10m",
+       "navigateBefore": "10m",
+       "navigateToPanel": false,
+       "showUser": false,
+       "showTags": true,
+       "showTime": true
+     }},
+
+    {"id": 800, "type": "row", "title": "Current configuration & runtime aggregates",
+     "gridPos": {"h": 1, "w": 24, "x": 0, "y": 100}, "collapsed": false},
+
+    {"id": 801, "type": "stat", "title": "CPU workers",
+     "description": "Gunicorn worker processes in the CPU container (CPU_WORKERS).",
+     "gridPos": {"h": 4, "w": 3, "x": 0, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_cpu_workers)", "refId": "A"}]},
+
+    {"id": 802, "type": "stat", "title": "CPU threads/worker",
+     "description": "Gthread threads per gunicorn worker (CPU_THREADS). Total inbound concurrency = workers × threads.",
+     "gridPos": {"h": 4, "w": 3, "x": 3, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_cpu_threads)", "refId": "A"}]},
+
+    {"id": 803, "type": "stat", "title": "OCR max workers",
+     "description": "Per-request SGLang fan-out (OCR_MAX_WORKERS). How many region crops glmocr sends in parallel for one document.",
+     "gridPos": {"h": 4, "w": 3, "x": 6, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_ocr_max_workers)", "refId": "A"}]},
+
+    {"id": 804, "type": "stat", "title": "OCR conn pool",
+     "description": "HTTP connection-pool size glmocr uses for SGLang calls (OCR_CONN_POOL). Should be ≥ threads × max-workers.",
+     "gridPos": {"h": 4, "w": 3, "x": 9, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_ocr_conn_pool)", "refId": "A"}]},
+
+    {"id": 805, "type": "stat", "title": "SGL max running",
+     "description": "SGLang concurrent-request batching cap (SGL_MAX_RUNNING_REQUESTS). Hard ceiling on GPU parallelism.",
+     "gridPos": {"h": 4, "w": 3, "x": 12, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_sgl_max_running)", "refId": "A"}]},
+
+    {"id": 806, "type": "stat", "title": "SGL max total tokens",
+     "description": "SGLang KV-cache total-token budget (SGL_MAX_TOTAL_TOKENS). Hard limit on simultaneous context length × batch.",
+     "gridPos": {"h": 4, "w": 3, "x": 15, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_sgl_max_total_tokens)", "refId": "A"}]},
+
+    {"id": 807, "type": "stat", "title": "SGL max prefill",
+     "description": "SGLang prefill-batch token cap (SGL_MAX_PREFILL_TOKENS). Bounds tokens processed per forward pass during prompt processing.",
+     "gridPos": {"h": 4, "w": 3, "x": 18, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_sgl_max_prefill_tokens)", "refId": "A"}]},
+
+    {"id": 808, "type": "stat", "title": "SGL chunked prefill size",
+     "description": "SGLang chunked-prefill chunk size (SGL_CHUNKED_PREFILL_SIZE). Split long prompts into chunks of this many tokens.",
+     "gridPos": {"h": 4, "w": 3, "x": 21, "y": 101},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["max"]}, "colorMode": "value", "graphMode": "none"},
+     "targets": [{"expr": "max(glmocr_config_sgl_chunked_size)", "refId": "A"}]},
+
+    {"id": 809, "type": "stat", "title": "GPU model",
+     "description": "GPU name as reported by DCGM. Sourced from the modelName label on any DCGM metric.",
+     "gridPos": {"h": 4, "w": 6, "x": 0, "y": 105},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "none"}},
+     "options": {"textMode": "name", "reduceOptions": {"calcs": ["last"]}, "colorMode": "background", "graphMode": "none"},
+     "targets": [
+       {"expr": "DCGM_FI_DEV_GPU_UTIL", "legendFormat": "{{modelName}}", "refId": "A"}
+     ]},
+
+    {"id": 810, "type": "stat", "title": "VRAM used",
+     "description": "Frame-buffer memory currently used on the GPU (DCGM_FI_DEV_FB_USED, MB).",
+     "gridPos": {"h": 4, "w": 6, "x": 6, "y": 105},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "decmbytes", "decimals": 0}},
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "value", "graphMode": "area"},
+     "targets": [{"expr": "max(DCGM_FI_DEV_FB_USED)", "refId": "A"}]},
+
+    {"id": 811, "type": "stat", "title": "VRAM usage %",
+     "description": "Fraction of total VRAM in use. Green <80%, amber <95%, red above — SGLang may start evicting or rejecting.",
+     "gridPos": {"h": 4, "w": 6, "x": 12, "y": 105},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {
+       "defaults": {
+         "unit": "percentunit", "decimals": 2, "min": 0, "max": 1,
+         "thresholds": {"mode": "absolute", "steps": [
+           {"color": "green", "value": null},
+           {"color": "orange", "value": 0.8},
+           {"color": "red", "value": 0.95}]}
+       }
+     },
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "background", "graphMode": "area"},
+     "targets": [
+       {"expr": "max(DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE))",
+        "refId": "A"}
+     ]},
+
+    {"id": 812, "type": "stat", "title": "SGLang avg batch size (5m)",
+     "description": "Average number of concurrently running SGLang requests over the last 5 minutes — how heavily batched inference actually is.",
+     "gridPos": {"h": 4, "w": 6, "x": 18, "y": 105},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {"defaults": {"unit": "short", "decimals": 2}},
+     "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "value", "graphMode": "area"},
+     "targets": [
+       {"expr": "avg_over_time(sglang_num_running_reqs[5m]) or avg_over_time(sglang:num_running_reqs[5m])", "refId": "A"}
+     ]},
+
+    {"id": 813, "type": "timeseries", "title": "Concurrent requests — all layers",
+     "description": "Where the requests in flight live at each concurrency layer: CPU gunicorn (in-flight), SGLang running batch, and SGLang queue waiting for a slot.",
+     "gridPos": {"h": 7, "w": 24, "x": 0, "y": 109},
+     "datasource": {"type": "prometheus", "uid": "${datasource}"},
+     "fieldConfig": {
+       "defaults": {"unit": "short", "min": 0, "custom": {"drawStyle": "line", "fillOpacity": 20, "stacking": {"mode": "none"}}},
+       "overrides": [
+         {"matcher": {"id": "byName", "options": "CPU in-flight"},  "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+         {"matcher": {"id": "byName", "options": "SGLang running"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+         {"matcher": {"id": "byName", "options": "SGLang queued"},  "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
+         {"matcher": {"id": "byName", "options": "SGLang cap"},     "properties": [
+           {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}},
+           {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [8, 4]}}]}
+       ]
+     },
+     "targets": [
+       {"expr": "sum(glmocr_in_flight_requests)", "legendFormat": "CPU in-flight",  "refId": "A"},
+       {"expr": "sglang_num_running_reqs or sglang:num_running_reqs",        "legendFormat": "SGLang running", "refId": "B"},
+       {"expr": "sglang_num_queue_reqs or sglang:num_queue_reqs",            "legendFormat": "SGLang queued",  "refId": "C"},
+       {"expr": "glmocr_config_sgl_max_running",    "legendFormat": "SGLang cap",     "refId": "D"}
+     ]}
+  ]
+}

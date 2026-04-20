@@ -23,8 +23,20 @@ sed 's/^/  | /' /app/config.yaml
 
 export GLMOCR_CONFIG=/app/config.yaml
 
-echo "[entrypoint] gunicorn workers=${CPU_WORKERS} threads=${CPU_THREADS} timeout=${GUNICORN_TIMEOUT}"
+# Multi-worker Prometheus metrics need a shared tmpfs-style dir. Wipe it on
+# start so stale dead-worker values from previous boots don't pollute the
+# aggregation.
+export PROMETHEUS_MULTIPROC_DIR="${PROMETHEUS_MULTIPROC_DIR:-/tmp/prom_multiproc}"
+# prometheus_client historically honored `prometheus_multiproc_dir` (lower
+# case, without the PROMETHEUS_ prefix); set both for compatibility.
+export prometheus_multiproc_dir="${PROMETHEUS_MULTIPROC_DIR}"
+rm -rf "${PROMETHEUS_MULTIPROC_DIR}"
+mkdir -p "${PROMETHEUS_MULTIPROC_DIR}"
+
+echo "[entrypoint] gunicorn workers=${CPU_WORKERS} threads=${CPU_THREADS} "\
+"timeout=${GUNICORN_TIMEOUT}"
 exec gunicorn \
+    --config /app/gunicorn_conf.py \
     --bind "0.0.0.0:${GLMOCR_PORT}" \
     --workers "${CPU_WORKERS}" \
     --threads "${CPU_THREADS}" \

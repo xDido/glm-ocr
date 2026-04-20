@@ -25,7 +25,7 @@ fetch_funsd() {
     else
         echo "[funsd] primary host failed, falling back to HF mirror..."
         require_hf
-        huggingface-cli download nielsr/funsd \
+        hf download nielsr/funsd \
             --repo-type dataset --local-dir "${out}"
     fi
     echo "[funsd] -> ${out}"
@@ -38,7 +38,7 @@ fetch_omnidocbench() {
     fi
     require_hf
     echo "[omnidocbench] pulling opendatalab/OmniDocBench (~1.5 GB)..."
-    huggingface-cli download opendatalab/OmniDocBench \
+    hf download opendatalab/OmniDocBench \
         --repo-type dataset --local-dir "${out}"
     echo "[omnidocbench] -> ${out}"
     echo "  this is the benchmark GLM-OCR reports on; apples-to-apples"
@@ -49,14 +49,14 @@ fetch_docvqa() {
     if [[ -d "${out}" ]]; then echo "[docvqa] already present at ${out}"; return; fi
     require_hf
     echo "[docvqa] pulling nielsr/docvqa_1200_examples (compact subset)..."
-    huggingface-cli download nielsr/docvqa_1200_examples \
+    hf download nielsr/docvqa_1200_examples \
         --repo-type dataset --local-dir "${out}"
     echo "[docvqa] -> ${out}"
 }
 
 require_hf() {
-    if ! command -v huggingface-cli >/dev/null 2>&1; then
-        echo "huggingface-cli not found. Install with:" >&2
+    if ! command -v hf >/dev/null 2>&1; then
+        echo "hf CLI not found. Install with:" >&2
         echo "  pip install 'huggingface_hub[cli]'" >&2
         exit 1
     fi

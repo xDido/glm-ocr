@@ -24,6 +24,11 @@ services:
       SGL_CHUNKED_PREFILL: ${SGL_CHUNKED_PREFILL}
       SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE}
       SGL_SCHEDULE_POLICY: ${SGL_SCHEDULE_POLICY}
+      SGL_SPECULATIVE: ${SGL_SPECULATIVE:-}
+      SGL_SPEC_ALGORITHM: ${SGL_SPEC_ALGORITHM:-}
+      SGL_SPEC_NUM_STEPS: ${SGL_SPEC_NUM_STEPS:-}
+      SGL_SPEC_EAGLE_TOPK: ${SGL_SPEC_EAGLE_TOPK:-}
+      SGL_SPEC_NUM_DRAFT_TOKENS: ${SGL_SPEC_NUM_DRAFT_TOKENS:-}
       HF_TOKEN: ${HF_TOKEN}
       HF_HOME: /root/.cache/huggingface
     volumes:
@@ -38,6 +43,12 @@ services:
       stack: 67108864
     deploy:
       resources:
+        # Mirror g4dn.2xlarge sizing (8 vCPU, 32 GB) so local numbers
+        # are comparable to what the AWS target will see. Honored by
+        # `docker compose up` in non-swarm mode.
+        limits:
+          cpus: "8"
+          memory: 32G
         reservations:
           devices:
             - driver: nvidia
@@ -54,6 +65,7 @@ services:
   cpu:
     build:
       context: ./docker/cpu
+      dockerfile: Dockerfile.slim
     image: glmocr-cpu:local
     container_name: glmocr-cpu
     restart: unless-stopped
@@ -62,6 +74,11 @@ services:
     environment:
       CPU_WORKERS: ${CPU_WORKERS}
       CPU_THREADS: ${CPU_THREADS}
+      # Torch/MKL math-thread caps. Critical on CPU layout inference:
+      # without caps, 4 workers × default OMP=8 = 32 threads fighting
+      # the 8-vCPU cgroup. Default to 2 when unset.
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-2}
       GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT}
       GLMOCR_PORT: "5002"
       OCR_MAX_WORKERS: ${OCR_MAX_WORKERS}
@@ -76,6 +93,10 @@ services:
       LAYOUT_DEVICE: ${LAYOUT_DEVICE}
       LAYOUT_USE_POLYGON: ${LAYOUT_USE_POLYGON}
       LAYOUT_MODEL_DIR: ${LAYOUT_MODEL_DIR:-PaddlePaddle/PP-DocLayoutV3_safetensors}
+      LAYOUT_COMPILE: ${LAYOUT_COMPILE:-false}
+      LAYOUT_BATCH_ENABLED: ${LAYOUT_BATCH_ENABLED:-false}
+      LAYOUT_BATCH_MAX: ${LAYOUT_BATCH_MAX:-4}
+      LAYOUT_BATCH_WINDOW_MS: ${LAYOUT_BATCH_WINDOW_MS:-20}
       HF_HOME: /root/.cache/huggingface
       HF_TOKEN: ${HF_TOKEN}
       SGLANG_HOST: ${SGLANG_HOST}
@@ -101,6 +122,17 @@ services:
     depends_on:
       sglang:
         condition: service_healthy
+    deploy:
+      resources:
+        # 8 vCPU / 20 GB to mirror g4dn.2xlarge co-located sizing.
+        # No GPU reservation — layout-on-CUDA was evaluated and rejected
+        # on the 8 GB dev card because torch's CUDA context (~1 GB per
+        # worker) steals VRAM from SGLang's KV cache. Keep layout on CPU
+        # in this container; re-add a reservation only if LAYOUT_DEVICE
+        # moves back to cuda on a 16 GB+ target.
+        limits:
+          cpus: "8"
+          memory: 20G
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5002/health || curl -fsS -o /dev/null http://localhost:5002/ || exit 1"]
       interval: 10s

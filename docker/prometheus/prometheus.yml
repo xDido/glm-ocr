@@ -1,0 +1,44 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  scrape_timeout: 4s
+
+scrape_configs:
+
+  - job_name: sglang
+    static_configs:
+      - targets: [sglang:30000]
+    metrics_path: /metrics
+
+  - job_name: glmocr_cpu
+    static_configs:
+      - targets: [cpu:5002]
+    metrics_path: /metrics
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+  # Pushgateway holds the asyncio bench's final summary. honor_labels=true
+  # so the `job=...` label the bench pushed is kept instead of being
+  # overwritten with "pushgateway".
+  - job_name: pushgateway
+    honor_labels: true
+    static_configs:
+      - targets: [pushgateway:9091]
+
+  # locust_exporter scrapes Locust's web API on the host during the run.
+  # Outside of a run the target is DOWN (expected).
+  - job_name: locust_exporter
+    static_configs:
+      - targets: [locust-exporter:9646]
+
+  # cAdvisor emits per-container CPU / mem / net / disk.
+  - job_name: cadvisor
+    static_configs:
+      - targets: [cadvisor:8080]
+
+  # NVIDIA DCGM exporter (util%, VRAM, temp, power, SM clocks).
+  - job_name: gpu
+    static_configs:
+      - targets: [nvidia-gpu-exporter:9400]

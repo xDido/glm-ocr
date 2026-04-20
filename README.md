@@ -55,10 +55,12 @@ All knobs live in `.env`. The mapping:
 | `OCR_RETRY_MAX`            | `pipeline.ocr_api.retry_max_attempts` | Retry count for 429/5xx                 |
 | `OCR_CONN_POOL`            | `pipeline.ocr_api.connection_pool_size` | Must be ≥ `CPU_THREADS × OCR_MAX_WORKERS` |
 | `LAYOUT_ENABLED`           | template branch   | false → bypass PP-DocLayoutV3, send full pages              |
-| `SGL_MAX_RUNNING_REQUESTS` | `--max-running-requests` | SGLang batch cap                                     |
-| `SGL_MAX_PREFILL_TOKENS`   | `--max-prefill-tokens`   | SGLang prefill budget                                |
+| `SGL_MAX_RUNNING_REQUESTS` | `--max-running-requests` | SGLang batch cap (how many requests batch on the GPU) |
+| `SGL_MAX_PREFILL_TOKENS`   | `--max-prefill-tokens`   | Tokens per prefill step                              |
+| `SGL_MAX_TOTAL_TOKENS`     | `--max-total-tokens`     | Total KV-cache slots across in-flight requests       |
 | `SGL_MEM_FRACTION_STATIC`  | `--mem-fraction-static`  | Fraction of GPU mem reserved for KV cache            |
-| `SGL_CHUNKED_PREFILL`      | `--chunked-prefill`      | Interleave prefill with decode                       |
+| `SGL_CHUNKED_PREFILL`      | `--chunked-prefill-size` | Interleave prefill with decode (size from `SGL_CHUNKED_PREFILL_SIZE`) |
+| `SGL_SCHEDULE_POLICY`      | `--schedule-policy`      | `lpm` (prefix-cache aware) or `fcfs`                 |
 
 See `.env.example` for the full list.
 
@@ -143,6 +145,50 @@ mark each driver's start and end on the "GLM-OCR Load Test" dashboard.
 
 Sweep `OCR_MAX_WORKERS × SGL_MAX_RUNNING_REQUESTS` to build the sizing
 table for ECS.
+
+### Staged sweep
+
+`scripts/tune_params.py` has three staged modes for producing an
+evidence-based sizing report. All use `N=200` per cell, a seeded image
+pool for reproducibility, and a 10% fail-rate abort that cuts off bad
+cells mid-bench (configurable):
+
+```bash
+# Stage A — 1D scans across every SGLang knob (incl. speculative
+# decoding sub-knobs + SGL_MEM_FRACTION_STATIC) and OCR_CONN_POOL.
+python scripts/tune_params.py --stage a --dry-run     # preview matrix
+python scripts/tune_params.py --stage a               # progress log shows [N/M pct%]
+
+# Stage B — 2D fine-tune on the top-2 axes from Stage A.
+python scripts/tune_params.py --stage b --axes OCR_MAX_WORKERS,SGL_MAX_RUNNING_REQUESTS
+
+# Stage C — c-curve verification at a fixed config.
+python scripts/tune_params.py --stage c \
+    --set OCR_MAX_WORKERS=4 --set SGL_MAX_RUNNING_REQUESTS=24
+
+# Flags:
+#   --max-fail-rate 0.10         default; 0 disables early-abort
+#   --min-sample-for-abort 40    observations before abort can trigger
+```
+
+The CPU container is built from `docker/cpu/Dockerfile.slim`
+(python-slim + torch+cpu from PyTorch's CPU wheel index). Saves ~5 GB
+over the CUDA-inclusive default. Rebuild cleanly with
+`bash scripts/rebuild_and_up.sh`.
+
+The sweep includes SGLang speculative decoding (NEXTN heads shipped in
+the GLM-OCR weights); see `.env` for `SGL_SPECULATIVE` + sub-knobs and
+`docker/gpu/entrypoint.sh` for how they wire into the launch args.
+
+Raw per-trial JSON lands under `loadtest/results/raw/<run-id>/`; render
+inline-PNG markdown reports with:
+
+```bash
+python scripts/lib/render_report.py stage \
+    --trials loadtest/results/raw/<run-id>/_trials.json \
+    --out    loadtest/results/<run-id>.md \
+    --run-id <run-id>
+```
 
 ## Windows + NVIDIA Docker notes
 

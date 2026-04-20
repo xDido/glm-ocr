@@ -1,4 +1,4 @@
-FROM python:3.12
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
       PYTHONUNBUFFERED=1 \
@@ -10,21 +10,36 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #   libgl1 / libglib2.0-0 -> opencv runtime libs
 #   gettext-base   -> envsubst
 #   curl           -> healthcheck
+#
+# On malloc: sticking with glibc. jemalloc+balanced-decay was evaluated
+# and costs ~15% throughput on this workload (aiohttp + PyTorch small-
+# alloc density). Instead we bound memory growth via gunicorn's
+# `--max-requests` so workers recycle every N requests (see entrypoint).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       poppler-utils \
       libgl1 \
       libglib2.0-0 \
       gettext-base \
       curl \
+      g++ \
       && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install glmocr with self-host + server extras, plus gunicorn.
-# psutil + pyyaml power the /runtime observability endpoint.
-# prometheus-flask-exporter + prometheus-client expose /metrics (HTTP
-# counter/histogram/status metrics + the custom glmocr_* gauges) so
-# Prometheus can scrape this container.
+# Install torch CPU-only from PyTorch's dedicated index. The default
+# torch wheel on PyPI declares hard deps on nvidia-cuda-*, nvidia-cudnn-*,
+# nvidia-nccl-* (~5 GB) that we never touch — LAYOUT_DEVICE=cuda was
+# evaluated on this 8 GB dev card and the VRAM contention with SGLang
+# cost more than the layout speedup gained (see phase-probe notes).
+# Pre-installing `+cpu` satisfies glmocr's torch requirement so pip
+# does not re-resolve it from PyPI on the next step.
+RUN pip install \
+      --index-url https://download.pytorch.org/whl/cpu \
+      "torch>=2.2,<3" \
+      "torchvision>=0.17,<1"
+
+# Now install glmocr and friends. pip sees torch is already satisfied and
+# skips the CUDA-inclusive wheel.
 RUN pip install \
       "glmocr[selfhosted,server]" \
       "gunicorn>=21.2,<23" \
@@ -35,8 +50,6 @@ RUN pip install \
 
 COPY wsgi.py /app/wsgi.py
 COPY runtime_app.py /app/runtime_app.py
-# Gunicorn child_exit hook used by prometheus_client to reap per-worker
-# multiproc files. Paired with PROMETHEUS_MULTIPROC_DIR from entrypoint.sh.
 COPY gunicorn_conf.py /app/gunicorn_conf.py
 COPY config.yaml.template /app/config.yaml.template
 COPY config.layout-off.template /app/config.layout-off.template

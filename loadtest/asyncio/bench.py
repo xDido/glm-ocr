@@ -50,6 +50,17 @@ def parse_args() -> argparse.Namespace:
                    help="per-request timeout (s)")
     p.add_argument("--warmup", type=int, default=2,
                    help="warmup requests (excluded from stats)")
+    p.add_argument("--pool-seed", type=int, default=None,
+                   help="seed the per-request random pool draw for "
+                        "reproducibility; unset = non-deterministic")
+    p.add_argument("--max-fail-rate", type=float, default=None,
+                   help="abort the run mid-flight once fail/attempted "
+                        "exceeds this fraction after --min-sample-for-abort "
+                        "observations. Unset = never abort.")
+    p.add_argument("--min-sample-for-abort", type=int, default=40,
+                   help="minimum completed requests before --max-fail-rate "
+                        "can trigger an abort (guards against unlucky "
+                        "warmup streaks).")
     p.add_argument("--json-out", type=Path, default=None,
                    help="write results as JSON")
     p.add_argument("--pushgateway-url", type=str, default=None,
@@ -75,7 +86,10 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 async def one_call(session: aiohttp.ClientSession, url: str,
-                   body: dict[str, Any], timeout: float) -> tuple[bool, float, int, str | None]:
+                   body: dict[str, Any], timeout: float) -> tuple[bool, float, int, str | None, str]:
+    """Returns (ok, elapsed_s, status, err_str_or_None, image_url). The
+    image_url is captured so the caller can build per-doc failure details."""
+    image_url = (body.get("images") or ["?"])[0]
     start = time.perf_counter()
     try:
         async with session.post(url, json=body,
@@ -84,9 +98,9 @@ async def one_call(session: aiohttp.ClientSession, url: str,
             elapsed = time.perf_counter() - start
             ok = resp.status == 200
             err = None if ok else f"status={resp.status} body={payload[:200]!r}"
-            return ok, elapsed, resp.status, err
+            return ok, elapsed, resp.status, err, image_url
     except Exception as exc:
-        return False, time.perf_counter() - start, 0, repr(exc)
+        return False, time.perf_counter() - start, 0, repr(exc), image_url
 
 
 def _resolve_image_pool(args: argparse.Namespace) -> list[str]:
@@ -108,16 +122,32 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     url = args.host.rstrip("/") + args.endpoint
     pool = _resolve_image_pool(args)
 
+    if args.pool_seed is not None:
+        random.seed(args.pool_seed)
+
     sem = asyncio.Semaphore(args.concurrency)
-    results: list[tuple[bool, float, int, str | None]] = []
+    results: list[tuple[bool, float, int, str | None, str]] = []
+    aborted_event = asyncio.Event()
 
     async with aiohttp.ClientSession() as session:
         async def worker(_i: int) -> None:
+            # If abort already tripped before the slot opened, don't even
+            # send the request — saves the GPU from pointless work.
+            if aborted_event.is_set():
+                return
             # Each request independently samples one image from the pool;
             # same URL when pool size == 1, random otherwise.
             body = {"images": [random.choice(pool)]}
             async with sem:
-                results.append(await one_call(session, url, body, args.timeout))
+                if aborted_event.is_set():
+                    return
+                r = await one_call(session, url, body, args.timeout)
+            results.append(r)
+            if (args.max_fail_rate is not None
+                    and len(results) >= args.min_sample_for_abort):
+                fails = sum(1 for x in results if not x[0])
+                if fails / len(results) > args.max_fail_rate:
+                    aborted_event.set()
 
         if args.warmup:
             print(f"[warmup] firing {args.warmup} request(s)...")
@@ -125,10 +155,16 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             results.clear()
 
         print(f"[bench] host={args.host} total={args.total} "
-              f"concurrency={args.concurrency} pool_size={len(pool)}")
+              f"concurrency={args.concurrency} pool_size={len(pool)}"
+              + (f" max_fail_rate={args.max_fail_rate:.0%}"
+                 if args.max_fail_rate is not None else ""))
         wall_start = time.perf_counter()
-        await asyncio.gather(*[worker(i) for i in range(args.total)])
+        await asyncio.gather(*[worker(i) for i in range(args.total)],
+                             return_exceptions=True)
         wall = time.perf_counter() - wall_start
+        if aborted_event.is_set():
+            print(f"[bench] aborted at {len(results)}/{args.total} "
+                  f"(fail% exceeded {args.max_fail_rate:.0%})")
 
     oks = [r for r in results if r[0]]
     fails = [r for r in results if not r[0]]
@@ -139,6 +175,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "endpoint": args.endpoint,
         "concurrency": args.concurrency,
         "total": args.total,
+        "pool_size": len(pool),
+        "pool_seed": args.pool_seed,
+        "aborted": aborted_event.is_set(),
+        "requests_attempted": len(results),
+        "max_fail_rate": args.max_fail_rate,
         "wall_seconds": wall,
         "throughput_rps": (len(oks) / wall) if wall > 0 else 0.0,
         "successes": len(oks),
@@ -153,6 +194,18 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "max": max(ok_lat_ms) if ok_lat_ms else math.nan,
         },
         "error_samples": [r[3] for r in fails[:5]],
+        # Per-failure breakdown: which doc failed, how long it spent
+        # before failing, what the error was. Useful to identify
+        # pathological documents in the pool.
+        "failure_details": [
+            {
+                "image_url": r[4],
+                "elapsed_ms": r[1] * 1000,
+                "status": r[2],
+                "error": r[3],
+            }
+            for r in fails
+        ],
     }
     return summary
 

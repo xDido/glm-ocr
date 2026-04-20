@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Register the CPU + GPU ECS task definitions against either real AWS or
-# a local ministack endpoint (ECS_ENDPOINT=http://localhost:4566).
+# Register the CPU + GPU ECS task definitions against AWS. Override
+# ECS_ENDPOINT only if pointing at a custom endpoint.
 #
 # Relies on envsubst to expand ${VAR} placeholders inside the task-def JSON.
 # Pass all the same knobs from .env — this script sources .env if present.
@@ -18,7 +18,6 @@ fi
 : "${AWS_SECRET_ACCESS_KEY:=test}"
 : "${ECS_ENDPOINT:=}"
 
-# Defaults safe against ministack (roles / ARNs are accepted as strings there).
 : "${EXECUTION_ROLE_ARN:=arn:aws:iam::000000000000:role/ecsTaskExecutionRole}"
 : "${TASK_ROLE_ARN:=arn:aws:iam::000000000000:role/ecsTaskRole}"
 : "${CPU_IMAGE_URI:=glmocr-cpu:local}"
@@ -57,9 +56,18 @@ for fam in cpu gpu; do
     out="${tmp_dir}/ecs-task-${fam}.json"
     envsubst < "${src}" > "${out}"
 
+    # On Windows (Git Bash/MSYS), aws.exe is native and can't resolve MSYS
+    # paths like /tmp/... — convert to a Windows-native path for the file://
+    # URI. On Linux/macOS cygpath is absent and we use ${out} directly.
+    if command -v cygpath >/dev/null 2>&1; then
+        uri="file://$(cygpath -m "${out}")"
+    else
+        uri="file://${out}"
+    fi
+
     echo "[register-tasks] registering ${fam} task definition..."
     aws "${AWS_ARGS[@]}" ecs register-task-definition \
-        --cli-input-json "file://${out}" \
+        --cli-input-json "${uri}" \
         --query 'taskDefinition.taskDefinitionArn' --output text
 done
 

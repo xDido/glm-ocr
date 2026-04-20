@@ -1,0 +1,29 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prom
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+
+  # Grafana Cloud Mimir — queries land here when the dashboard's "Datasource"
+  # dropdown is flipped to "Prometheus (Cloud)". Inert if the three env vars
+  # are empty; Grafana will surface a connection error on queries, which is
+  # the right signal that cloud isn't configured yet.
+  - name: Prometheus (Cloud)
+    type: prometheus
+    uid: prom-cloud
+    access: proxy
+    url: ${GRAFANA_CLOUD_PROM_URL_READ}
+    basicAuth: true
+    basicAuthUser: ${GRAFANA_CLOUD_PROM_USER}
+    editable: false
+    jsonData:
+      timeInterval: 15s
+    secureJsonData:
+      basicAuthPassword: ${GRAFANA_CLOUD_PROM_TOKEN}
