@@ -21,6 +21,7 @@ services:
       SGL_MAX_PREFILL_TOKENS: ${SGL_MAX_PREFILL_TOKENS}
       SGL_MAX_TOTAL_TOKENS: ${SGL_MAX_TOTAL_TOKENS}
       SGL_MEM_FRACTION_STATIC: ${SGL_MEM_FRACTION_STATIC}
+      SGL_CONTEXT_LENGTH: ${SGL_CONTEXT_LENGTH:-}
       SGL_CHUNKED_PREFILL: ${SGL_CHUNKED_PREFILL}
       SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE:-8192}
       SGL_SCHEDULE_POLICY: ${SGL_SCHEDULE_POLICY}
@@ -48,7 +49,7 @@ services:
         # `docker compose up` in non-swarm mode.
         limits:
           cpus: "8"
-          memory: 32G
+          memory: 8G
         reservations:
           devices:
             - driver: nvidia

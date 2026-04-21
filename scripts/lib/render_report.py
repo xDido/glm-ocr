@@ -240,11 +240,28 @@ def render_simple(args: argparse.Namespace) -> None:
 def render_sweep(args: argparse.Namespace) -> None:
     bench_paths = [pathlib.Path(p) for p in args.bench]
     summaries = []
-    for p in sorted(bench_paths, key=lambda pp: json.loads(pp.read_text())["concurrency"]):
+    for p in bench_paths:
         try:
             summaries.append(json.loads(p.read_text(encoding="utf-8")))
         except Exception as exc:
             print(f"[render_report] skipping {p}: {exc!r}", file=sys.stderr)
+
+    # Sort into two groups so the matrix report reads top-down from
+    # "single-user paced" to "loaded back-to-back":
+    #   group 0: paced runs (interval_seconds > 0) sorted by interval asc
+    #   group 1: unpaced runs sorted by concurrency asc
+    # Pure-concurrency sweeps (all interval=0) collapse to plain
+    # concurrency-asc ordering, matching prior behavior.
+    def _sort_key(s: dict) -> tuple:
+        iv = float(s.get("interval_seconds") or 0.0)
+        c = int(s.get("concurrency", 0))
+        return (0 if iv > 0 else 1, iv, c)
+    summaries.sort(key=_sort_key)
+
+    def _row_label(s: dict) -> str:
+        iv = float(s.get("interval_seconds") or 0.0)
+        c = int(s.get("concurrency", 0))
+        return f"c={c}, i={iv:g}s" if iv > 0 else f"c={c}"
 
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     host = summaries[0].get("host", "") if summaries else ""
@@ -252,16 +269,19 @@ def render_sweep(args: argparse.Namespace) -> None:
     # Comparison table rows. Mean is shown because it is the stable
     # complement to wall (wall is max-over-slots and noise-dominated at
     # small N; mean is population-average and converges faster).
-    hdr = ("| c | ok | fail | fail % | wall s | rps | mean | min | p50 | p90 | p95 | p99 | max |")
-    sep = ("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    # `interval (s)` column: '—' when the trial was unpaced (back-to-back).
+    hdr = ("| c | interval (s) | ok | fail | fail % | wall s | rps | mean | min | p50 | p90 | p95 | p99 | max |")
+    sep = ("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     rows = [hdr, sep]
     for s in summaries:
         ok = s["successes"]
         fail = s["failures"]
         tot = s["total"]
         lat = s["latency_ms"]
+        iv = float(s.get("interval_seconds") or 0.0)
+        iv_cell = f"{iv:g}" if iv > 0 else "—"
         rows.append(
-            f"| {s['concurrency']} | {ok} | {fail} | {_pct(ok, tot)} | "
+            f"| {s['concurrency']} | {iv_cell} | {ok} | {fail} | {_pct(ok, tot)} | "
             f"{s['wall_seconds']:.1f} | {s['throughput_rps']:.3f} | "
             f"{lat.get('mean', float('nan')):,.0f} | "
             f"{lat['min']:,.0f} | {lat['p50']:,.0f} | {lat['p90']:,.0f} | "
@@ -272,19 +292,19 @@ def render_sweep(args: argparse.Namespace) -> None:
     # Per-level error samples.
     err_sections = []
     for s in summaries:
-        c = s["concurrency"]
+        label = _row_label(s)
         failures = s.get("failures", 0)
         samples = s.get("error_samples") or []
         if failures == 0:
-            err_sections.append(f"- **c={c}**: no failures ✓")
+            err_sections.append(f"- **{label}**: no failures ✓")
         else:
             err_sections.append(
-                f"- **c={c}** ({failures} failures): "
+                f"- **{label}** ({failures} failures): "
                 + ", ".join(f"`{x}`" for x in samples[:3])
             )
     errs = "\n".join(err_sections)
 
-    concurrencies = ", ".join(str(s["concurrency"]) for s in summaries)
+    concurrencies = ", ".join(_row_label(s) for s in summaries)
 
     md = f"""# GLM-OCR asyncio concurrency sweep — {args.run_id}
 
@@ -292,7 +312,38 @@ def render_sweep(args: argparse.Namespace) -> None:
 **Driver:** asyncio (`loadtest/asyncio/bench.py`)
 **Endpoint:** `{host}{summaries[0].get("endpoint", "") if summaries else ""}`
 **Dataset:** OmniDocBench ({args.pool_size}-image pool)
-**Concurrency levels:** {concurrencies}
+**Trials:** {concurrencies}
+
+## Tuning recommendations (prod)
+
+1. **Pin GPU clocks at host boot.** Prevents GPU frequency scaling from
+   injecting 200-500 ms of idle-recovery variance into SGLang's
+   generation loop — you see this as a fat first-request tail after
+   idle. Add to the ASG's user-data script:
+
+   ```bash
+   # Enable persistence mode — driver stays loaded even when no process holds the GPU
+   nvidia-smi -pm 1
+
+   # Lock GPU clocks to max on the T4
+   # T4 supported clocks: memory=5001 MHz, sm=585-1590 MHz
+   nvidia-smi -lgc 1590,1590   # lock SM clock to max
+   nvidia-smi -lmc 5001        # lock memory clock to max
+   ```
+
+   **Effect:** GPU stays at P0 (max clocks) forever, no throttling;
+   eliminates the 200-500 ms idle-recovery penalty on the first request
+   after quiet periods.
+
+   **Tradeoff:** continuous power draw (same $/hour on AWS — billed by
+   instance hour, not GPU work).
+
+   **Requires:** root on the host. In ECS-EC2 this means user-data runs
+   as root (fine). Fargate cannot do this (no host access), but SGLang
+   runs on EC2 here so that's OK.
+
+   Right fix for this workload — low effort, high impact, no latency
+   regression elsewhere.
 
 ## Server runtime
 
@@ -1121,6 +1172,38 @@ def _render_stage_c(args, trials, plt, png_dir, now,
         )
     table_md = "\n".join(rows)
 
+    # Memory-ceiling table: per-cell CPU + SGLang RSS and VRAM, with a
+    # 16-GiB headroom verdict so the "does prod ever cross the cpu
+    # container's memory budget?" question has a one-glance answer.
+    mem_ceiling_rows = [
+        "| # | c | CPU RSS mean | CPU RSS p99 | CPU RSS max | SGLang RSS max | VRAM max | headroom to 16 GiB |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    def _mib(v):
+        return f"{v/1024:.2f} GiB" if isinstance(v, (int, float)) and v > 0 else "—"
+
+    for i, t in enumerate(c_trials, 1):
+        s = t["summary"]
+        p = s.get("probe_summary") or {}
+        c = int(s.get("concurrency", 0)) or int(t.get("knobs", {}).get("concurrency", 0))
+        cpu_avg = p.get("mem_rss_cpu_mb_avg")
+        cpu_p99 = p.get("mem_rss_cpu_mb_p99")
+        cpu_max = p.get("mem_rss_cpu_mb_max")
+        sgl_max = p.get("mem_rss_sgl_mb_max")
+        vram_max = p.get("vram_used_mb_max")
+        if isinstance(cpu_max, (int, float)):
+            headroom_mib = 16384 - cpu_max
+            verdict = "✅" if headroom_mib >= 0 else "❌"
+            headroom_str = f"{headroom_mib/1024:+.2f} GiB {verdict}"
+        else:
+            headroom_str = "—"
+        mem_ceiling_rows.append(
+            f"| {i} | {c} | {_mib(cpu_avg)} | {_mib(cpu_p99)} | {_mib(cpu_max)} | "
+            f"{_mib(sgl_max)} | {_mib(vram_max)} | {headroom_str} |"
+        )
+    mem_ceiling_md = "\n".join(mem_ceiling_rows)
+
     # Winner: SLO-compliant cell with highest rps.
     winner_md = "_(no SLO-compliant cell)_"
     if slo_winners:
@@ -1170,6 +1253,18 @@ def _render_stage_c(args, trials, plt, png_dir, now,
 ## Grid
 
 {table_md}
+
+## Memory ceiling (per cell)
+
+{mem_ceiling_md}
+
+**How to read:** `CPU RSS max` is the single worst 2-second probe sample
+inside that cell — the number that matters for cgroup limits. `p99` is
+the 99th-percentile sustained draw (worst of roughly 40 samples per
+cell, so more a "worst-of-many" than a strict statistical p99).
+`headroom to 16 GiB` = `16384 − CPU RSS max (MiB)`; positive = ✅, negative = ❌.
+SGLang and VRAM columns are informational — they live in the GPU
+container and VRAM, not the cpu-container memory budget.
 
 ## Curve
 

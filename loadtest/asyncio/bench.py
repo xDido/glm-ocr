@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
                    help="per-request timeout (s)")
     p.add_argument("--warmup", type=int, default=2,
                    help="warmup requests (excluded from stats)")
+    p.add_argument("--interval-seconds", type=float, default=0.0,
+                   help="baseline/paced mode: fire requests serially, "
+                        "sleeping this many seconds between submissions "
+                        "(measured from the start of one request to the "
+                        "start of the next). When >0, --concurrency is "
+                        "forced to 1 and --max-fail-rate abort is "
+                        "evaluated between requests.")
     p.add_argument("--pool-seed", type=int, default=None,
                    help="seed the per-request random pool draw for "
                         "reproducibility; unset = non-deterministic")
@@ -125,7 +132,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.pool_seed is not None:
         random.seed(args.pool_seed)
 
-    sem = asyncio.Semaphore(args.concurrency)
+    paced = args.interval_seconds > 0
+    effective_concurrency = 1 if paced else args.concurrency
+    sem = asyncio.Semaphore(effective_concurrency)
     results: list[tuple[bool, float, int, str | None, str]] = []
     aborted_event = asyncio.Event()
 
@@ -155,12 +164,29 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             results.clear()
 
         print(f"[bench] host={args.host} total={args.total} "
-              f"concurrency={args.concurrency} pool_size={len(pool)}"
+              f"concurrency={effective_concurrency} pool_size={len(pool)}"
+              + (f" interval={args.interval_seconds}s" if paced else "")
               + (f" max_fail_rate={args.max_fail_rate:.0%}"
                  if args.max_fail_rate is not None else ""))
         wall_start = time.perf_counter()
-        await asyncio.gather(*[worker(i) for i in range(args.total)],
-                             return_exceptions=True)
+        if paced:
+            # Serial paced mode: fire -> complete -> sleep remaining slice.
+            # Sleep is measured from each request's start, so if a request
+            # takes longer than the interval we send the next one
+            # immediately (no piling up).
+            for i in range(args.total):
+                if aborted_event.is_set():
+                    break
+                tick = time.perf_counter()
+                await worker(i)
+                elapsed = time.perf_counter() - tick
+                if i < args.total - 1:
+                    remaining = args.interval_seconds - elapsed
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+        else:
+            await asyncio.gather(*[worker(i) for i in range(args.total)],
+                                 return_exceptions=True)
         wall = time.perf_counter() - wall_start
         if aborted_event.is_set():
             print(f"[bench] aborted at {len(results)}/{args.total} "
@@ -173,7 +199,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "host": args.host,
         "endpoint": args.endpoint,
-        "concurrency": args.concurrency,
+        "concurrency": effective_concurrency,
+        "interval_seconds": args.interval_seconds if paced else 0.0,
         "total": args.total,
         "pool_size": len(pool),
         "pool_seed": args.pool_seed,

@@ -22,6 +22,7 @@ ARGS=(
 [[ -n "${SGL_MAX_PREFILL_TOKENS:-}"   ]] && ARGS+=(--max-prefill-tokens    "${SGL_MAX_PREFILL_TOKENS}")
 [[ -n "${SGL_MAX_TOTAL_TOKENS:-}"     ]] && ARGS+=(--max-total-tokens      "${SGL_MAX_TOTAL_TOKENS}")
 [[ -n "${SGL_MEM_FRACTION_STATIC:-}"  ]] && ARGS+=(--mem-fraction-static   "${SGL_MEM_FRACTION_STATIC}")
+[[ -n "${SGL_CONTEXT_LENGTH:-}"       ]] && ARGS+=(--context-length        "${SGL_CONTEXT_LENGTH}")
 [[ -n "${SGL_SCHEDULE_POLICY:-}"      ]] && ARGS+=(--schedule-policy       "${SGL_SCHEDULE_POLICY}")
 
 # Chunked prefill: the bare --chunked-prefill flag was renamed to

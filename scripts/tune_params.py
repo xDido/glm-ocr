@@ -318,23 +318,43 @@ def _probe_aggregate(probe_path: pathlib.Path) -> dict:
         v = _vals(key)
         return (sum(v) / len(v)) if v else None
 
-    def _p95(key: str) -> float | None:
+    def _max(key: str) -> float | None:
+        v = _vals(key)
+        return max(v) if v else None
+
+    def _q(key: str, q: float) -> float | None:
         v = sorted(_vals(key))
         if not v:
             return None
-        return v[min(len(v) - 1, int(0.95 * len(v)))]
+        return v[min(len(v) - 1, int(q * len(v)))]
+
+    def _p95(key: str) -> float | None:
+        return _q(key, 0.95)
+
+    def _p99(key: str) -> float | None:
+        return _q(key, 0.99)
 
     return {
         "samples":            len(samples),
         "gpu_util_avg":       _avg("gpu_util_pct"),
         "gpu_util_p95":       _p95("gpu_util_pct"),
+        "gpu_util_max":       _max("gpu_util_pct"),
         "vram_used_mb_avg":   _avg("vram_used_mb"),
+        "vram_used_mb_p99":   _p99("vram_used_mb"),
+        "vram_used_mb_max":   _max("vram_used_mb"),
         "vram_free_mb_avg":   _avg("vram_free_mb"),
         "cpu_cores_cpu_avg":  _avg("cpu_cores_cpu"),
+        "cpu_cores_cpu_max":  _max("cpu_cores_cpu"),
         "cpu_cores_sgl_avg":  _avg("cpu_cores_sglang"),
+        "cpu_cores_sgl_max":  _max("cpu_cores_sglang"),
         "mem_rss_cpu_mb_avg": _avg("mem_rss_cpu_mb"),
+        "mem_rss_cpu_mb_p99": _p99("mem_rss_cpu_mb"),
+        "mem_rss_cpu_mb_max": _max("mem_rss_cpu_mb"),
         "mem_rss_sgl_mb_avg": _avg("mem_rss_sglang_mb"),
+        "mem_rss_sgl_mb_p99": _p99("mem_rss_sglang_mb"),
+        "mem_rss_sgl_mb_max": _max("mem_rss_sglang_mb"),
         "in_flight_avg":      _avg("in_flight"),
+        "in_flight_max":      _max("in_flight"),
         "sglang_running_avg": _avg("sglang_running"),
         "sglang_queued_avg":  _avg("sglang_queued"),
     }

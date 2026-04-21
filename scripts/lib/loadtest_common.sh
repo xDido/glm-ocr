@@ -69,19 +69,67 @@ preflight_omnidoc() {
 #   Samples OMNIDOC_SAMPLE_POOL images under DATASET_DIR, writes them
 #   (rewritten to CONTAINER_DATASET_ROOT) one-per-line to <urls_file>.
 #   Sets POOL_SIZE (int) and IMAGES_CSV (comma-joined).
+#
+#   Honors POOL_SEED when set — two invocations with the same dataset
+#   and same seed produce IDENTICAL urls_file output, so load-test
+#   results can be compared across runs without workload drift. When
+#   POOL_SEED is unset, falls back to `shuf` (non-deterministic, matches
+#   historical behavior).
 # ---------------------------------------------------------------------------
 build_omnidoc_pool() {
     local urls_file="$1"
+    local file_list
+    file_list="$(mktemp)"
 
-    # `shuf -n N` consumes stdin cleanly. `shuf | head -n N` would SIGPIPE
-    # shuf once head closes stdin; with pipefail that kills the script
-    # with exit 141.
+    # Step 1: full list of candidate files (deterministically sorted
+    # so the seed → pool mapping is stable across filesystems/find
+    # orderings).
+    #
+    # POOL_ASCII_ONLY=1 restricts the pool to filenames containing only
+    # ASCII bytes — i.e. excludes the Chinese-titled textbook pages in
+    # OmniDocBench. Useful when comparing runs across environments that
+    # differ in locale/encoding handling, and to keep documents more
+    # uniform in layout complexity.
     find "${DATASET_DIR}" -type f \
          \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) \
          2>/dev/null \
-         | shuf -n "${OMNIDOC_SAMPLE_POOL}" \
-         | sed -E "s#^${DATASET_DIR}#file://${CONTAINER_DATASET_ROOT}#" \
-         > "${urls_file}"
+         | LC_ALL=C sort \
+         > "${file_list}"
+
+    if [[ "${POOL_ASCII_ONLY:-0}" == "1" ]]; then
+        # grep -P with \P{ASCII} inverted matches lines that contain
+        # only ASCII bytes. We use LC_ALL=C + a regex that rejects any
+        # byte ≥ 0x80 for portable behavior on Git-Bash.
+        LC_ALL=C grep -v $'[^\x01-\x7f]' "${file_list}" > "${file_list}.ascii"
+        mv "${file_list}.ascii" "${file_list}"
+    fi
+
+    # Step 2: pick OMNIDOC_SAMPLE_POOL items. If POOL_SEED is set, use
+    # a seeded Python shuffle (deterministic). Otherwise fall back to
+    # `shuf -n N` (non-deterministic; historical behavior).
+    if [[ -n "${POOL_SEED:-}" ]]; then
+        python - "${file_list}" "${OMNIDOC_SAMPLE_POOL}" "${POOL_SEED}" <<'PY' \
+            | sed -E "s#^${DATASET_DIR}#file://${CONTAINER_DATASET_ROOT}#" \
+            > "${urls_file}"
+import io, random, sys
+# OmniDocBench filenames include non-ASCII (e.g. Chinese textbook
+# pages). Windows Python defaults to cp1252 stdout which can't encode
+# them — reopen stdout as UTF-8 so the shell pipe sees raw bytes.
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="\n")
+path, n, seed = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path, encoding="utf-8") as f:
+    lines = [line.rstrip("\n") for line in f if line.strip()]
+rng = random.Random(seed)
+rng.shuffle(lines)
+for item in lines[:n]:
+    print(item)
+PY
+    else
+        shuf -n "${OMNIDOC_SAMPLE_POOL}" < "${file_list}" \
+            | sed -E "s#^${DATASET_DIR}#file://${CONTAINER_DATASET_ROOT}#" \
+            > "${urls_file}"
+    fi
+    rm -f "${file_list}"
 
     POOL_SIZE="$(wc -l < "${urls_file}" | tr -d ' ')"
     [[ "${POOL_SIZE}" -gt 0 ]] || die "no images found under ${DATASET_DIR}"
