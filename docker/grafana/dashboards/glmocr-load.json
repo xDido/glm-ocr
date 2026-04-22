@@ -374,7 +374,7 @@
      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 61},
      "datasource": {"type": "prometheus", "uid": "${datasource}"},
      "targets": [
-       {"expr": "sglang_num_running_reqs or sglang:num_running_reqs",     "legendFormat": "running", "refId": "A"},
+       {"expr": "sglang:num_running_reqs",     "legendFormat": "running", "refId": "A"},
        {"expr": "glmocr_config_sgl_max_running", "legendFormat": "cap",     "refId": "B"}
      ]},
 
@@ -383,7 +383,7 @@
      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 61},
      "datasource": {"type": "prometheus", "uid": "${datasource}"},
      "targets": [
-       {"expr": "sglang_num_queue_reqs or sglang:num_queue_reqs", "legendFormat": "queued", "refId": "A"}
+       {"expr": "sglang:num_queue_reqs", "legendFormat": "queued", "refId": "A"}
      ]},
 
     {"id": 403, "type": "timeseries", "title": "Generation throughput (tok/s)",
@@ -624,7 +624,7 @@
      "fieldConfig": {"defaults": {"unit": "short", "decimals": 2}},
      "options": {"reduceOptions": {"calcs": ["last"]}, "colorMode": "value", "graphMode": "area"},
      "targets": [
-       {"expr": "avg_over_time(sglang_num_running_reqs[5m]) or avg_over_time(sglang:num_running_reqs[5m])", "refId": "A"}
+       {"expr": "avg_over_time(sglang:num_running_reqs[5m])", "refId": "A"}
      ]},
 
     {"id": 813, "type": "timeseries", "title": "Concurrent requests — all layers",
@@ -644,8 +644,8 @@
      },
      "targets": [
        {"expr": "sum(glmocr_in_flight_requests)", "legendFormat": "CPU in-flight",  "refId": "A"},
-       {"expr": "sglang_num_running_reqs or sglang:num_running_reqs",        "legendFormat": "SGLang running", "refId": "B"},
-       {"expr": "sglang_num_queue_reqs or sglang:num_queue_reqs",            "legendFormat": "SGLang queued",  "refId": "C"},
+       {"expr": "sglang:num_running_reqs",        "legendFormat": "SGLang running", "refId": "B"},
+       {"expr": "sglang:num_queue_reqs",            "legendFormat": "SGLang queued",  "refId": "C"},
        {"expr": "glmocr_config_sgl_max_running",    "legendFormat": "SGLang cap",     "refId": "D"}
      ]}
   ]
