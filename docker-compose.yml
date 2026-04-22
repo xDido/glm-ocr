@@ -48,7 +48,7 @@ services:
         # are comparable to what the AWS target will see. Honored by
         # `docker compose up` in non-swarm mode.
         limits:
-          cpus: "8"
+          cpus: "4"
           memory: 8G
         reservations:
           devices:
@@ -72,6 +72,7 @@ services:
     restart: unless-stopped
     ports:
       - "${GLMOCR_PORT:-5002}:5002"
+      - "${ASYNC_PORT:-5003}:5003"
     environment:
       CPU_WORKERS: ${CPU_WORKERS}
       CPU_THREADS: ${CPU_THREADS}
@@ -96,10 +97,21 @@ services:
       LAYOUT_MODEL_DIR: ${LAYOUT_MODEL_DIR:-PaddlePaddle/PP-DocLayoutV3_safetensors}
       LAYOUT_BACKEND: ${LAYOUT_BACKEND:-torch}
       LAYOUT_ONNX_THREADS: ${LAYOUT_ONNX_THREADS:-1}
+      # Phase 1 — numpy post-processing (drop torch from request path).
+      # torch = upstream default, safe fallback | numpy = no-torch hot path.
+      LAYOUT_POSTPROC: ${LAYOUT_POSTPROC:-torch}
+      # Phase 2 — fused ONNX graph (raw = default, fused = post-proc baked in).
+      # Fused was rolled back (regressed at c=24/32); kept behind the flag.
+      LAYOUT_GRAPH: ${LAYOUT_GRAPH:-raw}
       LAYOUT_COMPILE: ${LAYOUT_COMPILE:-false}
       LAYOUT_BATCH_ENABLED: ${LAYOUT_BATCH_ENABLED:-false}
       LAYOUT_BATCH_MAX: ${LAYOUT_BATCH_MAX:-4}
       LAYOUT_BATCH_WINDOW_MS: ${LAYOUT_BATCH_WINDOW_MS:-20}
+      # Optional async FastAPI sidecar (LAYOUT_ASYNC=true starts uvicorn
+      # on ASYNC_PORT alongside gunicorn). Rolled back — kept behind flag.
+      LAYOUT_ASYNC: ${LAYOUT_ASYNC:-false}
+      ASYNC_PORT: ${ASYNC_PORT:-5003}
+      ASYNC_WORKERS: ${ASYNC_WORKERS:-4}
       HF_HOME: /root/.cache/huggingface
       HF_TOKEN: ${HF_TOKEN}
       SGLANG_HOST: ${SGLANG_HOST}
@@ -134,7 +146,7 @@ services:
         # in this container; re-add a reservation only if LAYOUT_DEVICE
         # moves back to cuda on a 16 GB+ target.
         limits:
-          cpus: "8"
+          cpus: "12"
           memory: 24G
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5002/health || curl -fsS -o /dev/null http://localhost:5002/ || exit 1"]

@@ -43,6 +43,30 @@ mkdir -p "${PROMETHEUS_MULTIPROC_DIR}"
 
 echo "[entrypoint] gunicorn workers=${CPU_WORKERS} threads=${CPU_THREADS} "\
 "timeout=${GUNICORN_TIMEOUT}"
+
+# Fix 4 — optional async sidecar. Starts uvicorn on ASYNC_PORT (default 5003)
+# running the FastAPI app in docker/cpu/async_app.py. The gunicorn/Flask app
+# on ${GLMOCR_PORT} stays exactly as-is. The matrix harness targets the
+# async handler by pointing CPU_URL at :${ASYNC_PORT}. Leaving LAYOUT_ASYNC
+# unset or "false" is a no-op — the image ships the async code either way.
+: "${LAYOUT_ASYNC:=false}"
+: "${ASYNC_PORT:=5003}"
+: "${ASYNC_WORKERS:=4}"
+if [[ "${LAYOUT_ASYNC,,}" == "true" ]]; then
+    echo "[entrypoint] LAYOUT_ASYNC=true -> starting uvicorn sidecar on ${ASYNC_PORT} "\
+"(workers=${ASYNC_WORKERS})"
+    uvicorn async_app:app \
+        --host 0.0.0.0 \
+        --port "${ASYNC_PORT}" \
+        --workers "${ASYNC_WORKERS}" \
+        --log-level info \
+        --no-access-log \
+        &
+    ASYNC_PID=$!
+    # Forward SIGTERM to the sidecar on container stop.
+    trap "kill -TERM ${ASYNC_PID} 2>/dev/null || true" TERM INT EXIT
+fi
+
 exec gunicorn \
     --config /app/gunicorn_conf.py \
     --bind "0.0.0.0:${GLMOCR_PORT}" \

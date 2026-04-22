@@ -451,15 +451,191 @@ def instrument_pipeline(pipeline) -> None:
     # in this benchmark anyway.
     ld = getattr(pipeline, "layout_detector", None)
     if ld is not None and hasattr(ld, "process"):
-        # Optional ONNX Runtime backend. Swaps ld._model with a thin wrapper
-        # that runs the same forward via an onnxruntime InferenceSession.
-        # The export (docker/cpu/export_layout_onnx.py, triggered from the
-        # entrypoint) produces a file at:
-        #   ${HF_HOME}/glmocr-layout-onnx/pp_doclayout_v3.onnx
-        # Measured ~1.76× vs eager torch on single-threaded CPU. We pin
-        # intra_op_num_threads=1 to match the production OMP/MKL throttle
-        # so concurrent workers don't oversubscribe cores.
-        if os.environ.get("LAYOUT_BACKEND", "torch").lower() == "onnx":
+        # Two optional layers stack on top of upstream glmocr's default
+        # torch-eager layout path:
+        #
+        #   LAYOUT_BACKEND=onnx     replaces the forward pass with an
+        #                           onnxruntime InferenceSession; ld._model
+        #                           becomes a SimpleNamespace-returning shim.
+        #   LAYOUT_POSTPROC=numpy   replaces ld.process entirely with a
+        #                           numpy-only pipeline — no torch tensors
+        #                           ever constructed on the request path.
+        #                           Requires LAYOUT_BACKEND=onnx.
+        #
+        # The ONNX graph lives at
+        # ${HF_HOME}/glmocr-layout-onnx/pp_doclayout_v3.onnx, produced once
+        # by docker/cpu/export_layout_onnx.py at first boot.
+        layout_backend = os.environ.get("LAYOUT_BACKEND", "torch").lower()
+        layout_postproc = os.environ.get("LAYOUT_POSTPROC", "torch").lower()
+        layout_graph = os.environ.get("LAYOUT_GRAPH", "raw").lower()
+        _numpy_path_installed = False
+
+        if layout_backend == "onnx" and layout_postproc == "numpy":
+            try:
+                import numpy as _np_mod
+                import onnxruntime as _ort
+                from layout_postprocess import (
+                    compute_paddle_format_results,
+                    compute_paddle_format_results_from_fused,
+                    paddle_to_all_results,
+                )
+
+                hf_home = (os.environ.get("HF_HOME")
+                           or "/root/.cache/huggingface")
+                graph_filename = (
+                    "pp_doclayout_v3_fused.onnx" if layout_graph == "fused"
+                    else "pp_doclayout_v3.onnx"
+                )
+                onnx_path = os.path.join(
+                    hf_home, "glmocr-layout-onnx", graph_filename,
+                )
+                if not os.path.exists(onnx_path):
+                    raise FileNotFoundError(
+                        f"ONNX graph missing at {onnx_path}; "
+                        "entrypoint should have produced it"
+                    )
+
+                ort_opts = _ort.SessionOptions()
+                ort_opts.intra_op_num_threads = int(
+                    os.environ.get("LAYOUT_ONNX_THREADS", "1")
+                )
+                _sess = _ort.InferenceSession(
+                    onnx_path, ort_opts, providers=["CPUExecutionProvider"],
+                )
+
+                # Capture detector config + processor reference before we
+                # release the torch model. We'll use these in every call.
+                _ld_id2label = dict(ld._model.config.id2label)
+                _ld_label_task_mapping = ld.label_task_mapping
+                _ld_threshold = ld.threshold
+                _ld_threshold_by_class = ld.threshold_by_class or {}
+                _ld_layout_nms = ld.layout_nms
+                _ld_layout_unclip_ratio = ld.layout_unclip_ratio
+                _ld_layout_merge_bboxes_mode = ld.layout_merge_bboxes_mode
+                _ld_batch_size = max(1, int(ld.batch_size))
+                _ld_processor = ld._image_processor
+                _ld_processor_size = dict(_ld_processor.size)
+
+                # Drop the torch model. After this, ld._model holds a
+                # sentinel so upstream _validate_runtime_config() still
+                # passes (it only checks for not-None), but no torch
+                # tensors are ever constructed on the request path.
+                class _NumpySentinel:
+                    """Not a torch module. Prevents glmocr.start() from
+                    thinking the detector is uninitialized, while making
+                    sure anyone who accidentally calls it fails loudly."""
+
+                    def __call__(self, *_a, **_kw):
+                        raise RuntimeError(
+                            "_NumpySentinel invoked — LAYOUT_POSTPROC=numpy "
+                            "bypasses ld._model; check ld.process override."
+                        )
+
+                del ld._model
+                import gc as _gc
+                _gc.collect()
+                ld._model = _NumpySentinel()
+
+                if layout_graph == "fused":
+                    def _ort_run_fused(np_pixel_values, np_target_sizes):
+                        return _sess.run(None, {
+                            "pixel_values": np_pixel_values,
+                            "target_sizes": np_target_sizes,
+                        })
+                    _chunk_orchestrator = (
+                        lambda pixel_values, img_sizes_wh:
+                        compute_paddle_format_results_from_fused(
+                            pixel_values=pixel_values,
+                            ort_run_fused=_ort_run_fused,
+                            img_sizes_wh=img_sizes_wh,
+                            id2label=_ld_id2label,
+                            threshold=_ld_threshold,
+                            threshold_by_class=_ld_threshold_by_class,
+                            layout_nms=_ld_layout_nms,
+                            layout_unclip_ratio=_ld_layout_unclip_ratio,
+                            layout_merge_bboxes_mode=_ld_layout_merge_bboxes_mode,
+                            processor_size=_ld_processor_size,
+                        )
+                    )
+                else:
+                    def _ort_run(np_pixel_values):
+                        return _sess.run(None, {"pixel_values": np_pixel_values})
+                    _chunk_orchestrator = (
+                        lambda pixel_values, img_sizes_wh:
+                        compute_paddle_format_results(
+                            pixel_values=pixel_values,
+                            ort_run=_ort_run,
+                            img_sizes_wh=img_sizes_wh,
+                            id2label=_ld_id2label,
+                            threshold=_ld_threshold,
+                            threshold_by_class=_ld_threshold_by_class,
+                            layout_nms=_ld_layout_nms,
+                            layout_unclip_ratio=_ld_layout_unclip_ratio,
+                            layout_merge_bboxes_mode=_ld_layout_merge_bboxes_mode,
+                            processor_size=_ld_processor_size,
+                        )
+                    )
+
+                def _numpy_process(images, save_visualization=False,
+                                   global_start_idx=0, use_polygon=False):
+                    # Match glmocr.layout.PPDocLayoutDetector.process contract:
+                    # returns (list[list[dict]], dict[int, Image]).
+                    pil_images = [
+                        img.convert("RGB") if img.mode != "RGB" else img
+                        for img in images
+                    ]
+                    all_paddle_format: list = []
+                    for chunk_start in range(0, len(pil_images), _ld_batch_size):
+                        chunk = pil_images[chunk_start:chunk_start + _ld_batch_size]
+                        inputs = _ld_processor(images=chunk, return_tensors="np")
+                        pixel_values = inputs["pixel_values"]
+                        img_sizes_wh = [img.size for img in chunk]
+                        paddle_chunk = _chunk_orchestrator(
+                            pixel_values, img_sizes_wh,
+                        )
+                        all_paddle_format.extend(paddle_chunk)
+
+                    img_sizes_wh_full = [img.size for img in pil_images]
+                    all_results = paddle_to_all_results(
+                        all_paddle_format, img_sizes_wh_full, _ld_label_task_mapping,
+                    )
+
+                    vis_images: dict = {}
+                    if save_visualization:
+                        from glmocr.utils.visualization_utils import (
+                            draw_layout_boxes,
+                        )
+                        for idx, img_results in enumerate(all_paddle_format):
+                            vis_images[global_start_idx + idx] = draw_layout_boxes(
+                                image=_np_mod.array(pil_images[idx]),
+                                boxes=img_results,
+                                use_polygon=use_polygon,
+                            )
+                    return all_results, vis_images
+
+                ld.process = _numpy_process
+                _numpy_path_installed = True
+                print(
+                    f"[layout] numpy postproc enabled "
+                    f"(graph={layout_graph}, path={onnx_path}, "
+                    f"intra_op={ort_opts.intra_op_num_threads}); "
+                    f"torch model weights released; request path is numpy-only",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[layout] numpy postproc unavailable, "
+                    f"falling back to torch postproc: {e}",
+                    flush=True,
+                )
+
+        if not _numpy_path_installed and layout_backend == "onnx":
+            # Torch-postproc path: swap ld._model with an ORT shim that
+            # returns HF-style torch tensors so upstream post_process_*
+            # keeps working unchanged. Measured ~1.76× vs eager torch on
+            # single-threaded CPU. intra_op_num_threads=1 matches the
+            # production OMP/MKL throttle so concurrent workers don't
+            # oversubscribe cores.
             try:
                 import onnxruntime as _ort
                 from types import SimpleNamespace as _SNS
@@ -500,8 +676,6 @@ def instrument_pipeline(pipeline) -> None:
                     config = _orig_config
 
                     def __call__(self, pixel_values=None, **_kw):
-                        # onnxruntime needs a contiguous float32 numpy
-                        # array; the processor already provides that.
                         np_in = pixel_values.detach().cpu().numpy()
                         logits, pred_boxes, order_logits, out_masks, last_hs = (
                             _sess.run(None, {"pixel_values": np_in})
@@ -515,17 +689,12 @@ def instrument_pipeline(pipeline) -> None:
                         )
 
                     def to(self, _device):
-                        return self  # ORT manages its own threading/device
+                        return self
 
                     def eval(self):
                         return self
 
                 ld._model = _OnnxLayoutModel()
-                # Drop the last reference to the torch model so its ~600 MB
-                # of fp32 weight tensors can be freed back to torch's
-                # allocator. Without this, each gunicorn worker keeps two
-                # full copies of the weights (torch eager + ORT session)
-                # resident for the container's lifetime.
                 del _orig_model
                 import gc as _gc
                 _gc.collect()
@@ -542,13 +711,13 @@ def instrument_pipeline(pipeline) -> None:
                     flush=True,
                 )
 
-        # Optional torch.compile on the underlying HF model. PP-DocLayoutV3
-        # takes ~9s/page on CPU and is the single dominant phase; compile
-        # typically yields 1.2–1.5× on CPU transformer detectors. First
-        # call captures the graph (slow) — the stage_c external warmup
-        # absorbs that so real-run p99 stays clean. `dynamic=True` keeps
-        # a single graph across varying batch sizes.
-        if os.environ.get("LAYOUT_COMPILE", "false").lower() == "true":
+        # Optional torch.compile on the underlying HF model. Only meaningful
+        # on the torch-postproc path — the numpy path replaces ld._model with
+        # a sentinel, so torch.compile would be a no-op (or worse, error).
+        # Measured regression on the current 4-worker CPU setup (see .env),
+        # so this is off by default anyway.
+        if (not _numpy_path_installed
+                and os.environ.get("LAYOUT_COMPILE", "false").lower() == "true"):
             model = getattr(ld, "_model", None)
             if model is not None:
                 try:
