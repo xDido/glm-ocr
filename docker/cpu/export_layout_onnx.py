@@ -4,31 +4,24 @@ Two graphs are produced, both inside the HF cache volume so they survive
 container recreation alongside the model weights:
 
     ${HF_HOME:-/root/.cache/huggingface}/glmocr-layout-onnx/
-        pp_doclayout_v3.onnx               raw graph (forward pass only)
-        pp_doclayout_v3.onnx.data          weights sidecar
-        pp_doclayout_v3_fused_v2.onnx      fused graph (forward + post-proc)
-        pp_doclayout_v3_fused_v2.onnx.data weights sidecar
+        pp_doclayout_v3.onnx            raw graph (forward pass only)
+        pp_doclayout_v3.onnx.data       weights sidecar
+        pp_doclayout_v3_fused.onnx      fused graph (forward + post-proc)
+        pp_doclayout_v3_fused.onnx.data weights sidecar
 
 Raw graph outputs:
     (logits, pred_boxes, order_logits, out_masks, last_hidden_state)
 Consumed by glmocr's upstream torch post-proc OR our numpy port.
 
-Fused graph outputs (Phase 2, v2):
+Fused graph outputs (Phase 2):
     (scores_topk, labels_topk, boxes_topk_xyxy, order_seq_topk,
-     masks_topk_bool, last_hidden_state)
+     masks_topk_logits, last_hidden_state)
 The deterministic-arithmetic subset of post-processing is baked in:
-sigmoid, top-K over (N·C), cxcywh→xyxy, target-size rescale, the
-pairwise-vote reading-order decoder, AND per-query mask sigmoid +
-threshold (v2 change). Masks are emitted as bool (1 byte/element) so
-the I/O boundary copy is ~4x smaller than the v1 fp32-logit output.
-The mask threshold is a graph input so the same graph serves any
-downstream config without re-export. Per-image score filter, sort-by-
-order, polygon extraction, and downstream per-class/NMS/unclip steps
-remain in numpy — data-dependent shapes or cv2 dependencies.
-
-Post-export the fused graph is run through `onnxsim.simplify` for
-constant folding + redundant-op elimination. Fallbacks silently if
-onnxsim is unavailable or rejects the graph.
+sigmoid, top-K over (N·C), cxcywh→xyxy, target-size rescale, and the
+pairwise-vote reading-order decoder. Mask thresholding, per-image score
+filter, sort-by-order, polygon extraction, and downstream
+per-class/NMS/unclip steps remain in numpy — they have data-dependent
+shapes or cv2 dependencies that aren't worth forcing into ONNX.
 
 Both exports are idempotent: skip if the target file exists and is
 non-empty.
@@ -127,29 +120,19 @@ def _export_fused(model, proc, out_path: Path) -> None:
     # target_sizes is (B, 2) in [H, W] order — same convention upstream
     # `post_process_object_detection` uses for its `target_sizes` arg.
     dummy_target_sizes = torch.tensor([[768, 1024]], dtype=torch.int64)
-    # threshold is a scalar fp32. Value at export time doesn't matter
-    # (it's a pure graph input). 0.3 is glmocr's default.
-    dummy_threshold = torch.tensor(0.3, dtype=torch.float32)
 
     class WrappedDetectorFused(torch.nn.Module):
         """Forward pass + deterministic-arithmetic post-proc, all in torch
         so torch.onnx.export captures it. Mirrors the numpy port in
         layout_postprocess.py::np_post_process_object_detection up to
-        (but not including) the data-dependent per-image score filter.
-
-        v2: mask sigmoid + threshold is also baked in, with the threshold
-        passed as a graph input. Masks are emitted as bool (1 byte/elem)
-        so the ORT output copy is ~4x smaller than the v1 fp32-logit
-        output — the mask tensor dominates the fused graph's I/O volume
-        (500 queries * 72 * 72 elements per page)."""
+        (but not including) the data-dependent threshold filter."""
 
         def __init__(self, m: torch.nn.Module) -> None:
             super().__init__()
             self.m = m
 
         def forward(self, pixel_values: "torch.Tensor",
-                    target_sizes: "torch.Tensor",
-                    threshold: "torch.Tensor") -> tuple:
+                    target_sizes: "torch.Tensor") -> tuple:
             out = self.m(pixel_values=pixel_values)
             logits = out.logits                # (B, N, C)
             pred_boxes = out.pred_boxes        # (B, N, 4) cxcywh normalized
@@ -200,22 +183,17 @@ def _export_fused(model, proc, out_path: Path) -> None:
             )                                                           # (B, N, 4)
             Hm = out_masks.shape[-2]
             Wm = out_masks.shape[-1]
-            masks_topk_logits = out_masks.gather(
+            masks_topk = out_masks.gather(
                 1, query_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, Hm, Wm)
             )                                                           # (B, N, Hm, Wm)
             order_seq_topk = order_seq.gather(1, query_idx)             # (B, N)
-
-            # v2: mask sigmoid + threshold inside the graph. Output is
-            # bool — ORT serializes it as 1 byte/element on the output
-            # boundary, so the host-side copy shrinks 4x vs fp32 logits.
-            masks_topk_bool = torch.sigmoid(masks_topk_logits) > threshold
 
             return (
                 scores_topk,           # (B, N) fp32
                 labels_topk,           # (B, N) int64
                 boxes_topk,            # (B, N, 4) fp32 in image coords
                 order_seq_topk,        # (B, N) int64
-                masks_topk_bool,       # (B, N, Hm, Wm) bool
+                masks_topk,            # (B, N, Hm, Wm) fp32 — raw mask logits
                 out.last_hidden_state, # (B, N, D) fp32
             )
 
@@ -224,12 +202,12 @@ def _export_fused(model, proc, out_path: Path) -> None:
     t0 = time.perf_counter()
     torch.onnx.export(
         wrapped,
-        (dummy_pixel_values, dummy_target_sizes, dummy_threshold),
+        (dummy_pixel_values, dummy_target_sizes),
         str(out_path),
-        input_names=["pixel_values", "target_sizes", "threshold"],
+        input_names=["pixel_values", "target_sizes"],
         output_names=[
             "scores_topk", "labels_topk", "boxes_topk",
-            "order_seq_topk", "masks_topk_bool", "last_hidden_state",
+            "order_seq_topk", "masks_topk", "last_hidden_state",
         ],
         dynamic_axes={
             "pixel_values":      {0: "batch"},
@@ -238,70 +216,21 @@ def _export_fused(model, proc, out_path: Path) -> None:
             "labels_topk":       {0: "batch"},
             "boxes_topk":        {0: "batch"},
             "order_seq_topk":    {0: "batch"},
-            "masks_topk_bool":   {0: "batch"},
+            "masks_topk":        {0: "batch"},
             "last_hidden_state": {0: "batch"},
         },
         opset_version=17,
         do_constant_folding=True,
     )
     elapsed = time.perf_counter() - t0
-
-    # Report the actually-exported opset — torch.onnx occasionally
-    # silently escalates to a higher opset when the request can't be
-    # satisfied; we want that in the boot log so a future fused-graph
-    # regression traces cleanly to an opset mismatch rather than a
-    # semantic change.
-    try:
-        import onnx
-        loaded = onnx.load(str(out_path), load_external_data=False)
-        opset = loaded.opset_import[0].version
-    except Exception as exc:
-        opset = f"?? ({exc!r})"
-
     size_mb = out_path.stat().st_size / 1e6
     data_path = out_path.with_suffix(out_path.suffix + ".data")
     data_mb = data_path.stat().st_size / 1e6 if data_path.exists() else 0.0
     print(
         f"[export] fused OK in {elapsed:.1f}s  graph={size_mb:.1f} MB  "
-        f"weights={data_mb:.1f} MB  opset={opset}",
+        f"weights={data_mb:.1f} MB",
         flush=True,
     )
-
-    # Post-export: constant-fold + dead-op elimination via onnx-simplifier.
-    # Non-fatal — the graph is perfectly usable without simplification; this
-    # is a perf polish step. Biggest wins come from folding the constant
-    # fill/arange used by the order-decoder and collapsing redundant reshapes
-    # around the top-K + gather chain.
-    try:
-        import onnxsim
-        import onnx
-        t0 = time.perf_counter()
-        loaded = onnx.load(str(out_path))
-        simplified, check_ok = onnxsim.simplify(loaded)
-        if check_ok:
-            onnx.save(simplified, str(out_path))
-            new_size_mb = out_path.stat().st_size / 1e6
-            print(
-                f"[export] fused simplified in "
-                f"{time.perf_counter() - t0:.1f}s  "
-                f"{size_mb:.1f} MB -> {new_size_mb:.1f} MB",
-                flush=True,
-            )
-        else:
-            print(
-                "[export] onnxsim check failed; keeping un-simplified graph",
-                flush=True,
-            )
-    except ImportError:
-        print(
-            "[export] onnxsim not installed; skipping simplification",
-            flush=True,
-        )
-    except Exception as exc:
-        print(
-            f"[export] onnxsim raised {exc!r}; keeping un-simplified graph",
-            flush=True,
-        )
 
 
 def main() -> int:
@@ -312,7 +241,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     raw_path = out_dir / "pp_doclayout_v3.onnx"
-    fused_path = out_dir / "pp_doclayout_v3_fused_v2.onnx"
+    fused_path = out_dir / "pp_doclayout_v3_fused.onnx"
 
     need_raw = not (raw_path.exists() and raw_path.stat().st_size > 0)
     need_fused = not (fused_path.exists() and fused_path.stat().st_size > 0)

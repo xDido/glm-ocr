@@ -32,7 +32,7 @@ MODEL_DIR = os.environ.get(
 HF_HOME = os.environ.get("HF_HOME", "/root/.cache/huggingface")
 ONNX_DIR = Path(HF_HOME) / "glmocr-layout-onnx"
 RAW_PATH = ONNX_DIR / "pp_doclayout_v3.onnx"
-FUSED_PATH = ONNX_DIR / "pp_doclayout_v3_fused_v2.onnx"
+FUSED_PATH = ONNX_DIR / "pp_doclayout_v3_fused.onnx"
 
 IMAGES_DIR = os.environ.get("PARITY_IMAGES_DIR", "/tmp/bench_images")
 N_PAGES = int(sys.argv[1]) if len(sys.argv) > 1 else 20
@@ -115,19 +115,13 @@ def main() -> int:
             processor_size=dict(processor.size),
         )[0]
 
-        # Fused v2 + numpy tail. Mask threshold is a graph input; pass the
-        # same THRESHOLD the reference numpy path used for score filter.
-        scores_topk, labels_topk, boxes_topk, order_seq_topk, masks_bool_topk, _ = \
+        # Fused + numpy tail.
+        scores_topk, labels_topk, boxes_topk, order_seq_topk, masks_logits_topk, _ = \
             fused_sess.run(
-                None, {
-                    "pixel_values": pv,
-                    "target_sizes": target_sizes,
-                    # ORT rejects bare np.float32 scalars; wrap in a 0-d array.
-                    "threshold": np.asarray(THRESHOLD, dtype=np.float32),
-                }
+                None, {"pixel_values": pv, "target_sizes": target_sizes}
             )
         fused_np = _post_process_from_fused(
-            scores_topk, labels_topk, boxes_topk, order_seq_topk, masks_bool_topk,
+            scores_topk, labels_topk, boxes_topk, order_seq_topk, masks_logits_topk,
             target_sizes=target_sizes,
             threshold=THRESHOLD,
             processor_size=dict(processor.size),

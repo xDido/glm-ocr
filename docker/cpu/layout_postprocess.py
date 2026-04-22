@@ -780,24 +780,23 @@ def _post_process_from_fused(
     labels_topk: np.ndarray,
     boxes_topk: np.ndarray,
     order_seq_topk: np.ndarray,
-    masks_topk_bool: np.ndarray,
+    masks_topk_logits: np.ndarray,
     target_sizes: np.ndarray,
     threshold: float,
     processor_size: Dict[str, int],
 ) -> List[Dict[str, Any]]:
-    """Numpy tail after the fused ONNX graph (v2).
+    """Numpy tail after the fused ONNX graph.
 
-    Inputs match the fused-v2 graph's outputs. Masks arrive already
-    sigmoid + thresholded (bool dtype) — the graph itself applies the
-    threshold so the I/O boundary tensor is 1 byte/element instead of
-    4 byte/element. This function does only the data-dependent steps:
-    score threshold filter, sort by order_seq, polygon extraction via
-    cv2.
+    Inputs match the fused graph's outputs (all pre-threshold, per-query
+    top-K results of fixed shape). This function does only the
+    data-dependent steps: score threshold filter, sort by order_seq,
+    mask binarization, polygon extraction via cv2.
     """
     batch = scores_topk.shape[0]
-    # Mask threshold is applied inside the graph (v2); cast to int for
-    # the downstream numpy indexing + cv2.resize cast.
-    masks_bool = masks_topk_bool.astype(np.int32)
+    # Mask sigmoid + threshold — we kept this out of the graph because it's
+    # vanishingly cheap and keeping masks as fp32 logits halves the fused
+    # output volume in the I/O boundary case.
+    masks_bool = (_sigmoid(masks_topk_logits) > threshold).astype(np.int32)
 
     target_sizes = np.asarray(target_sizes)
     results: List[Dict[str, Any]] = []
@@ -849,11 +848,9 @@ def compute_paddle_format_results_from_fused(
     """Run the fused ONNX graph + numpy tail through apply_layout_postprocess.
 
     `ort_run_fused` takes (pixel_values, target_sizes) and returns the
-    6-tuple from the fused-v2 graph:
+    6-tuple from the fused graph:
         (scores_topk, labels_topk, boxes_topk, order_seq_topk,
-         masks_topk_bool, last_hidden_state)
-    The caller is expected to inject the mask threshold it captured at
-    init time — see runtime_app._ort_run_fused.
+         masks_topk_logits, last_hidden_state)
     """
     target_sizes = np.array(
         [(h, w) for (w, h) in img_sizes_wh], dtype=np.int64,
@@ -865,11 +862,11 @@ def compute_paddle_format_results_from_fused(
         pre_threshold = threshold
 
     (scores_topk, labels_topk, boxes_topk, order_seq_topk,
-     masks_topk_bool, _last_hs) = ort_run_fused(pixel_values, target_sizes)
+     masks_topk_logits, _last_hs) = ort_run_fused(pixel_values, target_sizes)
 
     raw_results = _post_process_from_fused(
         scores_topk, labels_topk, boxes_topk, order_seq_topk,
-        masks_topk_bool,
+        masks_topk_logits,
         target_sizes=target_sizes,
         threshold=pre_threshold,
         processor_size=processor_size,
