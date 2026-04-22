@@ -21,6 +21,9 @@ LAYOUT_USE_POLYGON=false       # polygon mode not needed for block-level OCR
 LAYOUT_COMPILE=false           # torch.compile regresses +19% mean
 LAYOUT_ONNX_THREADS=2          # saturates 8-core cgroup: 4 workers x 2 ORT = 8
                                # grow with cores: at 12c use 3 (measured +34% rps at c=12, +31% at c=24 vs 8c baseline)
+LAYOUT_ONNX_PROVIDER=openvino  # OpenVINOExecutionProvider via onnxruntime-openvino wheel
+                               # 3x+ rps on CNN-dominated layout vs default MLAS CPU EP
+                               # device_type=CPU (no Intel iGPU on host); fall through to CPUExecutionProvider
 LAYOUT_BATCH_ENABLED=true      # cross-request layout coalescer
 LAYOUT_BATCH_MAX=8             # larger than 8 causes c=64 ServerDisconnectedError
 LAYOUT_BATCH_WINDOW_MS=20
@@ -118,6 +121,32 @@ Do-the-arithmetic rule: `CPU_WORKERS × LAYOUT_ONNX_THREADS` should equal the cg
 - Torch CPU-only wheel installed **before** `pip install glmocr` from PyTorch's dedicated index (`https://download.pytorch.org/whl/cpu`). Skips ~5 GB of unused CUDA dependencies pulled by the default PyPI wheel.
 - Docker multi-worker Prometheus needs a shared tmpfs dir (`PROMETHEUS_MULTIPROC_DIR`) wiped on each container start; otherwise stale dead-worker values pollute the aggregation across reboots.
 
+### 6. OpenVINO Execution Provider for layout (the 3× win)
+
+Swap the `onnxruntime` wheel for `onnxruntime-openvino` in the CPU image and initialize the layout `InferenceSession` with `OpenVINOExecutionProvider` (device `CPU`) before the default `CPUExecutionProvider` fallback.
+
+Why: per-op profile (ORT `enable_profiling`, chrome-trace) shows **Conv is 76% of every layout forward** (2,990 Conv invocations per call, 859 ms cumulative out of 1,134 ms mean wall time at intra-op=3, 800×800 input). The default ORT CPU EP uses MLAS; OpenVINO ships Intel's oneAPI Conv primitives, which beat MLAS on both Intel and AMD x86 — solo warm calls measured **755 ms/call vs 1,100 ms/call (−31%)**, and under 4-worker concurrency + the coalescer, the win amplifies to ~3× end-to-end throughput.
+
+Measured vs `LAYOUT_ONNX_PROVIDER=cpu` (everything else identical), averaged across 3 × N=200 matrix runs:
+
+| c | base rps | OV avg rps | Δ | base Flask p99 | OV p99 | Δ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 3.58 | 9.12 | **+155%** | 6,376 | 8,152 | +28% |
+| 24 | 3.13 | 13.78 | **+340%** | 24,151 | 6,489 | **−73%** |
+| 32 | 2.79 | 14.81 | **+431%** | 31,223 | 10,448 | **−67%** |
+| 40 | 3.06 | 13.20 | **+331%** | 29,583 | 11,954 | **−60%** |
+| 64 | 2.79 | 9.40 | **+237%** | 53,537 | 20,004 | **−63%** |
+
+Layout-forward p50 at c=12 dropped **3,744 → 691 ms (−81%)**. The gate is passed by enormous margins — this is the largest single win in the project's history, and it validates E4's "attack the Conv kernel, not the graph" conclusion.
+
+Cost: image size grows ~200 MB (OpenVINO runtime libs baked into the wheel). ORT version inside the image becomes `1.24.1` (from `1.24.4`) because the openvino wheel is pinned one patch behind mainline ORT — no compat issues seen. First-request per-worker has a ~1 s OpenVINO graph-compile warmup; pre-warm with a burst of 16 concurrent hits before matrix measurement.
+
+Tradeoff: the ~13 rps ceiling at c=24–40 surfaces a **new** capacity cliff — 20/3000 requests across 3 runs raised `ServerDisconnectedError` at non-deterministic c levels (c=24 on one run, c=64 on another). This is a downstream SGLang keepalive/batching event that the upstream speedup *exposes* but doesn't cause. Layout CPU is no longer binding; the next bottleneck is the GPU pipeline, which is finally worth tuning (speculative decoding, `max_tokens` reservation, etc.).
+
+Device_type knob: set to `CPU` explicitly to avoid accidentally dispatching to an Intel iGPU the host doesn't have. On an Intel iGPU/NPU host, flipping `device_type` to `GPU`/`NPU`/`AUTO` would be a one-line config change, no rebuild. NVIDIA GPUs are invisible to OpenVINO EP (that's an OpenVINO limitation — the plugin only speaks Intel OneAPI).
+
+Knob: `LAYOUT_ONNX_PROVIDER=openvino` (`cpu` is the rollback). The onnxruntime-openvino wheel ships **both** providers, so rollback is an env flip + `docker compose up -d --force-recreate cpu`; no rebuild.
+
 ---
 
 ## Rejected — documented so you don't re-try them without a new hypothesis
@@ -139,7 +168,9 @@ Measured:
 - c=24: **-23% rps, +24% p95** — regression.
 - c=32: **-33% rps, +45% p95** — severe regression.
 
-Rolled back. Likely causes: opset-18 fallback from onnxscript (requested 17), and larger-graph per-op overhead compounding under concurrent sessions. Re-try path documented in source plan; if attempted, pin opset 17 + `onnxsim` constant-folding + bool-mask output to halve bytes.
+Rolled back.
+
+**Retried 2026-04-22** with the documented recipe: pinned opset 17 request, `onnxsim.simplify` post-export, bool-mask output (threshold baked in as a graph input, masks emitted as `tensor(bool)` — 4× smaller I/O). Parity cleared (30/30 OmniDocBench pages, worst IoU 1.0000, score Δ 1.19e-07). Matrix at N=200 × 2 still failed: c=12 rps −23% averaged, c=24 rps −15%, c=32 tripped a 14-failure capacity cliff on run 2. Root cause: `torch.onnx`'s exporter cannot emit a Pad op at opset 17 (no opset-17 adapter in the onnx C API's version converter; fallback to opset 18), which reintroduces exactly the concurrent-session overhead the first attempt hit. **Do not retry this again until a torch.onnx update adds opset-17 Pad support, or someone writes a standalone opset-18→17 pass for Pad.** Code kept dormant behind `LAYOUT_GRAPH=fused` in commit `b0cb780` (subsequently reverted in `cd4ae66`).
 
 ### Async FastAPI sidecar (`asyncio.to_thread(pipeline.process)`)
 
@@ -171,13 +202,12 @@ Removed because they produce the same p50/p95/p99 within noise as the low-percen
 
 ## Queued — impactful but not yet shipped
 
-### Post-soak cleanup (~1 hour)
+### SGLang-side tuning is finally worthwhile
 
-Delete the `LAYOUT_POSTPROC=torch` fallback branch and the `LAYOUT_COMPILE` block from the runtime app (~80 LOC). Drops torch as a runtime dependency entirely. No perf delta, just dependency hygiene.
-
-### Retry Phase 2 fused graph (1–2 days)
-
-The c=12 win was real (+29% rps, -34% p99). The c=24/32 regression looks concurrent-session-specific (opset fallback + larger graph). Retry with: pinned opset 17, `onnxsim` constant-folding, bool-mask output. Re-run matrix to decide.
+With layout unblocked by OpenVINO EP (#6), the RPS ceiling now sits at SGLang. Two experiments previously dismissed because layout was binding are now live candidates:
+- **Speculative-decoding sweep.** Grid `SGL_SPEC_NUM_STEPS ∈ {3,4,5} × SGL_SPEC_NUM_DRAFT_TOKENS ∈ {4,5,6}`. Greedy OCR output (top_k=1, top_p=1e-5) is a textbook fit for NEXTN acceptance; never measured at the current ingress rate.
+- **`OCR_MAX_TOKENS` reduction.** glmocr defaults `max_tokens=8192` per region; observed mean is ~55 generated tokens. At the old RPS ceiling this didn't move the needle (queue collapsed but layout bound the ceiling); at 13 rps it should free meaningful SGLang slot headroom.
+- **c=24/c=64 `ServerDisconnectedError` investigation.** 20/3000 in the OpenVINO matrix. Tunables: `OCR_REQUEST_TIMEOUT`, `OCR_RETRY_MAX`, SGLang `--max-running-requests`, keepalive on the aiohttp client.
 
 ### Preprocess into `onnxruntime-extensions` (half a day, only if profiled as bottleneck)
 
@@ -186,6 +216,10 @@ Move `PPDocLayoutV3ImageProcessor.resize + normalize` into the ORT session as a 
 ### Scale `LAYOUT_ONNX_THREADS` with cgroup
 
 If you grow the cgroup past 8 cores, re-tune `LAYOUT_ONNX_THREADS` to maintain `CPU_WORKERS × LAYOUT_ONNX_THREADS ≈ cgroup_cores`. The knob is the one with the cleanest scaling behavior in the whole setup.
+
+### Post-soak cleanup (~1 hour)
+
+Delete the `LAYOUT_POSTPROC=torch` fallback branch and the `LAYOUT_COMPILE` block from the runtime app (~80 LOC). Drops torch as a runtime dependency entirely. No perf delta, just dependency hygiene.
 
 ---
 
@@ -219,25 +253,36 @@ The only way to attribute a delta to the right knob. Bundling two fixes means yo
 
 ## Architectural dependency order (why this order matters)
 
-1. **ONNX backend first.** Unblocks Fix 3 (`LAYOUT_ONNX_THREADS` only exists in the ORT branch) and the fused graph. Without the ORT move, none of the thread tuning applies.
+1. **ONNX backend first.** Unblocks `LAYOUT_ONNX_THREADS` and all alternative execution providers. Without the ORT move, none of the thread tuning or provider-swap applies.
 2. **numpy post-proc second.** Prerequisite for deleting torch from the request path, and for accurate GIL accounting under load (you can't see the GIL ceiling while torch still holds it in long chunks).
 3. **Batch coalescer third.** Independent of ORT/numpy ordering, but compounds the ORT gain.
-4. **Thread tuning last.** `LAYOUT_ONNX_THREADS`, `CPU_THREADS`, `LAYOUT_BATCH_MAX` are all cgroup-sensitive and depend on which kernels are live. Don't tune them before the pipeline stack is finalized; you'll tune to the wrong baseline.
+4. **Thread tuning fourth.** `LAYOUT_ONNX_THREADS`, `CPU_THREADS`, `LAYOUT_BATCH_MAX` are all cgroup-sensitive and depend on which kernels are live. Don't tune them before the pipeline stack is finalized; you'll tune to the wrong baseline.
+5. **Alternative EP last (once you have a profile).** Per-op profile before switching providers — the Conv share was 76% on this workload, making OpenVINO the obvious pick. Don't swap providers speculatively; the wheel size, import cost, and graph-compile warmup are real, and the win only materialises if the bottleneck op-type matches the EP's strength (OpenVINO for CNN Conv, TensorRT for GPU if available, DnnlEP for Dnnl-friendly shapes, etc.).
 
 ---
 
 ## Net impact (pre-optimization → final)
 
-Baseline config: torch eager, torch post-proc, no batcher, `LAYOUT_ONNX_THREADS=1`, `LAYOUT_BATCH_MAX=4`.
+Two checkpoints are useful, because the arc has a clear before/after at the OpenVINO switch.
 
-Final config: as in the TL;DR `.env` block above.
+**Original baseline** (torch eager, torch post-proc, no batcher, `LAYOUT_ONNX_THREADS=1`, `LAYOUT_BATCH_MAX=4`):
 
-| c | baseline rps | final rps | Δ |
+| c | original rps | post-ORT+numpy+batcher rps | Δ |
 |---:|---:|---:|---:|
-| 12 | 1.554 | ~2.4 (avg) | **+54%** |
-| 24 | 2.384 | ~2.77 (avg) | +16% |
-| 32 | 2.173 | ~2.48 (avg) | +14% |
+| 12 | 1.55 | ~3.6 | +132% |
+| 24 | 2.38 | ~3.1 | +30% |
+| 32 | 2.17 | ~2.8 | +29% |
 
-c=32 p95: 28,691 ms → ~21,700 ms (**-24%**). c=32 p99: roughly flat (29,273 → ~27,273 ms).
+**After OpenVINO EP** (onnxruntime-openvino wheel, device=CPU; the final TL;DR `.env` block above), averaged 3 × N=200:
 
-The largest single win is the low-concurrency p50 (~50% reduction at c=12) — attributable to GIL release from removing torch from post-proc under gthread contention.
+| c | post-ORT baseline rps | final (OV) rps | Δ vs post-ORT | Δ vs original |
+|---:|---:|---:|---:|---:|
+| 12 | 3.58 | 9.12 | **+155%** | **+487%** |
+| 24 | 3.13 | 13.78 | **+340%** | **+479%** |
+| 32 | 2.79 | 14.81 | **+431%** | **+582%** |
+| 40 | 3.06 | 13.20 | **+331%** | — |
+| 64 | 2.79 | 9.40 | **+237%** | — |
+
+Flask p99 at c=32 went **31,223 ms (post-ORT baseline) → 10,448 ms (−67%)**. Layout-forward p50 at c=12: **3,744 → 691 ms (−81%)**.
+
+The largest single win of the whole arc is OpenVINO EP (3–4× on its own). The ORT+numpy+batcher stack was the *prerequisite*: without a stable profile-ready pipeline, the provider swap would have been an uninformed guess. Apply them in the dependency order above; skipping steps 1–4 to jump straight to #6 works from a pure-throughput angle, but you lose the observability (histograms, GIL accounting) that tells you the provider swap is doing what you think it's doing.
