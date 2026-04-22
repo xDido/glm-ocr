@@ -159,6 +159,37 @@ Avg rps +15–27% at c=32/40 across 2 runs but **16 failures at c=64** (`ServerD
 
 Evaluated on an 8 GB dev GPU. Torch's CUDA context (~1 GB per worker × 4 workers) steals VRAM from SGLang's KV cache, which costs more end-to-end than the layout speedup. Revisit only on 16 GB+ cards.
 
+### OpenVINO Execution Provider (`LAYOUT_ONNX_PROVIDER=openvino`)
+
+**Rejected 2026-04-22 after appearing to ship.** A per-op ORT profile showed Conv = 76% of layout wall time, and a solo warm micro-bench (`scripts/ov_bench.py`) measured OpenVINO EP at 755 ms/call vs MLAS CPU EP's 1,100 ms (−31%). The matrix at 3 × N=200 looked like a headline 3× RPS win across c=12–64. The initial commit shipped, docs were written.
+
+**What actually happened — the failure chain:**
+
+1. **Silent correctness bug.** After a user-selection probe, 3 of 20 sequential requests returned empty detections (`"json_result": [[]]`) as HTTP 200 OK. Log inspection found 14,594 `node_view_320` Reshape errors in 2 h:
+   ```
+   [CPU] Reshape node 'node_view_320' Check
+   'minusOneCount <= 1 && inputProduct == outputProduct' failed.
+   [cpu]reshape: input (8.256.25.25) conflicts with pattern (1.256.625)
+   ```
+   glmocr's pipeline catches the error, logs "Layout detection failed for pages [0], skipping batch", and returns HTTP 200 with no detections. The asyncio bench counts HTTP 200 as success. The measured "3× RPS win" was partially empty responses.
+
+2. **Root cause is in the exported graph, not the EP.** `scripts/ov_scan_reshapes.py` found 52 / 164 Reshape ops whose shape input is a frozen `[1, ...]` constant (28 patchable by flipping `1`→`-1`; 24 already have a `-1` elsewhere). PP-DocLayoutV3's torch source uses literal `.view(1, 300, ...)` in attention/decoder paths, and `torch.onnx.export` bakes those integers into the graph. MLAS CPU EP silently accepts the input/output-product mismatch; OpenVINO's CPU plugin correctly rejects it.
+
+3. **Every workaround failed.**
+   - `disable_dynamic_shapes: False` provider option: no effect. 19 / 20 concurrent requests empty.
+   - `torch.onnx.export(dynamo=True)`: made it *worse* — 106 frozen-bug Reshapes instead of 52.
+   - `openvino.convert_model(torch_model, ...)` native frontend: aborts conversion entirely with a shape mismatch in `aten::mul` inside attention (`f32[?,300,4] × f32[?,300,200,1]`). Model forward isn't batch-safe at the *source*; no exporter can recover symbolic shapes the model itself never exposed.
+   - Running without the batcher (`LAYOUT_BATCH_ENABLED=false`): 0 empty responses but 0.38 rps at c=12 — OpenVINO's per-inference fixed cost at batch=1 without amortization is catastrophic on this Ryzen 5600X host.
+
+4. **Reverted** in commits `102f9c1` + `1350454`. The `scripts/ov_bench.py` micro-bench and the `onnxruntime-openvino` wheel dependency are removed; env flag `LAYOUT_ONNX_PROVIDER` is gone.
+
+**Do not retry on this model** without one of:
+- Replacing PP-DocLayoutV3 with a batch-dynamic-safe detector (YOLO-family, e.g. `DocLayout-YOLO`). The model-swap unlocks OV naturally because YOLOv10 has no `.view(N, ...)` patterns. Biggest win is you also get a much faster detector on any EP (~200–400 ms/forward vs 1,100 ms).
+- Patching the 52 Reshape nodes via `onnx-graphsurgeon` AND separately fixing the attention `Multiply` shape mismatch surfaced by `openvino.convert_model`. Risky, high-surface-area graph surgery.
+- Targeting an Intel iGPU/NPU host where OpenVINO may have device-specific fallbacks that tolerate the frozen shapes. Untested; we're on NVIDIA + AMD CPU here.
+
+The E4 per-op profile finding (Conv = 76% of layout wall time) remains valid and still points at the layout model as the fundamental bottleneck. **The right fix for layout throughput is a different detector, not a different ORT EP.**
+
 ### jemalloc + balanced-decay allocator
 
 -15% throughput on this workload (aiohttp + torch small-alloc density fights jemalloc's arena-per-thread model). Sticking with glibc. Bound memory growth via gunicorn `--max-requests` recycling instead.
