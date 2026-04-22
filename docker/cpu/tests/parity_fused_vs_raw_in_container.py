@@ -5,9 +5,10 @@ compares the intermediate tensors that the numpy path would produce
 against what the fused graph emits directly.
 
 Comparison point: the 5 post-proc outputs just before the data-dependent
-threshold filter. Specifically:
+per-image score filter. Specifically:
     scores_topk, labels_topk, boxes_topk (xyxy image-coords),
-    order_seq_topk, masks_topk (raw logits)
+    order_seq_topk, masks_topk_bool (v2: sigmoid + threshold inside the
+    graph, emitted as bool).
 
 Usage inside container:
     docker exec glmocr-cpu python /app/parity_fused_vs_raw_in_container.py [N]
@@ -37,13 +38,15 @@ MODEL_DIR = os.environ.get(
 HF_HOME = os.environ.get("HF_HOME", "/root/.cache/huggingface")
 ONNX_DIR = Path(HF_HOME) / "glmocr-layout-onnx"
 RAW_PATH = ONNX_DIR / "pp_doclayout_v3.onnx"
-FUSED_PATH = ONNX_DIR / "pp_doclayout_v3_fused.onnx"
+FUSED_PATH = ONNX_DIR / "pp_doclayout_v3_fused_v2.onnx"
 
 IMAGES_DIR = os.environ.get("PARITY_IMAGES_DIR", "/tmp/bench_images")
 N_PAGES = int(sys.argv[1]) if len(sys.argv) > 1 else 10
 SCORE_TOL = float(os.environ.get("PARITY_SCORE_TOL", "1e-4"))
 BOX_TOL_PX = float(os.environ.get("PARITY_BOX_TOL", "0.5"))
-MASK_TOL = float(os.environ.get("PARITY_MASK_TOL", "1e-3"))
+# Threshold used by the fused graph's in-graph sigmoid + threshold on
+# per-query masks. Must match the value passed at Run time below.
+MASK_THRESHOLD = float(os.environ.get("PARITY_MASK_THRESHOLD", "0.3"))
 
 sys.path.insert(0, "/app")
 from layout_postprocess import _np_get_order_seqs, _sigmoid  # noqa: E402
@@ -73,7 +76,7 @@ def main() -> int:
     worst = {
         "score": 0.0,
         "box": 0.0,
-        "mask": 0.0,
+        "mask_mismatches": 0,
         "order_mismatch_pages": 0,
         "label_mismatch_pages": 0,
     }
@@ -119,39 +122,55 @@ def main() -> int:
             axis=1,
         )
         Hm, Wm = out_masks.shape[-2:]
-        masks_ref = np.take_along_axis(
+        masks_logits_ref = np.take_along_axis(
             out_masks,
             np.broadcast_to(query_idx[..., None, None], (B, N, Hm, Wm)),
             axis=1,
         )
+        # v2 fused graph does sigmoid + threshold inside ONNX — mirror that
+        # here so we can compare the bool output bit-exactly.
+        masks_ref_bool = _sigmoid(masks_logits_ref) > MASK_THRESHOLD
         order_ref = np.take_along_axis(order_seq_ref, query_idx, axis=1)
 
-        # Fused graph: get the 5 (6-with-last_hs) post-proc outputs directly.
+        # Fused v2: pass the threshold as a graph input. Output mask is bool.
         fused_out = fused_sess.run(
             None,
-            {"pixel_values": pv, "target_sizes": target_sizes},
+            {
+                "pixel_values": pv,
+                "target_sizes": target_sizes,
+                # ORT rejects bare np.float32 scalars; wrap in a 0-d array.
+                "threshold": np.asarray(MASK_THRESHOLD, dtype=np.float32),
+            },
         )
         scores_f, labels_f, boxes_f, order_f, masks_f, _last_hs_f = fused_out
 
         # Compare.
         score_delta = float(np.abs(scores_ref - scores_f).max())
         box_delta = float(np.abs(boxes_ref - boxes_f).max())
-        mask_delta = float(np.abs(masks_ref - masks_f).max())
+        # Mask is bool on both sides — count per-element disagreement.
+        mask_disagreement = int(
+            np.count_nonzero(masks_ref_bool != masks_f.astype(bool))
+        )
         label_ok = bool((labels_ref == labels_f).all())
         order_ok = bool((order_ref == order_f).all())
 
         worst["score"] = max(worst["score"], score_delta)
         worst["box"] = max(worst["box"], box_delta)
-        worst["mask"] = max(worst["mask"], mask_delta)
+        worst["mask_mismatches"] = max(
+            worst["mask_mismatches"], mask_disagreement
+        )
         if not label_ok:
             worst["label_mismatch_pages"] += 1
         if not order_ok:
             worst["order_mismatch_pages"] += 1
 
+        # Mask parity is bit-exact: no tolerance. Upstream sigmoid is the
+        # same math as torch's, and > is a boolean op. Any disagreement is
+        # a real divergence and should fail the test.
         page_ok = (
             score_delta <= SCORE_TOL
             and box_delta <= BOX_TOL_PX
-            and mask_delta <= MASK_TOL
+            and mask_disagreement == 0
             and label_ok
             and order_ok
         )
@@ -160,7 +179,8 @@ def main() -> int:
         else:
             print(f"[parity] {Path(p).name}: "
                   f"score Δ={score_delta:.2e}  box Δ={box_delta:.2f}  "
-                  f"mask Δ={mask_delta:.2e}  labels={label_ok} order={order_ok}")
+                  f"mask_mismatches={mask_disagreement}  "
+                  f"labels={label_ok} order={order_ok}")
 
         if (idx + 1) % 5 == 0:
             print(f"[parity] progress {idx+1}/{len(paths)}  ok={n_ok}  "
@@ -168,14 +188,14 @@ def main() -> int:
 
     print()
     print("[parity] summary:")
-    print(f"  pages:                    {len(paths)}")
-    print(f"  pages ok:                 {n_ok}")
-    print(f"  worst score Δ:            {worst['score']:.2e}")
-    print(f"  worst box Δ:              {worst['box']:.4f} px")
-    print(f"  worst mask-logit Δ:       {worst['mask']:.2e}")
-    print(f"  pages with label diff:    {worst['label_mismatch_pages']}")
-    print(f"  pages with order diff:    {worst['order_mismatch_pages']}")
-    print(f"  elapsed:                  {time.perf_counter()-t0:.1f}s")
+    print(f"  pages:                       {len(paths)}")
+    print(f"  pages ok:                    {n_ok}")
+    print(f"  worst score Δ:               {worst['score']:.2e}")
+    print(f"  worst box Δ:                 {worst['box']:.4f} px")
+    print(f"  worst mask bit mismatches:   {worst['mask_mismatches']}")
+    print(f"  pages with label diff:       {worst['label_mismatch_pages']}")
+    print(f"  pages with order diff:       {worst['order_mismatch_pages']}")
+    print(f"  elapsed:                     {time.perf_counter()-t0:.1f}s")
 
     return 0 if n_ok == len(paths) else 1
 

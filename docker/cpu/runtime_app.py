@@ -483,7 +483,7 @@ def instrument_pipeline(pipeline) -> None:
                 hf_home = (os.environ.get("HF_HOME")
                            or "/root/.cache/huggingface")
                 graph_filename = (
-                    "pp_doclayout_v3_fused.onnx" if layout_graph == "fused"
+                    "pp_doclayout_v3_fused_v2.onnx" if layout_graph == "fused"
                     else "pp_doclayout_v3.onnx"
                 )
                 onnx_path = os.path.join(
@@ -537,10 +537,28 @@ def instrument_pipeline(pipeline) -> None:
                 ld._model = _NumpySentinel()
 
                 if layout_graph == "fused":
+                    # Pre-compute the mask threshold the fused graph needs.
+                    # Matches compute_paddle_format_results_from_fused's
+                    # pre_threshold: when per-class thresholds are set we
+                    # pre-filter with the lowest of them so no class is
+                    # thresholded out before its per-class gate runs.
+                    if _ld_threshold_by_class:
+                        _pre_threshold = min(
+                            _ld_threshold,
+                            min(_ld_threshold_by_class.values()),
+                        )
+                    else:
+                        _pre_threshold = _ld_threshold
+                    # ORT rejects bare numpy scalars; wrap in a 0-d array.
+                    _pre_threshold_np = _np_mod.asarray(
+                        _pre_threshold, dtype=_np_mod.float32,
+                    )
+
                     def _ort_run_fused(np_pixel_values, np_target_sizes):
                         return _sess.run(None, {
                             "pixel_values": np_pixel_values,
                             "target_sizes": np_target_sizes,
+                            "threshold": _pre_threshold_np,
                         })
                     _chunk_orchestrator = (
                         lambda pixel_values, img_sizes_wh:
