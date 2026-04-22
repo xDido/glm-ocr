@@ -97,10 +97,6 @@ services:
       LAYOUT_MODEL_DIR: ${LAYOUT_MODEL_DIR:-PaddlePaddle/PP-DocLayoutV3_safetensors}
       LAYOUT_BACKEND: ${LAYOUT_BACKEND:-torch}
       LAYOUT_ONNX_THREADS: ${LAYOUT_ONNX_THREADS:-1}
-      # ORT execution provider for the layout session. cpu (default) = MLAS
-      # CPUExecutionProvider; openvino = OpenVINOExecutionProvider with CPU
-      # fallback (requires onnxruntime-openvino wheel in the image).
-      LAYOUT_ONNX_PROVIDER: ${LAYOUT_ONNX_PROVIDER:-cpu}
       # Phase 1 — numpy post-processing (drop torch from request path).
       # torch = upstream default, safe fallback | numpy = no-torch hot path.
       LAYOUT_POSTPROC: ${LAYOUT_POSTPROC:-torch}
