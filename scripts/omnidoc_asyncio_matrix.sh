@@ -72,9 +72,24 @@ run_trial() {
 # Fail-fast: loaded trials first (~30-90 s each). If the stack is broken
 # under load we find out inside 3 minutes rather than after 40 min of
 # paced baselines.
+#
+# c=40 / c=64 extend the sweep past the 4-worker × 16-thread admission
+# ceiling so we can see where throughput peaks and tails blow up.
+#
+# The 25 s gap between trials is load-bearing: augment_matrix_report.py
+# segments Prometheus's glmocr_in_flight_requests timeline by >=20 s of
+# idle, and uses those segments to retrofit per-trial phase decomposition.
+# Without the gap, all five trials merge into one segment and the
+# augmenter can't match them back to report rows.
 run_trial "c12"    12 0
+sleep 25
 run_trial "c24"    24 0
+sleep 25
 run_trial "c32"    32 0
+sleep 25
+run_trial "c40"    40 0
+sleep 25
+run_trial "c64"    64 0
 
 REPORT="${RUN_PREFIX}.md"
 python scripts/lib/render_report.py sweep \
@@ -83,6 +98,14 @@ python scripts/lib/render_report.py sweep \
     --run-id "omnidoc-${TS}-asyncio-matrix" \
     --pool-size "${POOL_SIZE}" \
     --cpu-url "${CPU_URL}"
+
+# Retroactively append CPU + SGLang per-trial runtime signals + phase
+# decomposition to the report by matching trial wall times against
+# Prometheus's glmocr_in_flight_requests timeline. Requires the 25 s
+# inter-trial gaps above so each trial is its own segment. Non-fatal
+# if Prometheus is unreachable (e.g. observability stack not up).
+python scripts/augment_matrix_report.py --report "${REPORT}" \
+    || warn "augment_matrix_report.py failed; report has bench data only"
 
 # Preserve the image pool next to the report so future runs can diff /
 # re-feed it and get apples-to-apples numbers. Without this, a doc-
