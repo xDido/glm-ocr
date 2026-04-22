@@ -29,9 +29,6 @@ pipeline:
     connection_pool_size: ${OCR_CONN_POOL}
     ssl_verify: false
 
-  page_loader:
-    max_tokens: ${OCR_MAX_TOKENS}
-
   max_workers: ${OCR_MAX_WORKERS}
 
   # Layout bypass: map every detected class to `skip`/`abandon` so the

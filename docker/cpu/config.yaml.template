@@ -29,13 +29,6 @@ pipeline:
     connection_pool_size: ${OCR_CONN_POOL}
     ssl_verify: false
 
-  page_loader:
-    # Per-region max_tokens sent to SGLang's /v1/chat/completions. Observed
-    # mean generated tokens per region ~55; keeping the cap well above that
-    # but below glmocr's default 8192 frees SGLang slot reservations and
-    # grows effective batching headroom.
-    max_tokens: ${OCR_MAX_TOKENS}
-
   max_workers: ${OCR_MAX_WORKERS}
 
   layout:
