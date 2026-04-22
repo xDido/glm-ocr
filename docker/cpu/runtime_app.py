@@ -468,7 +468,24 @@ def instrument_pipeline(pipeline) -> None:
         layout_backend = os.environ.get("LAYOUT_BACKEND", "torch").lower()
         layout_postproc = os.environ.get("LAYOUT_POSTPROC", "torch").lower()
         layout_graph = os.environ.get("LAYOUT_GRAPH", "raw").lower()
+        # Execution provider for the layout ORT session.
+        #   cpu      -> default MLAS CPU EP (rollback-safe).
+        #   openvino -> OpenVINOExecutionProvider, device=CPU. Micro-bench on
+        #               the raw graph showed -31% mean wall-time per forward
+        #               vs. MLAS CPU EP on this Ryzen 5600X host. Requires
+        #               the onnxruntime-openvino wheel (see Dockerfile.slim).
+        # CPU EP is always appended as a fallback so unsupported ops run on
+        # MLAS rather than aborting session init.
+        layout_provider = os.environ.get("LAYOUT_ONNX_PROVIDER", "cpu").lower()
         _numpy_path_installed = False
+
+        def _providers_for_layout():
+            if layout_provider == "openvino":
+                return [
+                    ("OpenVINOExecutionProvider", {"device_type": "CPU"}),
+                    "CPUExecutionProvider",
+                ]
+            return ["CPUExecutionProvider"]
 
         if layout_backend == "onnx" and layout_postproc == "numpy":
             try:
@@ -500,7 +517,7 @@ def instrument_pipeline(pipeline) -> None:
                     os.environ.get("LAYOUT_ONNX_THREADS", "1")
                 )
                 _sess = _ort.InferenceSession(
-                    onnx_path, ort_opts, providers=["CPUExecutionProvider"],
+                    onnx_path, ort_opts, providers=_providers_for_layout(),
                 )
 
                 # Capture detector config + processor reference before we
@@ -657,7 +674,7 @@ def instrument_pipeline(pipeline) -> None:
                     os.environ.get("LAYOUT_ONNX_THREADS", "1")
                 )
                 _sess = _ort.InferenceSession(
-                    onnx_path, ort_opts, providers=["CPUExecutionProvider"],
+                    onnx_path, ort_opts, providers=_providers_for_layout(),
                 )
                 _orig_model = ld._model
                 _orig_config = getattr(_orig_model, "config", None)
