@@ -7,6 +7,7 @@ Run headless:
 Env overrides:
     LOCUST_IMAGES  - comma-separated image URLs (required; set by scripts/omnidoc_locust.sh)
 """
+
 from __future__ import annotations
 
 import os
@@ -34,16 +35,26 @@ class OCRUser(HttpUser):
     @task
     def parse_single(self) -> None:
         body = {"images": [random.choice(IMAGES)]}
-        with self.client.post("/glmocr/parse", json=body, name="parse:single",
-                              catch_response=True, timeout=300) as resp:
+        with self.client.post(
+            "/glmocr/parse",
+            json=body,
+            name="parse:single",
+            catch_response=True,
+            timeout=300,
+        ) as resp:
             if resp.status_code != 200:
                 resp.failure(f"status={resp.status_code} body={resp.text[:200]}")
 
     @task(1)
     def parse_batch(self) -> None:
         body = {"images": random.sample(IMAGES, k=min(2, len(IMAGES)))}
-        with self.client.post("/glmocr/parse", json=body, name="parse:batch",
-                              catch_response=True, timeout=300) as resp:
+        with self.client.post(
+            "/glmocr/parse",
+            json=body,
+            name="parse:batch",
+            catch_response=True,
+            timeout=300,
+        ) as resp:
             if resp.status_code != 200:
                 resp.failure(f"status={resp.status_code} body={resp.text[:200]}")
 

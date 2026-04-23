@@ -23,7 +23,9 @@ ARGS=(
 [[ -n "${SGL_MAX_TOTAL_TOKENS:-}"     ]] && ARGS+=(--max-total-tokens      "${SGL_MAX_TOTAL_TOKENS}")
 [[ -n "${SGL_MEM_FRACTION_STATIC:-}"  ]] && ARGS+=(--mem-fraction-static   "${SGL_MEM_FRACTION_STATIC}")
 [[ -n "${SGL_CONTEXT_LENGTH:-}"       ]] && ARGS+=(--context-length        "${SGL_CONTEXT_LENGTH}")
-[[ -n "${SGL_SCHEDULE_POLICY:-}"      ]] && ARGS+=(--schedule-policy       "${SGL_SCHEDULE_POLICY}")
+[[ -n "${SGL_SCHEDULE_POLICY:-}"           ]] && ARGS+=(--schedule-policy           "${SGL_SCHEDULE_POLICY}")
+[[ -n "${SGL_CUDA_GRAPH_MAX_BS:-}"         ]] && ARGS+=(--cuda-graph-max-bs         "${SGL_CUDA_GRAPH_MAX_BS}")
+[[ -n "${SGL_SCHEDULE_CONSERVATIVENESS:-}" ]] && ARGS+=(--schedule-conservativeness "${SGL_SCHEDULE_CONSERVATIVENESS}")
 
 # Chunked prefill: the bare --chunked-prefill flag was renamed to
 # --chunked-prefill-size N in modern SGLang. Enable when SGL_CHUNKED_PREFILL

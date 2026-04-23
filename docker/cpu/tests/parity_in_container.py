@@ -12,6 +12,7 @@ Usage (from host):
 
 Exit code 0 if parity passes, non-zero otherwise.
 """
+
 from __future__ import annotations
 
 import os
@@ -58,7 +59,9 @@ def main() -> int:
 
     target_sizes_torch = torch.tensor([img.size[::-1]])
     torch_results = processor.post_process_object_detection(
-        outputs, threshold=THRESHOLD, target_sizes=target_sizes_torch,
+        outputs,
+        threshold=THRESHOLD,
+        target_sizes=target_sizes_torch,
     )[0]
 
     # Numpy path — pull same tensors out as numpy and call the port.
@@ -69,7 +72,10 @@ def main() -> int:
     target_sizes_np = np.array([img.size[::-1]], dtype=np.int64)
 
     np_results = np_post_process_object_detection(
-        logits_np, pred_boxes_np, order_logits_np, out_masks_np,
+        logits_np,
+        pred_boxes_np,
+        order_logits_np,
+        out_masks_np,
         target_sizes=target_sizes_np,
         threshold=THRESHOLD,
         processor_size=processor.size,
@@ -91,7 +97,9 @@ def main() -> int:
     failed = False
 
     if len(torch_scores) != len(np_scores):
-        print(f"[FAIL] detection count mismatch: torch={len(torch_scores)} np={len(np_scores)}")
+        print(
+            f"[FAIL] detection count mismatch: torch={len(torch_scores)} np={len(np_scores)}"
+        )
         failed = True
 
     n = min(len(torch_scores), len(np_scores))
@@ -112,13 +120,13 @@ def main() -> int:
             print(f"[FAIL] score delta {score_diff:.2e} exceeds 1e-4")
             failed = True
         if not label_match:
-            print(f"[FAIL] labels differ at some positions")
+            print("[FAIL] labels differ at some positions")
             failed = True
         if box_diff > 1e-2:
             print(f"[FAIL] box delta {box_diff:.4f} exceeds 0.01 pixels")
             failed = True
         if not order_match:
-            print(f"[FAIL] order_seq differs")
+            print("[FAIL] order_seq differs")
             failed = True
 
     if failed:
@@ -162,7 +170,10 @@ def main() -> int:
     detector.id2label = model.config.id2label
 
     all_results_torch, _ = detector.process(
-        [img], save_visualization=False, global_start_idx=0, use_polygon=False,
+        [img],
+        save_visualization=False,
+        global_start_idx=0,
+        use_polygon=False,
     )
 
     img_sizes_wh = [img.size]  # (width, height)
@@ -206,13 +217,17 @@ def main() -> int:
     full_failed = False
     for i, (t, n) in enumerate(zip(t_detections, n_detections)):
         if t["label"] != n["label"]:
-            print(f"[FAIL] det {i}: label {t['label']} vs {n['label']}"); full_failed = True
+            print(f"[FAIL] det {i}: label {t['label']} vs {n['label']}")
+            full_failed = True
         if abs(t["score"] - n["score"]) > 1e-4:
-            print(f"[FAIL] det {i}: score Δ {abs(t['score']-n['score']):.2e}"); full_failed = True
+            print(f"[FAIL] det {i}: score Δ {abs(t['score'] - n['score']):.2e}")
+            full_failed = True
         if t["bbox_2d"] != n["bbox_2d"]:
-            print(f"[FAIL] det {i}: bbox_2d {t['bbox_2d']} vs {n['bbox_2d']}"); full_failed = True
+            print(f"[FAIL] det {i}: bbox_2d {t['bbox_2d']} vs {n['bbox_2d']}")
+            full_failed = True
         if t["task_type"] != n["task_type"]:
-            print(f"[FAIL] det {i}: task_type {t['task_type']} vs {n['task_type']}"); full_failed = True
+            print(f"[FAIL] det {i}: task_type {t['task_type']} vs {n['task_type']}")
+            full_failed = True
 
     if full_failed:
         return 1

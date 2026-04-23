@@ -12,6 +12,7 @@ more closely than the Phase-1 numpy path does.
 Pairs detections by IoU (Hungarian-ish greedy) rather than by index
 since tie-breaking can rotate equal-score items.
 """
+
 from __future__ import annotations
 
 import glob
@@ -48,7 +49,12 @@ from layout_postprocess import (  # noqa: E402
 
 
 def _iou(b1, b2):
-    x1, y1, x2, y2 = max(b1[0], b2[0]), max(b1[1], b2[1]), min(b1[2], b2[2]), min(b1[3], b2[3])
+    x1, y1, x2, y2 = (
+        max(b1[0], b2[0]),
+        max(b1[1], b2[1]),
+        min(b1[2], b2[2]),
+        min(b1[3], b2[3]),
+    )
     if x2 <= x1 or y2 <= y1:
         return 0.0
     inter = (x2 - x1) * (y2 - y1)
@@ -88,8 +94,12 @@ def main() -> int:
 
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = 1
-    raw_sess = ort.InferenceSession(str(RAW_PATH), opts, providers=["CPUExecutionProvider"])
-    fused_sess = ort.InferenceSession(str(FUSED_PATH), opts, providers=["CPUExecutionProvider"])
+    raw_sess = ort.InferenceSession(
+        str(RAW_PATH), opts, providers=["CPUExecutionProvider"]
+    )
+    fused_sess = ort.InferenceSession(
+        str(FUSED_PATH), opts, providers=["CPUExecutionProvider"]
+    )
 
     n_ok = 0
     n_count_diff = 0
@@ -109,30 +119,42 @@ def main() -> int:
             None, {"pixel_values": pv}
         )
         raw_np = np_post_process_object_detection(
-            logits, pred_boxes, order_logits, out_masks,
+            logits,
+            pred_boxes,
+            order_logits,
+            out_masks,
             target_sizes=target_sizes,
             threshold=THRESHOLD,
             processor_size=dict(processor.size),
         )[0]
 
         # Fused + numpy tail.
-        scores_topk, labels_topk, boxes_topk, order_seq_topk, masks_logits_topk, _ = \
-            fused_sess.run(
-                None, {"pixel_values": pv, "target_sizes": target_sizes}
-            )
+        scores_topk, labels_topk, boxes_topk, order_seq_topk, masks_logits_topk, _ = (
+            fused_sess.run(None, {"pixel_values": pv, "target_sizes": target_sizes})
+        )
         fused_np = _post_process_from_fused(
-            scores_topk, labels_topk, boxes_topk, order_seq_topk, masks_logits_topk,
+            scores_topk,
+            labels_topk,
+            boxes_topk,
+            order_seq_topk,
+            masks_logits_topk,
             target_sizes=target_sizes,
             threshold=THRESHOLD,
             processor_size=dict(processor.size),
         )[0]
 
-        a_scores = raw_np["scores"]; a_labels = raw_np["labels"]; a_boxes = raw_np["boxes"]
-        b_scores = fused_np["scores"]; b_labels = fused_np["labels"]; b_boxes = fused_np["boxes"]
+        a_scores = raw_np["scores"]
+        a_labels = raw_np["labels"]
+        a_boxes = raw_np["boxes"]
+        b_scores = fused_np["scores"]
+        b_labels = fused_np["labels"]
+        b_boxes = fused_np["boxes"]
 
         if len(a_scores) != len(b_scores):
             n_count_diff += 1
-            print(f"[parity-e2e] {Path(p).name}: count {len(a_scores)} vs {len(b_scores)}")
+            print(
+                f"[parity-e2e] {Path(p).name}: count {len(a_scores)} vs {len(b_scores)}"
+            )
             continue
 
         if len(a_scores) == 0:
@@ -160,8 +182,10 @@ def main() -> int:
             print(f"[parity-e2e] {Path(p).name}: page mismatch")
 
         if (idx + 1) % 5 == 0:
-            print(f"[parity-e2e] progress {idx+1}/{len(paths)}  ok={n_ok}  "
-                  f"elapsed={time.perf_counter()-t0:.1f}s")
+            print(
+                f"[parity-e2e] progress {idx + 1}/{len(paths)}  ok={n_ok}  "
+                f"elapsed={time.perf_counter() - t0:.1f}s"
+            )
 
     print()
     print("[parity-e2e] summary:")
@@ -172,7 +196,7 @@ def main() -> int:
     print(f"  label mismatches:       {n_label_diff}")
     print(f"  worst score Δ (paired): {worst_score_delta:.2e}")
     print(f"  worst IoU (paired):     {worst_iou:.4f}")
-    print(f"  elapsed:                {time.perf_counter()-t0:.1f}s")
+    print(f"  elapsed:                {time.perf_counter() - t0:.1f}s")
     pass_rate = n_ok / max(1, len(paths))
     print(f"  pass rate:              {pass_rate:.2%}")
     return 0 if pass_rate >= 0.99 else 1

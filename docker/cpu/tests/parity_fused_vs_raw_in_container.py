@@ -17,6 +17,7 @@ N = number of pages to test (default 10). Images are pulled from
 
 Exit 0 on pass, non-zero on mismatch beyond tolerance.
 """
+
 from __future__ import annotations
 
 import glob
@@ -51,8 +52,11 @@ from layout_postprocess import _np_get_order_seqs, _sigmoid  # noqa: E402
 
 def main() -> int:
     if not RAW_PATH.exists() or not FUSED_PATH.exists():
-        print(f"[parity] missing graph(s): raw={RAW_PATH.exists()} "
-              f"fused={FUSED_PATH.exists()}", file=sys.stderr)
+        print(
+            f"[parity] missing graph(s): raw={RAW_PATH.exists()} "
+            f"fused={FUSED_PATH.exists()}",
+            file=sys.stderr,
+        )
         return 2
 
     paths = sorted(glob.glob(os.path.join(IMAGES_DIR, "*.png")))[:N_PAGES]
@@ -67,8 +71,12 @@ def main() -> int:
     # across both sessions.
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = 1
-    raw_sess = ort.InferenceSession(str(RAW_PATH), opts, providers=["CPUExecutionProvider"])
-    fused_sess = ort.InferenceSession(str(FUSED_PATH), opts, providers=["CPUExecutionProvider"])
+    raw_sess = ort.InferenceSession(
+        str(RAW_PATH), opts, providers=["CPUExecutionProvider"]
+    )
+    fused_sess = ort.InferenceSession(
+        str(FUSED_PATH), opts, providers=["CPUExecutionProvider"]
+    )
 
     worst = {
         "score": 0.0,
@@ -115,7 +123,8 @@ def main() -> int:
         labels_ref = (top_idx % C).astype(np.int64)
         query_idx = (top_idx // C).astype(np.int64)
         boxes_ref = np.take_along_axis(
-            boxes_xyxy, np.broadcast_to(query_idx[..., None], (B, N, 4)),
+            boxes_xyxy,
+            np.broadcast_to(query_idx[..., None], (B, N, 4)),
             axis=1,
         )
         Hm, Wm = out_masks.shape[-2:]
@@ -158,13 +167,17 @@ def main() -> int:
         if page_ok:
             n_ok += 1
         else:
-            print(f"[parity] {Path(p).name}: "
-                  f"score Δ={score_delta:.2e}  box Δ={box_delta:.2f}  "
-                  f"mask Δ={mask_delta:.2e}  labels={label_ok} order={order_ok}")
+            print(
+                f"[parity] {Path(p).name}: "
+                f"score Δ={score_delta:.2e}  box Δ={box_delta:.2f}  "
+                f"mask Δ={mask_delta:.2e}  labels={label_ok} order={order_ok}"
+            )
 
         if (idx + 1) % 5 == 0:
-            print(f"[parity] progress {idx+1}/{len(paths)}  ok={n_ok}  "
-                  f"elapsed={time.perf_counter()-t0:.1f}s")
+            print(
+                f"[parity] progress {idx + 1}/{len(paths)}  ok={n_ok}  "
+                f"elapsed={time.perf_counter() - t0:.1f}s"
+            )
 
     print()
     print("[parity] summary:")
@@ -175,7 +188,7 @@ def main() -> int:
     print(f"  worst mask-logit Δ:       {worst['mask']:.2e}")
     print(f"  pages with label diff:    {worst['label_mismatch_pages']}")
     print(f"  pages with order diff:    {worst['order_mismatch_pages']}")
-    print(f"  elapsed:                  {time.perf_counter()-t0:.1f}s")
+    print(f"  elapsed:                  {time.perf_counter() - t0:.1f}s")
 
     return 0 if n_ok == len(paths) else 1
 

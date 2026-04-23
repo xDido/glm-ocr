@@ -16,13 +16,13 @@ Usage inside container:
 
 Invoke twice (once per path) and compare the two stdout blocks.
 """
+
 from __future__ import annotations
 
 import os
 import sys
 import threading
 import time
-from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -33,6 +33,7 @@ sys.path.insert(0, "/app")
 def _rss_mb() -> float:
     try:
         import psutil
+
         return psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         return float("nan")
@@ -57,6 +58,7 @@ def main() -> int:
     pipeline.start()
 
     import runtime_app
+
     runtime_app.instrument_pipeline(pipeline)
     print(f"[perf] post-start RSS={_rss_mb():.1f} MB  threads={_thread_count()}")
 
@@ -71,7 +73,9 @@ def main() -> int:
     times_ms = []
     for i in range(iters):
         t0 = time.perf_counter()
-        ld.process([img], save_visualization=False, global_start_idx=0, use_polygon=False)
+        ld.process(
+            [img], save_visualization=False, global_start_idx=0, use_polygon=False
+        )
         times_ms.append((time.perf_counter() - t0) * 1000)
 
     times_ms = np.array(times_ms)

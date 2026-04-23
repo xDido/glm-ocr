@@ -22,6 +22,7 @@ Not a general-purpose parser. Assumes well-formed exposition from
 prometheus-flask-exporter + prometheus-client in multiproc mode; no
 escaping, no exemplars, no stateset semantics.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -97,15 +98,15 @@ def parse_prom_text(text: str) -> list[Sample]:
             close = line.find("}", brace)
             if close < 0:
                 continue
-            labels = _parse_labels(line[brace:close + 1])
-            rest = line[close + 1:].strip()
+            labels = _parse_labels(line[brace : close + 1])
+            rest = line[close + 1 :].strip()
         else:
             sp = line.find(" ")
             if sp < 0:
                 continue
             name = line[:sp]
             labels = {}
-            rest = line[sp + 1:].strip()
+            rest = line[sp + 1 :].strip()
         # value is first whitespace-separated token; ignore optional timestamp
         val_str = rest.split()[0] if rest else ""
         try:
@@ -123,7 +124,7 @@ def parse_prom_text(text: str) -> list[Sample]:
 
 @dataclass
 class Histogram:
-    name: str                  # base name ("glmocr_layout_seconds")
+    name: str  # base name ("glmocr_layout_seconds")
     label_key: tuple[tuple[str, str], ...]  # non-`le` labels, as hashable
     buckets: list[tuple[float, float]]  # sorted (le, count), includes +Inf as math.inf
     count: float
@@ -151,9 +152,7 @@ class Histogram:
                 last_finite = le
             if cnt >= self.count:
                 if le == float("inf"):
-                    label = (
-                        f">{last_finite:g}s" if last_finite is not None else ">Inf"
-                    )
+                    label = f">{last_finite:g}s" if last_finite is not None else ">Inf"
                     return (None, label)
                 return (le, None)
         return (None, None)
@@ -177,7 +176,8 @@ class Histogram:
                     # the target falls inside the +Inf bucket
                     label = (
                         f">{last_finite_edge:g}s"
-                        if last_finite_edge is not None else ">Inf"
+                        if last_finite_edge is not None
+                        else ">Inf"
                     )
                     return (None, label)
                 return (prev_edge, None)
@@ -194,18 +194,22 @@ class Histogram:
         return (prev_edge, None)
 
 
-def collect_histograms(samples: Iterable[Sample]) -> dict[tuple[str, tuple[tuple[str, str], ...]], Histogram]:
+def collect_histograms(
+    samples: Iterable[Sample],
+) -> dict[tuple[str, tuple[tuple[str, str], ...]], Histogram]:
     """Group `_bucket`, `_sum`, `_count` samples back into `Histogram`s.
 
     Returned key is `(metric_base_name, tuple(sorted((k, v) for k, v in labels if k != "le")))`.
     """
-    buckets: dict[tuple[str, tuple[tuple[str, str], ...]], list[tuple[float, float]]] = {}
+    buckets: dict[
+        tuple[str, tuple[tuple[str, str], ...]], list[tuple[float, float]]
+    ] = {}
     sums: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
     counts: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
 
     for s in samples:
         if s.name.endswith("_bucket"):
-            base = s.name[:-len("_bucket")]
+            base = s.name[: -len("_bucket")]
             le_raw = s.labels.get("le")
             if le_raw is None:
                 continue
@@ -216,11 +220,11 @@ def collect_histograms(samples: Iterable[Sample]) -> dict[tuple[str, tuple[tuple
             key = _histogram_key(base, s.labels)
             buckets.setdefault(key, []).append((le, s.value))
         elif s.name.endswith("_sum"):
-            base = s.name[:-len("_sum")]
+            base = s.name[: -len("_sum")]
             key = _histogram_key(base, s.labels)
             sums[key] = s.value
         elif s.name.endswith("_count"):
-            base = s.name[:-len("_count")]
+            base = s.name[: -len("_count")]
             key = _histogram_key(base, s.labels)
             counts[key] = s.value
 
@@ -238,7 +242,9 @@ def collect_histograms(samples: Iterable[Sample]) -> dict[tuple[str, tuple[tuple
     return out
 
 
-def _histogram_key(base: str, labels: dict[str, str]) -> tuple[str, tuple[tuple[str, str], ...]]:
+def _histogram_key(
+    base: str, labels: dict[str, str]
+) -> tuple[str, tuple[tuple[str, str], ...]]:
     lbl = tuple(sorted((k, v) for k, v in labels.items() if k != "le"))
     return (base, lbl)
 

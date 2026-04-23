@@ -10,6 +10,7 @@ Run from the repo root with:
 
 Requires numpy + opencv-python + pytest. No torch, no transformers.
 """
+
 from __future__ import annotations
 
 import sys
@@ -27,7 +28,6 @@ from layout_postprocess import (  # noqa: E402
     _np_get_order_seqs,
     _sigmoid,
     _unclip_boxes,
-    np_apply_layout_postprocess,
     np_apply_per_class_threshold,
     np_post_process_object_detection,
     run_numpy_layout_pipeline,
@@ -102,8 +102,9 @@ def test_order_seqs_reversed_preference():
 # ---------------------------------------------------------------------------
 
 
-def _build_synthetic_detector_output(batch=1, num_queries=4, num_classes=3,
-                                     mask_h=200, mask_w=200):
+def _build_synthetic_detector_output(
+    batch=1, num_queries=4, num_classes=3, mask_h=200, mask_w=200
+):
     """Deterministic synthetic outputs with known top-1 detection at query 0."""
     # logits: make query 0, class 1 the clear winner. Others very negative.
     logits = np.full((batch, num_queries, num_classes), -20.0, dtype=np.float32)
@@ -124,7 +125,10 @@ def test_post_process_picks_top_detection():
     # Target image is 100 × 200 (H × W).
     target_sizes = np.array([[100, 200]], dtype=np.int64)
     out = np_post_process_object_detection(
-        logits, pred_boxes, order_logits, out_masks,
+        logits,
+        pred_boxes,
+        order_logits,
+        out_masks,
         target_sizes=target_sizes,
         threshold=0.5,
         processor_size={"width": 800, "height": 800},
@@ -144,7 +148,10 @@ def test_post_process_threshold_drops_everything():
     logits, pred_boxes, order_logits, out_masks = _build_synthetic_detector_output()
     target_sizes = np.array([[100, 200]], dtype=np.int64)
     out = np_post_process_object_detection(
-        logits, pred_boxes, order_logits, out_masks,
+        logits,
+        pred_boxes,
+        order_logits,
+        out_masks,
         target_sizes=target_sizes,
         threshold=0.999999,  # above even sigmoid(10) after rounding — well above
         processor_size={"width": 800, "height": 800},
@@ -161,13 +168,15 @@ def test_post_process_threshold_drops_everything():
 def test_per_class_threshold_filters_correctly():
     # Two detections: label 0 @ 0.6, label 1 @ 0.7. Global threshold 0.5.
     # Per-class: label 0 → 0.8 (filter it out); label 1 → 0.5 (keep it).
-    raw = [{
-        "scores": np.array([0.6, 0.7], dtype=np.float32),
-        "labels": np.array([0, 1], dtype=np.int64),
-        "boxes": np.array([[0, 0, 10, 10], [20, 20, 30, 30]], dtype=np.float32),
-        "order_seq": np.array([0, 1], dtype=np.int64),
-        "polygon_points": [np.array([[0, 0]]), np.array([[20, 20]])],
-    }]
+    raw = [
+        {
+            "scores": np.array([0.6, 0.7], dtype=np.float32),
+            "labels": np.array([0, 1], dtype=np.int64),
+            "boxes": np.array([[0, 0, 10, 10], [20, 20, 30, 30]], dtype=np.float32),
+            "order_seq": np.array([0, 1], dtype=np.int64),
+            "polygon_points": [np.array([[0, 0]]), np.array([[20, 20]])],
+        }
+    ]
     id2label = {0: "text", 1: "title"}
     out = np_apply_per_class_threshold(
         raw,
@@ -182,13 +191,15 @@ def test_per_class_threshold_filters_correctly():
 
 
 def test_per_class_threshold_unknown_class_ignored():
-    raw = [{
-        "scores": np.array([0.6], dtype=np.float32),
-        "labels": np.array([0], dtype=np.int64),
-        "boxes": np.array([[0, 0, 10, 10]], dtype=np.float32),
-        "order_seq": np.array([0], dtype=np.int64),
-        "polygon_points": [],
-    }]
+    raw = [
+        {
+            "scores": np.array([0.6], dtype=np.float32),
+            "labels": np.array([0], dtype=np.int64),
+            "boxes": np.array([[0, 0, 10, 10]], dtype=np.float32),
+            "order_seq": np.array([0], dtype=np.int64),
+            "polygon_points": [],
+        }
+    ]
     id2label = {0: "text"}
     out = np_apply_per_class_threshold(
         raw,
@@ -223,21 +234,27 @@ def test_is_contained_nested():
 def test_nms_removes_duplicate_same_class():
     # Two near-identical same-class boxes (iou > 0.6) → lower score dropped.
     # boxes format: [cls_id, score, x1, y1, x2, y2]
-    boxes = np.array([
-        [0, 0.9, 0, 0, 10, 10],
-        [0, 0.5, 0, 0, 10, 10],   # duplicate, should drop
-        [1, 0.8, 100, 100, 110, 110],  # different class, different place
-    ], dtype=np.float32)
+    boxes = np.array(
+        [
+            [0, 0.9, 0, 0, 10, 10],
+            [0, 0.5, 0, 0, 10, 10],  # duplicate, should drop
+            [1, 0.8, 100, 100, 110, 110],  # different class, different place
+        ],
+        dtype=np.float32,
+    )
     kept = _nms(boxes, iou_same=0.6, iou_diff=0.95)
     assert sorted(kept) == [0, 2]
 
 
 def test_nms_keeps_different_classes_at_same_location():
     # iou_diff=0.95; two classes at identical box → iou=1.0 ≥ 0.95 → loser drops.
-    boxes = np.array([
-        [0, 0.9, 0, 0, 10, 10],
-        [1, 0.5, 0, 0, 10, 10],
-    ], dtype=np.float32)
+    boxes = np.array(
+        [
+            [0, 0.9, 0, 0, 10, 10],
+            [1, 0.5, 0, 0, 10, 10],
+        ],
+        dtype=np.float32,
+    )
     kept = _nms(boxes, iou_same=0.6, iou_diff=0.95)
     assert kept == [0]
 

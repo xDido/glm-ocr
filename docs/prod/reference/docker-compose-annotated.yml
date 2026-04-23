@@ -1,0 +1,237 @@
+# reference/docker-compose-annotated.yml
+#
+# Provenance: the dev repo's docker-compose.yml, annotated inline to show
+# what each service maps to in the production AWS architecture. Acts as a
+# local-to-cloud Rosetta stone for when you're translating a local config
+# observation into its prod equivalent.
+#
+# Do not run this file as a compose file — the annotations are invalid YAML
+# comments mixed with the real config. It's reference-only.
+
+services:
+
+  # ==== MAPS TO: SageMaker real-time endpoint `glmocr-sglang` ===============
+  # In prod, this entire service becomes a SageMaker BYOC endpoint. The
+  # container image is different (docker/sglang/ instead of bind-mounted
+  # entrypoint), the port is 8080 (not 30000), weights come from S3
+  # (not a bind mount), and the health contract is /ping (not /health).
+  #
+  # See docs/prod/03-sagemaker-sglang-byoc.md for the full BYOC container spec.
+  # The SGL_* env vars translate 1:1 into the SageMaker endpoint's
+  # Environment block via SSM Parameter Store (/glmocr/prod/sgl/*).
+  sglang:
+    image: lmsysorg/sglang:${SGL_IMAGE_TAG:-latest}
+    container_name: glmocr-sglang
+    restart: unless-stopped
+    ports:
+      - "${SGL_PORT:-30000}:30000"     # PROD: not exposed; sigv4-proxy reaches
+                                        # the endpoint via sagemaker-runtime API
+    entrypoint: ["bash", "/glm-ocr-entrypoint.sh"]
+    environment:
+      # All SGL_* → SSM /glmocr/prod/sgl/* → SageMaker Environment
+      SGL_MODEL_PATH: ${SGL_MODEL_PATH}              # PROD: /opt/ml/model (SM mount)
+      SGL_SERVED_MODEL_NAME: ${SGL_SERVED_MODEL_NAME}
+      SGL_TP_SIZE: ${SGL_TP_SIZE}
+      SGL_DTYPE: ${SGL_DTYPE}
+      SGL_MAX_RUNNING_REQUESTS: ${SGL_MAX_RUNNING_REQUESTS}
+      SGL_MAX_PREFILL_TOKENS: ${SGL_MAX_PREFILL_TOKENS}
+      SGL_MAX_TOTAL_TOKENS: ${SGL_MAX_TOTAL_TOKENS}
+      SGL_MEM_FRACTION_STATIC: ${SGL_MEM_FRACTION_STATIC}
+      SGL_CONTEXT_LENGTH: ${SGL_CONTEXT_LENGTH:-}
+      SGL_CHUNKED_PREFILL: ${SGL_CHUNKED_PREFILL}
+      SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE:-8192}
+      SGL_SCHEDULE_POLICY: ${SGL_SCHEDULE_POLICY}
+      SGL_CUDA_GRAPH_MAX_BS: ${SGL_CUDA_GRAPH_MAX_BS:-}
+      SGL_SCHEDULE_CONSERVATIVENESS: ${SGL_SCHEDULE_CONSERVATIVENESS:-}
+      SGLANG_USE_CUDA_IPC_TRANSPORT: ${SGLANG_USE_CUDA_IPC_TRANSPORT:-}
+      SGL_SPECULATIVE: ${SGL_SPECULATIVE:-}
+      SGL_SPEC_ALGORITHM: ${SGL_SPEC_ALGORITHM:-}
+      SGL_SPEC_NUM_STEPS: ${SGL_SPEC_NUM_STEPS:-}
+      SGL_SPEC_EAGLE_TOPK: ${SGL_SPEC_EAGLE_TOPK:-}
+      SGL_SPEC_NUM_DRAFT_TOKENS: ${SGL_SPEC_NUM_DRAFT_TOKENS:-}
+      HF_TOKEN: ${HF_TOKEN}                          # PROD: not needed at runtime
+                                                     # (weights are pre-staged in S3)
+      HF_HOME: /root/.cache/huggingface              # PROD: default; cache not used
+    volumes:
+      - ./docker/gpu/entrypoint.sh:/glm-ocr-entrypoint.sh:ro  # PROD: COPY'd in
+                                                                # Dockerfile instead
+      - ./hf-cache:/root/.cache/huggingface          # PROD: removed; weights
+                                                     # at /opt/ml/model via ModelDataUrl
+    shm_size: "32gb"                                 # PROD: set via SageMaker
+                                                     # container config (autodefaults)
+    ipc: host                                        # PROD: not available
+    deploy:
+      resources:
+        limits:    { cpus: "4", memory: 8G }        # PROD: chosen by instance
+        reservations:                                 # type (ml.g4dn.2xlarge)
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]                    # PROD: implicit on ml.g4dn
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:30000/health || exit 1"]
+                                                     # PROD: SageMaker pings
+                                                     # /ping on :8080, which our
+                                                     # serve.py proxies to SGLang's
+                                                     # /health on :30000
+
+  # ==== MAPS TO: ECS Fargate task `cpu` container ===========================
+  # This becomes 1 of 3 containers in the Fargate task:
+  #   - cpu           (this service, image unchanged)
+  #   - sigv4-proxy   (NEW in prod — makes SGLANG_HOST=127.0.0.1 work)
+  #   - alloy         (was a separate compose service — see below)
+  #
+  # Env vars come from SSM /glmocr/prod/cpu/* (non-secret) and Secrets Manager
+  # glmocr/prod/hf_token (secret). See docs/prod/04-fargate-cpu-task.md.
+  cpu:
+    build:
+      context: ./docker/cpu
+      dockerfile: Dockerfile.slim                    # PROD: built in CI, pushed
+                                                      # to ECR with commit SHA tag
+    image: glmocr-cpu:local                           # PROD: <acct>.dkr.ecr.<region>.amazonaws.com/glmocr-cpu:<sha>
+    container_name: glmocr-cpu
+    restart: unless-stopped
+    ports:
+      - "${GLMOCR_PORT:-5002}:5002"                   # PROD: ALB target group
+      - "${ASYNC_PORT:-5003}:5003"                    # PROD: not exposed (LAYOUT_ASYNC=false)
+    environment:
+      # All CPU-side knobs → SSM /glmocr/prod/cpu/*
+      CPU_WORKERS: ${CPU_WORKERS}
+      CPU_THREADS: ${CPU_THREADS}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}          # PROD: 1 (measured best)
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-2}          # PROD: 1
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT}
+      GLMOCR_PORT: "5002"
+      OCR_MAX_WORKERS: ${OCR_MAX_WORKERS}
+      OCR_CONNECT_TIMEOUT: ${OCR_CONNECT_TIMEOUT}
+      OCR_REQUEST_TIMEOUT: ${OCR_REQUEST_TIMEOUT}
+      OCR_RETRY_MAX: ${OCR_RETRY_MAX}
+      OCR_RETRY_BACKOFF_BASE: ${OCR_RETRY_BACKOFF_BASE}
+      OCR_RETRY_BACKOFF_MAX: ${OCR_RETRY_BACKOFF_MAX}
+      OCR_CONN_POOL: ${OCR_CONN_POOL}
+      OCR_MODEL_NAME: ${OCR_MODEL_NAME}
+      LAYOUT_ENABLED: ${LAYOUT_ENABLED}
+      LAYOUT_DEVICE: ${LAYOUT_DEVICE}
+      LAYOUT_USE_POLYGON: ${LAYOUT_USE_POLYGON}
+      LAYOUT_MODEL_DIR: ${LAYOUT_MODEL_DIR:-PaddlePaddle/PP-DocLayoutV3_safetensors}
+      LAYOUT_BACKEND: ${LAYOUT_BACKEND:-torch}        # PROD: onnx
+      LAYOUT_ONNX_THREADS: ${LAYOUT_ONNX_THREADS:-1}  # PROD: 2 (or 3 on 12-vCPU)
+      LAYOUT_POSTPROC: ${LAYOUT_POSTPROC:-torch}      # PROD: numpy
+      LAYOUT_GRAPH: ${LAYOUT_GRAPH:-raw}              # PROD: raw (fused regressed)
+      LAYOUT_COMPILE: ${LAYOUT_COMPILE:-false}
+      LAYOUT_BATCH_ENABLED: ${LAYOUT_BATCH_ENABLED:-false}  # PROD: true
+      LAYOUT_BATCH_MAX: ${LAYOUT_BATCH_MAX:-4}        # PROD: 8 (hard ceiling)
+      LAYOUT_BATCH_WINDOW_MS: ${LAYOUT_BATCH_WINDOW_MS:-20}
+      LAYOUT_ASYNC: ${LAYOUT_ASYNC:-false}            # PROD: false (async rejected)
+      ASYNC_PORT: ${ASYNC_PORT:-5003}
+      ASYNC_WORKERS: ${ASYNC_WORKERS:-4}
+      HF_HOME: /root/.cache/huggingface               # PROD: default; container ephemeral
+      HF_TOKEN: ${HF_TOKEN}                           # PROD: from Secrets Manager
+                                                      # (glmocr/prod/hf_token)
+      # ---- HERE'S THE BIG PROD CHANGE --------------------------------------
+      # SGLANG_HOST in dev is the compose DNS name 'sglang'.
+      # In prod, it's 127.0.0.1 because the sigv4-proxy sidecar runs on
+      # localhost:30000 in the same task. The proxy signs the request with
+      # SigV4 and forwards to sagemaker-runtime.<region>.amazonaws.com.
+      # NEVER set SGLANG_HOST to a public URL — it'd bypass signing → 403.
+      SGLANG_HOST: ${SGLANG_HOST}                     # PROD: 127.0.0.1
+      SGLANG_PORT: ${SGLANG_PORT}                     # PROD: 30000
+      SGLANG_SCHEME: ${SGLANG_SCHEME}                 # PROD: http
+      GLMOCR_PIPELINE_METRICS: "true"
+      # Mirror of SGL caps for dashboard gauges (read-only)
+      SGL_MAX_RUNNING_REQUESTS: ${SGL_MAX_RUNNING_REQUESTS}
+      SGL_MAX_TOTAL_TOKENS: ${SGL_MAX_TOTAL_TOKENS}
+      SGL_MAX_PREFILL_TOKENS: ${SGL_MAX_PREFILL_TOKENS}
+      SGL_CHUNKED_PREFILL_SIZE: ${SGL_CHUNKED_PREFILL_SIZE:-8192}
+    volumes:
+      - ./scripts/smoke_test.png:/app/smoke_test.png:ro  # PROD: removed
+      - ./hf-cache:/root/.cache/huggingface              # PROD: removed
+      - ./datasets:/app/datasets:ro                       # PROD: removed
+                                                          # (loadtest runs from CI)
+    depends_on:
+      sglang:
+        condition: service_healthy                        # PROD: task-def
+                                                          # dependsOn: sigv4-proxy HEALTHY
+    deploy:
+      resources:
+        limits: { cpus: "12", memory: 24G }              # PROD: 8 vCPU / 16 GB
+                                                          # (Fargate task sizing)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5002/health || exit 1"]
+                                                          # PROD: same healthcheck,
+                                                          # used by ECS + ALB
+
+  # ==== MAPS TO: REMOVED in prod ============================================
+  # Prometheus is a dev-only service. In prod, Alloy (below) scrapes the CPU
+  # container on task-local loopback and remote_writes straight to Grafana
+  # Cloud Mimir. We don't need a central Prometheus because we're not doing
+  # per-config sweeps in prod.
+  prometheus:
+    image: prom/prometheus:latest
+    # (... lines elided — see dev repo)
+
+  # ==== MAPS TO: ECS Fargate task `alloy` sidecar container =================
+  # In dev, Alloy is a separate compose service scraping cpu:5002 and sglang:30000
+  # via container DNS. In prod, it becomes a SIDECAR in the Fargate task and
+  # scrapes 127.0.0.1:5002 (the cpu container, on loopback). It can't reach
+  # SageMaker's SGLang metrics — that gap is filled by CloudWatch.
+  #
+  # See docs/prod/06-observability-prod.md.
+  alloy:
+    image: grafana/alloy:latest                           # PROD: pin a tag; baked
+                                                          # with our config.alloy into
+                                                          # a custom glmocr-alloy image
+    container_name: glmocr-alloy
+    environment:
+      - GRAFANA_CLOUD_PROM_URL=${GRAFANA_CLOUD_PROM_URL:-}   # PROD: Secrets Manager
+      - GRAFANA_CLOUD_PROM_USER=${GRAFANA_CLOUD_PROM_USER:-} # (glmocr/prod/grafana_cloud)
+      - GRAFANA_CLOUD_PROM_TOKEN=${GRAFANA_CLOUD_PROM_TOKEN:-}
+
+  # ==== MAPS TO: REMOVED in prod ============================================
+  # Pushgateway was for pushing bench script summaries. In prod we run the
+  # matrix from CI which writes Markdown reports + pushes annotations to
+  # Grafana Cloud directly via the HTTP API. No pushgateway needed.
+  pushgateway:
+    image: prom/pushgateway:latest
+    # (...)
+
+  # ==== MAPS TO: REMOVED in prod ============================================
+  # Locust exporter was for a dev-only load driver. Prod uses the asyncio
+  # matrix, not Locust.
+  locust-exporter:
+    image: containersol/locust_exporter:latest
+    # (...)
+
+  # ==== MAPS TO: REMOVED in prod ============================================
+  # cAdvisor gave per-container stats in dev. Prod gets equivalent from
+  # Fargate's CloudWatch Container Insights (enable in the ECS cluster).
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    # (...)
+
+  # ==== MAPS TO: REMOVED in prod ============================================
+  # DCGM GPU exporter — only relevant on a local NVIDIA card. SageMaker
+  # endpoints emit GPUUtilization / GPUMemoryUtilization to CloudWatch
+  # natively.
+  nvidia-gpu-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.5-3.4.0-ubuntu22.04
+    # (...)
+
+  # ==== MAPS TO: REMOVED in prod ============================================
+  # Local Grafana was for in-browser dashboard viewing during dev sessions.
+  # Prod uses Grafana Cloud (dido.grafana.net). Same dashboard JSON,
+  # different datasource UIDs.
+  grafana:
+    image: grafana/grafana:latest
+    # (...)
+
+# ==== MAPS TO: VPC + 2 private subnets ========================================
+# Docker bridge network → AWS VPC with 2-AZ private + public subnets.
+networks:
+  glmocr:
+    driver: bridge
+
+# ==== MAPS TO: CloudWatch log group retention ================================
+# Grafana persistent volume → /aws/ecs or /aws/sagemaker log groups (14-day retention).
+volumes:
+  grafana-data:

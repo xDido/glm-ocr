@@ -22,6 +22,7 @@ best-effort; a failure just yields a "(unavailable)" row rather than
 aborting the report. matplotlib is an optional dep — if missing, the
 stage mode still emits the markdown without inline charts.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -45,6 +46,7 @@ import parse_metrics as pm  # noqa: E402
 # HTTP helpers (best-effort — failures become "(unavailable)" in the report).
 # ---------------------------------------------------------------------------
 
+
 def _get_json(url: str, timeout: float = 3.0) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -53,29 +55,34 @@ def _get_json(url: str, timeout: float = 3.0) -> dict:
         return {}
 
 
-def _prom_range(prom_url: str, query: str, start: float, end: float,
-                step: int = 30) -> list[tuple[float, float]]:
-    qs = urllib.parse.urlencode({
-        "query": query, "start": int(start), "end": int(end), "step": step,
-    })
+def _prom_range(
+    prom_url: str, query: str, start: float, end: float, step: int = 30
+) -> list[tuple[float, float]]:
+    qs = urllib.parse.urlencode(
+        {
+            "query": query,
+            "start": int(start),
+            "end": int(end),
+            "step": step,
+        }
+    )
     try:
         with urllib.request.urlopen(
-            f"{prom_url}/api/v1/query_range?{qs}", timeout=5,
+            f"{prom_url}/api/v1/query_range?{qs}",
+            timeout=5,
         ) as r:
             d = json.load(r)
     except Exception:
         return []
     if d.get("status") != "success" or not d.get("data", {}).get("result"):
         return []
-    return [
-        (float(t), float(v))
-        for t, v in d["data"]["result"][0].get("values", [])
-    ]
+    return [(float(t), float(v)) for t, v in d["data"]["result"][0].get("values", [])]
 
 
 # ---------------------------------------------------------------------------
 # Formatting helpers.
 # ---------------------------------------------------------------------------
+
 
 def _pct(ok: int, total: int) -> str:
     return f"{100 * ok / total:.1f}%" if total else "—"
@@ -110,8 +117,12 @@ def _server_table(cpu_url: str) -> str:
     if not sm:
         return "_(/runtime/summary unavailable — CPU container not responding)_"
 
-    def row(label: str, block_key: str, sub_env: str = "env",
-            sub_actual: str | tuple[str, ...] = "actual") -> tuple[str, str, str]:
+    def row(
+        label: str,
+        block_key: str,
+        sub_env: str = "env",
+        sub_actual: str | tuple[str, ...] = "actual",
+    ) -> tuple[str, str, str]:
         b = sm.get(block_key) or {}
         env_v = b.get(sub_env)
         if isinstance(sub_actual, tuple):
@@ -126,15 +137,29 @@ def _server_table(cpu_url: str) -> str:
 
     data = [
         row("CPU_WORKERS", "cpu_workers"),
-        row("CPU_THREADS (per worker)", "cpu_threads_per_worker",
-            sub_actual="actual_per_worker"),
+        row(
+            "CPU_THREADS (per worker)",
+            "cpu_threads_per_worker",
+            sub_actual="actual_per_worker",
+        ),
         row("OCR_MAX_WORKERS", "ocr_max_workers", sub_actual="config"),
-        row("SGL_MAX_RUNNING_REQUESTS", "sglang_max_running",
-            sub_actual=("runtime", "live_running")),
-        row("SGL_MAX_TOTAL_TOKENS", "sglang_batch_tokens",
-            sub_env="env_total", sub_actual="runtime_total"),
-        row("SGL_MAX_PREFILL_TOKENS", "sglang_batch_tokens",
-            sub_env="env_prefill", sub_actual="runtime_prefill"),
+        row(
+            "SGL_MAX_RUNNING_REQUESTS",
+            "sglang_max_running",
+            sub_actual=("runtime", "live_running"),
+        ),
+        row(
+            "SGL_MAX_TOTAL_TOKENS",
+            "sglang_batch_tokens",
+            sub_env="env_total",
+            sub_actual="runtime_total",
+        ),
+        row(
+            "SGL_MAX_PREFILL_TOKENS",
+            "sglang_batch_tokens",
+            sub_env="env_prefill",
+            sub_actual="runtime_prefill",
+        ),
         row("SGL_DTYPE", "sglang_dtype"),
         row("SGL_TP_SIZE", "sglang_tp_size"),
         row("SGL_MEM_FRACTION_STATIC", "sglang_mem_fraction"),
@@ -177,16 +202,19 @@ def _headline_table(summary: dict) -> str:
 
 
 def _observability_section(run_id: str) -> str:
-    return "\n".join([
-        "- Grafana dashboard: <http://localhost:3000/d/glmocr-load>",
-        f"- Pushgateway: <http://localhost:9091/metrics> (job=`glmocr_asyncio`, run_id=`{run_id}`)",
-        "- Alloy UI: <http://localhost:12345/graph>",
-    ])
+    return "\n".join(
+        [
+            "- Grafana dashboard: <http://localhost:3000/d/glmocr-load>",
+            f"- Pushgateway: <http://localhost:9091/metrics> (job=`glmocr_asyncio`, run_id=`{run_id}`)",
+            "- Alloy UI: <http://localhost:12345/graph>",
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
 # Mode: simple — single bench run.
 # ---------------------------------------------------------------------------
+
 
 def render_simple(args: argparse.Namespace) -> None:
     summary = json.loads(pathlib.Path(args.bench).read_text(encoding="utf-8"))
@@ -201,13 +229,18 @@ def render_simple(args: argparse.Namespace) -> None:
 
 ## Test parameters
 
-{_fmt_table([
-    ("Concurrency", str(summary.get("concurrency", "—"))),
-    ("Total requests", str(summary.get("total", "—"))),
-    ("Image pool", str(args.pool_size)),
-    ("Warmup", "2"),
-    ("Per-request timeout", "300 s"),
-], ("Knob", "Value"))}
+{
+        _fmt_table(
+            [
+                ("Concurrency", str(summary.get("concurrency", "—"))),
+                ("Total requests", str(summary.get("total", "—"))),
+                ("Image pool", str(args.pool_size)),
+                ("Warmup", "2"),
+                ("Per-request timeout", "300 s"),
+            ],
+            ("Knob", "Value"),
+        )
+    }
 
 ## Server runtime
 
@@ -237,6 +270,7 @@ def render_simple(args: argparse.Namespace) -> None:
 # Mode: sweep — multiple bench runs, one .md with a comparison table.
 # ---------------------------------------------------------------------------
 
+
 def render_sweep(args: argparse.Namespace) -> None:
     bench_paths = [pathlib.Path(p) for p in args.bench]
     summaries = []
@@ -256,6 +290,7 @@ def render_sweep(args: argparse.Namespace) -> None:
         iv = float(s.get("interval_seconds") or 0.0)
         c = int(s.get("concurrency", 0))
         return (0 if iv > 0 else 1, iv, c)
+
     summaries.sort(key=_sort_key)
 
     def _row_label(s: dict) -> str:
@@ -270,8 +305,8 @@ def render_sweep(args: argparse.Namespace) -> None:
     # complement to wall (wall is max-over-slots and noise-dominated at
     # small N; mean is population-average and converges faster).
     # `interval (s)` column: '—' when the trial was unpaced (back-to-back).
-    hdr = ("| c | interval (s) | ok | fail | fail % | wall s | rps | mean | min | p50 | p90 | p95 | p99 | max |")
-    sep = ("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    hdr = "| c | interval (s) | ok | fail | fail % | wall s | rps | mean | min | p50 | p90 | p95 | p99 | max |"
+    sep = "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     rows = [hdr, sep]
     for s in summaries:
         ok = s["successes"]
@@ -373,6 +408,7 @@ just adds queuing and failures._
 # Mode: probe — bench.json + probe.jsonl + Prometheus backfill correlation.
 # ---------------------------------------------------------------------------
 
+
 def _summarize_series(values: list[float]) -> tuple[float, float, float, int]:
     if not values:
         return (float("nan"), float("nan"), float("nan"), 0)
@@ -389,31 +425,51 @@ def render_probe(args: argparse.Namespace) -> None:
     probe = [json.loads(l) for l in probe_lines if l.strip()]
 
     # Pull the run window from probe timestamps.
-    run_start = probe[0]["ts"] if probe else time.time() - summary.get("wall_seconds", 0)
+    run_start = (
+        probe[0]["ts"] if probe else time.time() - summary.get("wall_seconds", 0)
+    )
     run_end = probe[-1]["ts"] if probe else time.time()
 
     # Probe-side signals (in_flight is reliable; sglang_* may or may not
     # be populated depending on whether SGLang's /metrics is reachable).
-    in_flight = [p["in_flight"] for p in probe if isinstance(p.get("in_flight"), (int, float))]
-    sgl_run_probe = [p["sglang_running"] for p in probe if isinstance(p.get("sglang_running"), (int, float))]
-    sgl_queue_probe = [p["sglang_queued"] for p in probe if isinstance(p.get("sglang_queued"), (int, float))]
+    in_flight = [
+        p["in_flight"] for p in probe if isinstance(p.get("in_flight"), (int, float))
+    ]
+    sgl_run_probe = [
+        p["sglang_running"]
+        for p in probe
+        if isinstance(p.get("sglang_running"), (int, float))
+    ]
+    sgl_queue_probe = [
+        p["sglang_queued"]
+        for p in probe
+        if isinstance(p.get("sglang_queued"), (int, float))
+    ]
 
     # Backfill sglang from Prometheus if the probe didn't capture it.
     if not sgl_run_probe:
-        sgl_run = [v for _, v in _prom_range(
-            args.prom_url,
-            'sglang:num_running_reqs{model_name="glm-ocr"}',
-            run_start, run_end,
-        )]
+        sgl_run = [
+            v
+            for _, v in _prom_range(
+                args.prom_url,
+                'sglang:num_running_reqs{model_name="glm-ocr"}',
+                run_start,
+                run_end,
+            )
+        ]
     else:
         sgl_run = sgl_run_probe
 
     if not sgl_queue_probe:
-        sgl_queue = [v for _, v in _prom_range(
-            args.prom_url,
-            'sglang:num_queue_reqs{model_name="glm-ocr"}',
-            run_start, run_end,
-        )]
+        sgl_queue = [
+            v
+            for _, v in _prom_range(
+                args.prom_url,
+                'sglang:num_queue_reqs{model_name="glm-ocr"}',
+                run_start,
+                run_end,
+            )
+        ]
     else:
         sgl_queue = sgl_queue_probe
 
@@ -423,13 +479,15 @@ def render_probe(args: argparse.Namespace) -> None:
             return f"| {name} | — | — | — | 0 |"
         return f"| {name} | {mean:.2f} | {p95:.1f} | {mx:.1f} | {n} |"
 
-    signal_table = "\n".join([
-        "| Signal | mean | p95 | max | samples |",
-        "|---|---:|---:|---:|---:|",
-        stats_row("CPU `glmocr_in_flight_requests`", in_flight),
-        stats_row("SGLang `sglang:num_running_reqs`", sgl_run),
-        stats_row("SGLang `sglang:num_queue_reqs`", sgl_queue),
-    ])
+    signal_table = "\n".join(
+        [
+            "| Signal | mean | p95 | max | samples |",
+            "|---|---:|---:|---:|---:|",
+            stats_row("CPU `glmocr_in_flight_requests`", in_flight),
+            stats_row("SGLang `sglang:num_running_reqs`", sgl_run),
+            stats_row("SGLang `sglang:num_queue_reqs`", sgl_queue),
+        ]
+    )
 
     # Derived ratios if both series exist.
     derived = ""
@@ -453,13 +511,18 @@ def render_probe(args: argparse.Namespace) -> None:
 
 ## Test parameters
 
-{_fmt_table([
-    ("Concurrency", str(summary.get("concurrency", "—"))),
-    ("Total requests", str(summary.get("total", "—"))),
-    ("Image pool", str(args.pool_size)),
-    ("Probe interval", "2 s"),
-    ("Warmup", "2"),
-], ("Knob", "Value"))}
+{
+        _fmt_table(
+            [
+                ("Concurrency", str(summary.get("concurrency", "—"))),
+                ("Total requests", str(summary.get("total", "—"))),
+                ("Image pool", str(args.pool_size)),
+                ("Probe interval", "2 s"),
+                ("Warmup", "2"),
+            ],
+            ("Knob", "Value"),
+        )
+    }
 
 ## Server runtime
 
@@ -497,46 +560,70 @@ def render_probe(args: argparse.Namespace) -> None:
 # SGLang/OCR knob glossary surfaced in every stage report so readers can
 # interpret the axes without bouncing to the README.
 KNOB_GLOSSARY = [
-    ("SGL_SPECULATIVE",
-     "NEXTN/MTP speculative decoding (shipped with GLM-OCR weights). "
-     "Claimed ~2–4× decode throughput at the cost of KV-cache + "
-     "draft-model memory."),
-    ("SGL_SPEC_NUM_STEPS",
-     "Draft-model token lookahead depth per verification step. Higher "
-     "= more aggressive speculation, more wasted work on rejects."),
-    ("SGL_SPEC_NUM_DRAFT_TOKENS",
-     "Tokens committed per accepted draft. Too low → spec overhead "
-     "not amortized; too high → more frequent rejects."),
-    ("SGL_SPEC_EAGLE_TOPK",
-     "EAGLE draft candidate fan-out. Usually 1 for NEXTN; higher only "
-     "pays off with true-EAGLE draft models."),
-    ("SGL_MEM_FRACTION_STATIC",
-     "Fraction of GPU memory reserved for model weights + activations. "
-     "The rest (1 - this) is KV cache + spec draft cache. With spec "
-     "on, lower values give more cache headroom."),
-    ("SGL_MAX_RUNNING_REQUESTS",
-     "Max requests SGLang batches simultaneously on the GPU. Too low → "
-     "client queue; too high → KV cache thrash."),
-    ("SGL_MAX_PREFILL_TOKENS",
-     "Tokens processed per prefill step. Too low → prompts chunked "
-     "across more steps; too high → blocks decode longer."),
-    ("SGL_MAX_TOTAL_TOKENS",
-     "Total KV-cache slots across all in-flight requests. Too low → "
-     "evictions; too high → steals VRAM from weights."),
-    ("SGL_CHUNKED_PREFILL",
-     "Interleave prefill with decode. Usually a win for mixed "
-     "concurrency; verify with the ablation."),
-    ("SGL_SCHEDULE_POLICY",
-     "`lpm` = longest-prefix-match (helps shared-prompt workloads); "
-     "`fcfs` = first-come-first-serve. OCR has unique images so `lpm` "
-     "≈ `fcfs`."),
-    ("OCR_CONN_POOL",
-     "aiohttp pool size between the CPU container and SGLang. Must be "
-     "≥ CPU_THREADS × OCR_MAX_WORKERS. Undersized → 503s; oversized → "
-     "wasted RAM."),
-    ("OCR_MAX_WORKERS",
-     "Parallel SGLang calls per document (region fan-out). The CPU "
-     "side's answer to how many regions to submit at once."),
+    (
+        "SGL_SPECULATIVE",
+        "NEXTN/MTP speculative decoding (shipped with GLM-OCR weights). "
+        "Claimed ~2–4× decode throughput at the cost of KV-cache + "
+        "draft-model memory.",
+    ),
+    (
+        "SGL_SPEC_NUM_STEPS",
+        "Draft-model token lookahead depth per verification step. Higher "
+        "= more aggressive speculation, more wasted work on rejects.",
+    ),
+    (
+        "SGL_SPEC_NUM_DRAFT_TOKENS",
+        "Tokens committed per accepted draft. Too low → spec overhead "
+        "not amortized; too high → more frequent rejects.",
+    ),
+    (
+        "SGL_SPEC_EAGLE_TOPK",
+        "EAGLE draft candidate fan-out. Usually 1 for NEXTN; higher only "
+        "pays off with true-EAGLE draft models.",
+    ),
+    (
+        "SGL_MEM_FRACTION_STATIC",
+        "Fraction of GPU memory reserved for model weights + activations. "
+        "The rest (1 - this) is KV cache + spec draft cache. With spec "
+        "on, lower values give more cache headroom.",
+    ),
+    (
+        "SGL_MAX_RUNNING_REQUESTS",
+        "Max requests SGLang batches simultaneously on the GPU. Too low → "
+        "client queue; too high → KV cache thrash.",
+    ),
+    (
+        "SGL_MAX_PREFILL_TOKENS",
+        "Tokens processed per prefill step. Too low → prompts chunked "
+        "across more steps; too high → blocks decode longer.",
+    ),
+    (
+        "SGL_MAX_TOTAL_TOKENS",
+        "Total KV-cache slots across all in-flight requests. Too low → "
+        "evictions; too high → steals VRAM from weights.",
+    ),
+    (
+        "SGL_CHUNKED_PREFILL",
+        "Interleave prefill with decode. Usually a win for mixed "
+        "concurrency; verify with the ablation.",
+    ),
+    (
+        "SGL_SCHEDULE_POLICY",
+        "`lpm` = longest-prefix-match (helps shared-prompt workloads); "
+        "`fcfs` = first-come-first-serve. OCR has unique images so `lpm` "
+        "≈ `fcfs`.",
+    ),
+    (
+        "OCR_CONN_POOL",
+        "aiohttp pool size between the CPU container and SGLang. Must be "
+        "≥ CPU_THREADS × OCR_MAX_WORKERS. Undersized → 503s; oversized → "
+        "wasted RAM.",
+    ),
+    (
+        "OCR_MAX_WORKERS",
+        "Parallel SGLang calls per document (region fan-out). The CPU "
+        "side's answer to how many regions to submit at once.",
+    ),
 ]
 
 
@@ -553,15 +640,19 @@ def _knob_glossary_md() -> str:
 def _try_import_matplotlib():
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+
         return plt
     except ImportError:
         return None
 
 
 def _trial_mean(t: dict) -> float:
-    return float((t.get("summary", {}).get("latency_ms") or {}).get("mean", float("nan")))
+    return float(
+        (t.get("summary", {}).get("latency_ms") or {}).get("mean", float("nan"))
+    )
 
 
 def _trial_rps(t: dict) -> float:
@@ -595,27 +686,36 @@ def _trial_meets_slo(t: dict) -> bool:
 
 
 def _trial_p95(t: dict) -> float:
-    return float((t.get("summary", {}).get("latency_ms") or {}).get("p95", float("nan")))
+    return float(
+        (t.get("summary", {}).get("latency_ms") or {}).get("p95", float("nan"))
+    )
 
 
 def _trial_p50(t: dict) -> float:
-    return float((t.get("summary", {}).get("latency_ms") or {}).get("p50", float("nan")))
+    return float(
+        (t.get("summary", {}).get("latency_ms") or {}).get("p50", float("nan"))
+    )
 
 
 def _trial_p99(t: dict) -> float:
-    return float((t.get("summary", {}).get("latency_ms") or {}).get("p99", float("nan")))
+    return float(
+        (t.get("summary", {}).get("latency_ms") or {}).get("p99", float("nan"))
+    )
 
 
 def _trial_max(t: dict) -> float:
-    return float((t.get("summary", {}).get("latency_ms") or {}).get("max", float("nan")))
+    return float(
+        (t.get("summary", {}).get("latency_ms") or {}).get("max", float("nan"))
+    )
 
 
 def _trial_wall(t: dict) -> float:
     return float(t.get("summary", {}).get("wall_seconds", 0.0))
 
 
-def _render_stage_a_chart(plt, trials_by_knob: dict[str, list[dict]],
-                          png_dir: pathlib.Path) -> dict[str, str]:
+def _render_stage_a_chart(
+    plt, trials_by_knob: dict[str, list[dict]], png_dir: pathlib.Path
+) -> dict[str, str]:
     """One PNG per knob: rps + mean latency on twin-y axes."""
     rel_paths: dict[str, str] = {}
     for knob, trials in trials_by_knob.items():
@@ -646,7 +746,9 @@ def _render_stage_a_chart(plt, trials_by_knob: dict[str, list[dict]],
 
         ax2 = ax1.twinx()
         if categorical:
-            ax2.plot(range(len(xs)), mean_s, "s--", color="#d62728", label="mean latency (s)")
+            ax2.plot(
+                range(len(xs)), mean_s, "s--", color="#d62728", label="mean latency (s)"
+            )
         else:
             ax2.plot(xs, mean_s, "s--", color="#d62728", label="mean latency (s)")
         ax2.set_ylabel("mean latency (s)", color="#d62728")
@@ -661,7 +763,9 @@ def _render_stage_a_chart(plt, trials_by_knob: dict[str, list[dict]],
     return rel_paths
 
 
-def _render_stage_b_heatmaps(plt, trials: list[dict], png_dir: pathlib.Path) -> dict[str, str]:
+def _render_stage_b_heatmaps(
+    plt, trials: list[dict], png_dir: pathlib.Path
+) -> dict[str, str]:
     """Three heatmaps: rps, p95, fail%. Expects every trial to share the
     same two knob axes."""
     if not trials:
@@ -675,23 +779,33 @@ def _render_stage_b_heatmaps(plt, trials: list[dict], png_dir: pathlib.Path) -> 
     idx = {(t["knobs"][x_knob], t["knobs"][y_knob]): t for t in trials}
 
     def grid(f) -> list[list[float]]:
-        return [[f(idx[(xv, yv)]) if (xv, yv) in idx else float("nan")
-                 for xv in x_vals] for yv in y_vals]
+        return [
+            [f(idx[(xv, yv)]) if (xv, yv) in idx else float("nan") for xv in x_vals]
+            for yv in y_vals
+        ]
 
     # Track aborted cells so we can stamp them on the heatmap.
-    aborted_grid = [[bool(idx[(xv, yv)]["summary"].get("aborted"))
-                     if (xv, yv) in idx else False
-                     for xv in x_vals] for yv in y_vals]
+    aborted_grid = [
+        [
+            bool(idx[(xv, yv)]["summary"].get("aborted")) if (xv, yv) in idx else False
+            for xv in x_vals
+        ]
+        for yv in y_vals
+    ]
 
     rel_paths: dict[str, str] = {}
     for metric_name, fn, fmt in [
-        ("rps",   _trial_rps,        "{:.3f}"),
-        ("p95",   _trial_p95,        "{:.0f}"),
-        ("fail%", _trial_fail_rate,  "{:.0%}"),
+        ("rps", _trial_rps, "{:.3f}"),
+        ("p95", _trial_p95, "{:.0f}"),
+        ("fail%", _trial_fail_rate, "{:.0%}"),
     ]:
         values = grid(fn)
-        fig, ax = plt.subplots(figsize=(max(4, len(x_vals) + 2), max(3, len(y_vals) + 1)))
-        im = ax.imshow(values, aspect="auto", cmap="viridis" if metric_name != "fail%" else "Reds")
+        fig, ax = plt.subplots(
+            figsize=(max(4, len(x_vals) + 2), max(3, len(y_vals) + 1))
+        )
+        im = ax.imshow(
+            values, aspect="auto", cmap="viridis" if metric_name != "fail%" else "Reds"
+        )
         ax.set_xticks(range(len(x_vals)))
         ax.set_xticklabels(x_vals)
         ax.set_yticks(range(len(y_vals)))
@@ -707,8 +821,9 @@ def _render_stage_b_heatmaps(plt, trials: list[dict], png_dir: pathlib.Path) -> 
                 label = fmt.format(v)
                 if aborted_grid[yi][xi]:
                     label += "\n✖"
-                ax.text(xi, yi, label, ha="center", va="center",
-                        color="white", fontsize=9)
+                ax.text(
+                    xi, yi, label, ha="center", va="center", color="white", fontsize=9
+                )
         fig.colorbar(im, ax=ax)
         fig.tight_layout()
         safe = metric_name.replace("%", "pct")
@@ -762,8 +877,9 @@ def _render_stage_c_chart(plt, trials: list[dict], png_dir: pathlib.Path) -> str
     return out_png.name
 
 
-def _render_resource_chart(plt, probe_path: pathlib.Path,
-                           png_dir: pathlib.Path) -> str | None:
+def _render_resource_chart(
+    plt, probe_path: pathlib.Path, png_dir: pathlib.Path
+) -> str | None:
     """Time-series PNG for RAM / VRAM / CPU% / GPU%. Skips if the probe
     file is missing fields (older probe runs)."""
     try:
@@ -800,16 +916,30 @@ def _render_resource_chart(plt, probe_path: pathlib.Path,
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
-    plot_one(axes[0][0], [("cpu_cores_cpu", "cpu ctr"),
-                          ("cpu_cores_sglang", "sglang ctr")],
-             "cores", "Container CPU (rate of container_cpu_usage_seconds_total)")
-    plot_one(axes[0][1], [("mem_rss_cpu_mb", "cpu ctr"),
-                          ("mem_rss_sglang_mb", "sglang ctr")],
-             "MiB", "Container RSS")
-    plot_one(axes[1][0], [("vram_used_mb", "VRAM used (MiB)")],
-             "MiB", "GPU VRAM (DCGM_FI_DEV_FB_USED)")
-    plot_one(axes[1][1], [("gpu_util_pct", "GPU util %")],
-             "%", "GPU utilization (DCGM_FI_DEV_GPU_UTIL)")
+    plot_one(
+        axes[0][0],
+        [("cpu_cores_cpu", "cpu ctr"), ("cpu_cores_sglang", "sglang ctr")],
+        "cores",
+        "Container CPU (rate of container_cpu_usage_seconds_total)",
+    )
+    plot_one(
+        axes[0][1],
+        [("mem_rss_cpu_mb", "cpu ctr"), ("mem_rss_sglang_mb", "sglang ctr")],
+        "MiB",
+        "Container RSS",
+    )
+    plot_one(
+        axes[1][0],
+        [("vram_used_mb", "VRAM used (MiB)")],
+        "MiB",
+        "GPU VRAM (DCGM_FI_DEV_FB_USED)",
+    )
+    plot_one(
+        axes[1][1],
+        [("gpu_util_pct", "GPU util %")],
+        "%",
+        "GPU utilization (DCGM_FI_DEV_GPU_UTIL)",
+    )
     axes[1][0].set_xlabel("seconds since probe start")
     axes[1][1].set_xlabel("seconds since probe start")
     fig.tight_layout()
@@ -835,12 +965,14 @@ def _resource_summary_table(probe_path: pathlib.Path) -> str:
         vals = [v * scale for v in vals]
         return (statistics.fmean(vals), max(vals), len(vals))
 
-    rows = [("CPU container cores", stats("cpu_cores_cpu"), "{:.2f}"),
-            ("SGLang container cores", stats("cpu_cores_sglang"), "{:.2f}"),
-            ("CPU container RSS MiB", stats("mem_rss_cpu_mb"), "{:.0f}"),
-            ("SGLang container RSS MiB", stats("mem_rss_sglang_mb"), "{:.0f}"),
-            ("GPU VRAM used MiB", stats("vram_used_mb"), "{:.0f}"),
-            ("GPU utilization %", stats("gpu_util_pct"), "{:.0f}")]
+    rows = [
+        ("CPU container cores", stats("cpu_cores_cpu"), "{:.2f}"),
+        ("SGLang container cores", stats("cpu_cores_sglang"), "{:.2f}"),
+        ("CPU container RSS MiB", stats("mem_rss_cpu_mb"), "{:.0f}"),
+        ("SGLang container RSS MiB", stats("mem_rss_sglang_mb"), "{:.0f}"),
+        ("GPU VRAM used MiB", stats("vram_used_mb"), "{:.0f}"),
+        ("GPU utilization %", stats("gpu_util_pct"), "{:.0f}"),
+    ]
 
     md = ["| Signal | mean | max | samples |", "|---|---:|---:|---:|"]
     for label, st, fmt in rows:
@@ -878,8 +1010,11 @@ def render_stage(args: argparse.Namespace) -> None:
     png_dir.mkdir(parents=True, exist_ok=True)
     plt = _try_import_matplotlib()
     if plt is None:
-        print("[render_report] matplotlib missing — markdown will omit PNG charts "
-              "(pip install matplotlib to enable)", file=sys.stderr)
+        print(
+            "[render_report] matplotlib missing — markdown will omit PNG charts "
+            "(pip install matplotlib to enable)",
+            file=sys.stderr,
+        )
 
     resource_png = None
     resource_table = ""
@@ -890,23 +1025,29 @@ def render_stage(args: argparse.Namespace) -> None:
             resource_png = _render_resource_chart(plt, probe_path, png_dir)
 
     if stage == "a":
-        body = _render_stage_a(args, trials, plt, png_dir, now,
-                               resource_png, resource_table)
+        body = _render_stage_a(
+            args, trials, plt, png_dir, now, resource_png, resource_table
+        )
     elif stage == "b":
-        body = _render_stage_b(args, trials, plt, png_dir, now,
-                               resource_png, resource_table)
+        body = _render_stage_b(
+            args, trials, plt, png_dir, now, resource_png, resource_table
+        )
     elif stage == "c":
-        body = _render_stage_c(args, trials, plt, png_dir, now,
-                               resource_png, resource_table)
+        body = _render_stage_c(
+            args, trials, plt, png_dir, now, resource_png, resource_table
+        )
     elif stage == "d":
-        body = _render_stage_d(args, trials, plt, png_dir, now,
-                               resource_png, resource_table)
+        body = _render_stage_d(
+            args, trials, plt, png_dir, now, resource_png, resource_table
+        )
     elif stage == "e":
-        body = _render_stage_e(args, trials, plt, png_dir, now,
-                               resource_png, resource_table)
+        body = _render_stage_e(
+            args, trials, plt, png_dir, now, resource_png, resource_table
+        )
     elif stage == "g":
-        body = _render_stage_g(args, trials, plt, png_dir, now,
-                               resource_png, resource_table)
+        body = _render_stage_g(
+            args, trials, plt, png_dir, now, resource_png, resource_table
+        )
     else:
         body = f"# {args.run_id}\n\n_(unrecognized stage in {args.trials})_\n"
 
@@ -914,8 +1055,9 @@ def render_stage(args: argparse.Namespace) -> None:
     print(f"[render_report] wrote {out_md}")
 
 
-def _render_stage_a(args, trials, plt, png_dir, now,
-                    resource_png, resource_table) -> str:
+def _render_stage_a(
+    args, trials, plt, png_dir, now, resource_png, resource_table
+) -> str:
     # Group trials by which knob they scanned.
     by_knob: dict[str, list[dict]] = {}
     for t in trials:
@@ -959,11 +1101,13 @@ def _render_stage_a(args, trials, plt, png_dir, now,
 
     # SLO winners section — every cell that met p99 ≤ 120s AND fail ≤ 10%,
     # sorted by rps. Surfaces the candidate configs worth taking to Stage B/C.
-    slo_trials = [t for trials in by_knob.values() for t in trials if _trial_meets_slo(t)]
+    slo_trials = [
+        t for trials in by_knob.values() for t in trials if _trial_meets_slo(t)
+    ]
     slo_trials.sort(key=lambda t: _trial_rps(t), reverse=True)
     if slo_trials:
         slo_rows = [
-            f"SLO gate: `p99 ≤ {SLO_P99_MS/1000:.0f}s` AND `fail% ≤ {SLO_MAX_FAIL:.0%}`. "
+            f"SLO gate: `p99 ≤ {SLO_P99_MS / 1000:.0f}s` AND `fail% ≤ {SLO_MAX_FAIL:.0%}`. "
             f"{len(slo_trials)} of {sum(len(v) for v in by_knob.values())} "
             "cells meet it. Sorted by rps descending.",
             "",
@@ -979,10 +1123,12 @@ def _render_stage_a(args, trials, plt, png_dir, now,
             )
         slo_md = "\n".join(slo_rows)
     else:
-        slo_md = (f"_No cell met the SLO gate (p99 ≤ {SLO_P99_MS/1000:.0f}s, "
-                  f"fail ≤ {SLO_MAX_FAIL:.0%}). Either narrow the pool to "
-                  "shorter documents, reduce client concurrency, or widen "
-                  "the SLO._")
+        slo_md = (
+            f"_No cell met the SLO gate (p99 ≤ {SLO_P99_MS / 1000:.0f}s, "
+            f"fail ≤ {SLO_MAX_FAIL:.0%}). Either narrow the pool to "
+            "shorter documents, reduce client concurrency, or widen "
+            "the SLO._"
+        )
 
     resource_md = ""
     if resource_table:
@@ -1021,21 +1167,27 @@ to spot where throughput flattens (saturation) or latency inflects
 """
 
 
-def _render_stage_b(args, trials, plt, png_dir, now,
-                    resource_png, resource_table) -> str:
+def _render_stage_b(
+    args, trials, plt, png_dir, now, resource_png, resource_table
+) -> str:
     b_trials = [t for t in trials if t.get("kind") == "stage-b"]
     axis_keys = list(b_trials[0]["knobs"].keys()) if b_trials else []
 
     chart_section = ""
     if plt is not None and b_trials and len(axis_keys) == 2:
         rel = _render_stage_b_heatmaps(plt, b_trials, png_dir)
-        lines = [f"### {name}\n\n![{name}]({png_dir.name}/{p})"
-                 for name, p in rel.items()]
+        lines = [
+            f"### {name}\n\n![{name}]({png_dir.name}/{p})" for name, p in rel.items()
+        ]
         chart_section = "\n\n".join(lines)
 
     rows = [
-        "| " + " | ".join(axis_keys) + " | ok | fail | attempted | fail% | rps | p50 | p95 | p99 | mean | wall s | aborted |",
-        "|" + "|".join(["---"] * len(axis_keys)) + "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| "
+        + " | ".join(axis_keys)
+        + " | ok | fail | attempted | fail% | rps | p50 | p95 | p99 | mean | wall s | aborted |",
+        "|"
+        + "|".join(["---"] * len(axis_keys))
+        + "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for t in b_trials:
         s = t["summary"]
@@ -1043,8 +1195,9 @@ def _render_stage_b(args, trials, plt, png_dir, now,
         attempted = s.get("requests_attempted", s.get("total", 0))
         aborted = "✖ yes" if s.get("aborted") else ""
         rows.append(
-            "| " + " | ".join(vals) +
-            f" | {s.get('successes', 0)} | {s.get('failures', 0)} | "
+            "| "
+            + " | ".join(vals)
+            + f" | {s.get('successes', 0)} | {s.get('failures', 0)} | "
             f"{attempted} | {_trial_fail_rate(t):.0%} | "
             f"{_trial_rps(t):.3f} | {_trial_p50(t):.0f} | "
             f"{_trial_p95(t):.0f} | {_trial_p99(t):.0f} | "
@@ -1062,7 +1215,7 @@ def _render_stage_b(args, trials, plt, png_dir, now,
 
 **Completed:** {now}  \\
 **Source:** `{args.trials}`  \\
-**Axes:** {' × '.join(f'`{k}`' for k in axis_keys)}
+**Axes:** {" × ".join(f"`{k}`" for k in axis_keys)}
 
 ## Knob glossary
 
@@ -1082,8 +1235,9 @@ def _render_stage_b(args, trials, plt, png_dir, now,
 """
 
 
-def _render_stage_c_bar_panels(plt, c_trials: list[dict],
-                               png_dir: pathlib.Path) -> dict[str, str]:
+def _render_stage_c_bar_panels(
+    plt, c_trials: list[dict], png_dir: pathlib.Path
+) -> dict[str, str]:
     """Stage-G-style panels adapted for a 1-D c-sweep. One PNG per
     metric with one bar per concurrency cell, labelled with the value.
     Mirrors `_render_stage_g_heatmaps` visually but is a simple bar
@@ -1091,9 +1245,7 @@ def _render_stage_c_bar_panels(plt, c_trials: list[dict],
     if not c_trials:
         return {}
     cs = sorted({int(t["summary"].get("concurrency", 0) or 0) for t in c_trials})
-    by_c = {
-        int(t["summary"].get("concurrency", 0) or 0): t for t in c_trials
-    }
+    by_c = {int(t["summary"].get("concurrency", 0) or 0): t for t in c_trials}
     rel: dict[str, str] = {}
     for metric_name, fn, fmt, color in [
         ("rps", _trial_rps, "{:.2f}", "#2a9d8f"),
@@ -1104,10 +1256,14 @@ def _render_stage_c_bar_panels(plt, c_trials: list[dict],
         fig, ax = plt.subplots(figsize=(max(4, len(cs) * 1.2 + 2), 3.2))
         bars = ax.bar([str(c) for c in cs], values, color=color)
         for bar, v in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height(),
-                    fmt.format(v),
-                    ha="center", va="bottom", fontsize=10)
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                fmt.format(v),
+                ha="center",
+                va="bottom",
+                fontsize=10,
+            )
         ax.set_xlabel("concurrency")
         ax.set_title(f"Stage C — {metric_name}")
         ax.margins(y=0.15)
@@ -1120,8 +1276,9 @@ def _render_stage_c_bar_panels(plt, c_trials: list[dict],
     return rel
 
 
-def _render_stage_c(args, trials, plt, png_dir, now,
-                    resource_png, resource_table) -> str:
+def _render_stage_c(
+    args, trials, plt, png_dir, now, resource_png, resource_table
+) -> str:
     c_trials = [t for t in trials if t.get("kind", "").startswith("stage-c")]
     # Strip non-knob metadata before rendering "Fixed config" so the
     # cell-varying fields (concurrency, bottleneck) don't clutter it.
@@ -1134,8 +1291,7 @@ def _render_stage_c(args, trials, plt, png_dir, now,
     if plt is not None and c_trials:
         rels = _render_stage_c_bar_panels(plt, c_trials, png_dir)
         panels_section = "\n\n".join(
-            f"### {name}\n\n![{name}]({png_dir.name}/{p})"
-            for name, p in rels.items()
+            f"### {name}\n\n![{name}]({png_dir.name}/{p})" for name, p in rels.items()
         )
 
     # Legacy c-curve line chart (rps + p99 vs c on twin axes). Useful
@@ -1156,7 +1312,9 @@ def _render_stage_c(args, trials, plt, png_dir, now,
     for i, t in enumerate(c_trials, 1):
         s = t["summary"]
         util = s.get("utilization") or {}
-        c = int(s.get("concurrency", 0)) or int(t.get("knobs", {}).get("concurrency", 0))
+        c = int(s.get("concurrency", 0)) or int(
+            t.get("knobs", {}).get("concurrency", 0)
+        )
         slo_ok = _trial_meets_slo(t)
         if slo_ok:
             slo_winners.append((i, t))
@@ -1181,12 +1339,14 @@ def _render_stage_c(args, trials, plt, png_dir, now,
     ]
 
     def _mib(v):
-        return f"{v/1024:.2f} GiB" if isinstance(v, (int, float)) and v > 0 else "—"
+        return f"{v / 1024:.2f} GiB" if isinstance(v, (int, float)) and v > 0 else "—"
 
     for i, t in enumerate(c_trials, 1):
         s = t["summary"]
         p = s.get("probe_summary") or {}
-        c = int(s.get("concurrency", 0)) or int(t.get("knobs", {}).get("concurrency", 0))
+        c = int(s.get("concurrency", 0)) or int(
+            t.get("knobs", {}).get("concurrency", 0)
+        )
         cpu_avg = p.get("mem_rss_cpu_mb_avg")
         cpu_p99 = p.get("mem_rss_cpu_mb_p99")
         cpu_max = p.get("mem_rss_cpu_mb_max")
@@ -1195,7 +1355,7 @@ def _render_stage_c(args, trials, plt, png_dir, now,
         if isinstance(cpu_max, (int, float)):
             headroom_mib = 16384 - cpu_max
             verdict = "✅" if headroom_mib >= 0 else "❌"
-            headroom_str = f"{headroom_mib/1024:+.2f} GiB {verdict}"
+            headroom_str = f"{headroom_mib / 1024:+.2f} GiB {verdict}"
         else:
             headroom_str = "—"
         mem_ceiling_rows.append(
@@ -1209,7 +1369,9 @@ def _render_stage_c(args, trials, plt, png_dir, now,
     if slo_winners:
         wi, wt = max(slo_winners, key=lambda x: _trial_rps(x[1]))
         ws = wt["summary"]
-        wc = int(ws.get("concurrency", 0)) or int(wt.get("knobs", {}).get("concurrency", 0))
+        wc = int(ws.get("concurrency", 0)) or int(
+            wt.get("knobs", {}).get("concurrency", 0)
+        )
         wu = ws.get("utilization") or {}
         winner_md = (
             f"**Cell {wi}** — `concurrency={wc}` — "
@@ -1219,7 +1381,10 @@ def _render_stage_c(args, trials, plt, png_dir, now,
             f"VRAM%={wu.get('gpu_memory', 0) * 100:.0f}."
         )
 
-    fixed_md = "\n".join(f"- `{k}` = `{v}`" for k, v in fixed_raw.items()) or "_(baseline env)_"
+    fixed_md = (
+        "\n".join(f"- `{k}` = `{v}`" for k, v in fixed_raw.items())
+        or "_(baseline env)_"
+    )
 
     resource_md = ""
     if resource_table:
@@ -1294,15 +1459,20 @@ concurrency only grows the queue without adding throughput.
 # bottleneck + utilization attribution.
 # ---------------------------------------------------------------------------
 
-def _render_stage_e(args, trials, plt, png_dir, now,
-                    resource_png, resource_table) -> str:
+
+def _render_stage_e(
+    args, trials, plt, png_dir, now, resource_png, resource_table
+) -> str:
     e_trials = [t for t in trials if t.get("kind", "").startswith("stage-e")]
     if not e_trials:
         return f"# {args.run_id}\n\n_(no stage-e trials found)_\n"
 
     # Fixed config is the same across every cell — pull from the first.
-    fixed = {k: v for k, v in e_trials[0]["knobs"].items()
-             if k not in ("concurrency", "bottleneck", "endpoint")}
+    fixed = {
+        k: v
+        for k, v in e_trials[0]["knobs"].items()
+        if k not in ("concurrency", "bottleneck", "endpoint")
+    }
     endpoint = e_trials[0]["knobs"].get("endpoint", "/glmocr/parse")
 
     # c-curve chart (rps/p99 vs c) reused from stage-c rendering.
@@ -1340,7 +1510,9 @@ def _render_stage_e(args, trials, plt, png_dir, now,
     winners = [t for t in e_trials if _trial_meets_slo(t)]
     if winners:
         best = max(winners, key=lambda t: _trial_rps(t))
-        c_best = int(best["summary"].get("concurrency", 0)) or int(best["knobs"].get("concurrency", 0))
+        c_best = int(best["summary"].get("concurrency", 0)) or int(
+            best["knobs"].get("concurrency", 0)
+        )
         gpu_best = (best["summary"].get("utilization") or {}).get("gpu_compute", 0)
         winner_md = (
             f"- **Best c under SLO** = **{c_best}** — "
@@ -1409,8 +1581,12 @@ def _render_stage_e(args, trials, plt, png_dir, now,
 
 # Axes swept in Stage D. Keep in sync with scripts/tune_params.py
 # STAGE_D_COMBOS — if the combo structure changes there, update here.
-STAGE_D_AXES = ["CPU_WORKERS", "CPU_THREADS", "OCR_MAX_WORKERS",
-                "SGL_MAX_RUNNING_REQUESTS"]
+STAGE_D_AXES = [
+    "CPU_WORKERS",
+    "CPU_THREADS",
+    "OCR_MAX_WORKERS",
+    "SGL_MAX_RUNNING_REQUESTS",
+]
 
 
 def _peak_util(t: dict) -> tuple[str, float]:
@@ -1423,12 +1599,14 @@ def _peak_util(t: dict) -> tuple[str, float]:
     return name, float(val)
 
 
-def _render_stage_d(args, trials, plt, png_dir, now,
-                    resource_png, resource_table) -> str:
+def _render_stage_d(
+    args, trials, plt, png_dir, now, resource_png, resource_table
+) -> str:
     d_trials = [t for t in trials if t.get("kind") == "stage-d"]
 
     # ---- Bottleneck tally -------------------------------------------------
     from collections import Counter
+
     tally = Counter(t["summary"].get("bottleneck", "unknown") for t in d_trials)
     tally_lines = ["| Bottleneck | Cells |", "|---|---:|"]
     for label, n in tally.most_common():
@@ -1437,13 +1615,30 @@ def _render_stage_d(args, trials, plt, png_dir, now,
 
     # ---- Main grid table --------------------------------------------------
     headers = (
-        ["# "] + [k.replace("_", " ") for k in STAGE_D_AXES] +
-        ["ok", "fail", "att", "fail%", "rps", "p50", "p95", "p99", "mean", "wall",
-         "GPU%", "VRAM%", "batch%", "CPU%", "abort?", "SLO", "bottleneck"]
+        ["# "]
+        + [k.replace("_", " ") for k in STAGE_D_AXES]
+        + [
+            "ok",
+            "fail",
+            "att",
+            "fail%",
+            "rps",
+            "p50",
+            "p95",
+            "p99",
+            "mean",
+            "wall",
+            "GPU%",
+            "VRAM%",
+            "batch%",
+            "CPU%",
+            "abort?",
+            "SLO",
+            "bottleneck",
+        ]
     )
     sep = ["---" for _ in headers[:5]] + ["---:" for _ in headers[5:]]
-    rows = ["| " + " | ".join(headers) + " |",
-            "|" + "|".join(sep) + "|"]
+    rows = ["| " + " | ".join(headers) + " |", "|" + "|".join(sep) + "|"]
 
     for i, t in enumerate(d_trials, start=1):
         s = t["summary"]
@@ -1453,18 +1648,27 @@ def _render_stage_d(args, trials, plt, png_dir, now,
         aborted = "✖" if s.get("aborted") else ""
         slo = "✅" if _trial_meets_slo(t) else "❌"
         cells = (
-            [str(i)] +
-            [str(knobs.get(k, "")) for k in STAGE_D_AXES] +
-            [str(s.get("successes", 0)), str(s.get("failures", 0)), str(attempted),
-             f"{_trial_fail_rate(t):.0%}", f"{_trial_rps(t):.3f}",
-             f"{_trial_p50(t):.0f}", f"{_trial_p95(t):.0f}",
-             f"{_trial_p99(t):.0f}", f"{_trial_mean(t):.0f}",
-             f"{_trial_wall(t):.0f}",
-             f"{util.get('gpu_compute', 0) * 100:.0f}",
-             f"{util.get('gpu_memory', 0) * 100:.0f}",
-             f"{util.get('sgl_batch', 0) * 100:.0f}",
-             f"{util.get('cpu_container', 0) * 100:.0f}",
-             aborted, slo, s.get("bottleneck", "—")]
+            [str(i)]
+            + [str(knobs.get(k, "")) for k in STAGE_D_AXES]
+            + [
+                str(s.get("successes", 0)),
+                str(s.get("failures", 0)),
+                str(attempted),
+                f"{_trial_fail_rate(t):.0%}",
+                f"{_trial_rps(t):.3f}",
+                f"{_trial_p50(t):.0f}",
+                f"{_trial_p95(t):.0f}",
+                f"{_trial_p99(t):.0f}",
+                f"{_trial_mean(t):.0f}",
+                f"{_trial_wall(t):.0f}",
+                f"{util.get('gpu_compute', 0) * 100:.0f}",
+                f"{util.get('gpu_memory', 0) * 100:.0f}",
+                f"{util.get('sgl_batch', 0) * 100:.0f}",
+                f"{util.get('cpu_container', 0) * 100:.0f}",
+                aborted,
+                slo,
+                s.get("bottleneck", "—"),
+            ]
         )
         rows.append("| " + " | ".join(cells) + " |")
     grid_md = "\n".join(rows)
@@ -1477,22 +1681,29 @@ def _render_stage_d(args, trials, plt, png_dir, now,
     # ---- SLO winners ------------------------------------------------------
     slo_winners = sorted(
         [t for t in d_trials if _trial_meets_slo(t)],
-        key=lambda t: _trial_rps(t), reverse=True,
+        key=lambda t: _trial_rps(t),
+        reverse=True,
     )
     if slo_winners:
+
         def _fmt_slo_winner(t: dict) -> str:
             idx1 = d_trials.index(t) + 1
             knobs = t.get("knobs", {})
             knob_str = ", ".join(f"{k}={knobs.get(k, '')}" for k in STAGE_D_AXES)
             bneck = t["summary"].get("bottleneck", "")
-            return (f"- **cell {idx1}** (`{knob_str}`) — "
-                    f"rps={_trial_rps(t):.3f}, p99={_trial_p99(t):.0f}ms, "
-                    f"fail={_trial_fail_rate(t):.0%}, bottleneck={bneck}")
+            return (
+                f"- **cell {idx1}** (`{knob_str}`) — "
+                f"rps={_trial_rps(t):.3f}, p99={_trial_p99(t):.0f}ms, "
+                f"fail={_trial_fail_rate(t):.0%}, bottleneck={bneck}"
+            )
+
         slo_md = "\n".join(_fmt_slo_winner(t) for t in slo_winners)
     else:
-        slo_md = (f"_No cell met the SLO gate (`p99 ≤ {SLO_P99_MS/1000:.0f}s`, "
-                  f"`fail ≤ {SLO_MAX_FAIL:.0%}`, not aborted). The `bottleneck` "
-                  f"column below tells you what's pinned._")
+        slo_md = (
+            f"_No cell met the SLO gate (`p99 ≤ {SLO_P99_MS / 1000:.0f}s`, "
+            f"`fail ≤ {SLO_MAX_FAIL:.0%}`, not aborted). The `bottleneck` "
+            f"column below tells you what's pinned._"
+        )
 
     resource_md = ""
     if resource_table:
@@ -1551,28 +1762,51 @@ the stack is under-utilized — nothing is pinned._
 def _render_stage_d_util_chart(plt, d_trials: list[dict], png_dir: pathlib.Path) -> str:
     """Horizontal bars, one row per cell, four grouped bars per row:
     GPU, VRAM, batch, CPU. Red dashed line at 0.85 = saturation."""
-    labels = [f"cell {i+1}" for i in range(len(d_trials))]
+    labels = [f"cell {i + 1}" for i in range(len(d_trials))]
     util_keys = ["gpu_compute", "gpu_memory", "sgl_batch", "cpu_container"]
     util_names = ["GPU", "VRAM", "batch", "CPU ctr"]
     colors = ["#d62728", "#ff7f0e", "#9467bd", "#1f77b4"]
 
     import numpy as np
+
     n = len(d_trials)
     fig, ax = plt.subplots(figsize=(10, max(3, 0.7 * n + 1)))
     bar_height = 0.18
     y_pos = np.arange(n)
 
     for k_idx, (key, name, color) in enumerate(zip(util_keys, util_names, colors)):
-        values = [float(((t.get("summary", {}).get("utilization") or {}).get(key) or 0.0))
-                  for t in d_trials]
+        values = [
+            float(((t.get("summary", {}).get("utilization") or {}).get(key) or 0.0))
+            for t in d_trials
+        ]
         offset = (k_idx - 1.5) * bar_height
-        ax.barh(y_pos + offset, values, height=bar_height,
-                label=name, color=color, alpha=0.9)
+        ax.barh(
+            y_pos + offset,
+            values,
+            height=bar_height,
+            label=name,
+            color=color,
+            alpha=0.9,
+        )
 
-    ax.axvline(0.85, color="red", linestyle="--", linewidth=1,
-               label="saturation (0.85)")
-    ax.set_xlim(0, max(1.05, max([(t.get("summary", {}).get("utilization") or {}).get(k, 0)
-                                   for t in d_trials for k in util_keys] + [1.0]) + 0.05))
+    ax.axvline(
+        0.85, color="red", linestyle="--", linewidth=1, label="saturation (0.85)"
+    )
+    ax.set_xlim(
+        0,
+        max(
+            1.05,
+            max(
+                [
+                    (t.get("summary", {}).get("utilization") or {}).get(k, 0)
+                    for t in d_trials
+                    for k in util_keys
+                ]
+                + [1.0]
+            )
+            + 0.05,
+        ),
+    )
     ax.set_yticks(y_pos)
     ax.set_yticklabels(labels)
     ax.invert_yaxis()  # cell 1 on top
@@ -1591,8 +1825,10 @@ def _render_stage_d_util_chart(plt, d_trials: list[dict], png_dir: pathlib.Path)
 # Stage G: OCR_MAX_WORKERS × SGL_MAX_TOTAL_TOKENS 2D grid at fixed c.
 # ---------------------------------------------------------------------------
 
-def _render_stage_g(args, trials, plt, png_dir, now,
-                    resource_png, resource_table) -> str:
+
+def _render_stage_g(
+    args, trials, plt, png_dir, now, resource_png, resource_table
+) -> str:
     g_trials = [t for t in trials if t.get("kind") == "stage-g"]
     if not g_trials:
         return f"# {args.run_id}\n\n_(no stage-g trials)_\n"
@@ -1601,11 +1837,11 @@ def _render_stage_g(args, trials, plt, png_dir, now,
     # at fixed c; the reshape varies MAX_TOKENS × concurrency at fixed OMW.
     # Pick whichever of {OMW, concurrency} has more than one unique value.
     omw_values = {int(t["summary"].get("omw", 0)) for t in g_trials}
-    c_values   = {int(t["summary"].get("concurrency", 0) or 0) for t in g_trials}
+    c_values = {int(t["summary"].get("concurrency", 0) or 0) for t in g_trials}
     inner_is_c = len(c_values) > 1
 
     inner_label = "c" if inner_is_c else "OMW"
-    inner_key   = "concurrency" if inner_is_c else "omw"
+    inner_key = "concurrency" if inner_is_c else "omw"
 
     rows = [
         f"| # | {inner_label} | MAX_TOKENS | rps | fail% | p50 | p95 | p99 | mean ms | GPU% | VRAM% | batch% | SLO | bottleneck |",
@@ -1623,9 +1859,9 @@ def _render_stage_g(args, trials, plt, png_dir, now,
             f"{_trial_rps(t):.3f} | {_trial_fail_rate(t):.0%} | "
             f"{_trial_p50(t):.0f} | {_trial_p95(t):.0f} | {_trial_p99(t):.0f} | "
             f"{_trial_mean(t):.0f} | "
-            f"{util.get('gpu_compute', 0)*100:.0f} | "
-            f"{util.get('gpu_memory', 0)*100:.0f} | "
-            f"{util.get('sgl_batch', 0)*100:.0f} | "
+            f"{util.get('gpu_compute', 0) * 100:.0f} | "
+            f"{util.get('gpu_memory', 0) * 100:.0f} | "
+            f"{util.get('sgl_batch', 0) * 100:.0f} | "
             f"{'✅' if slo_ok else '❌'} | {s.get('bottleneck', '-')} |"
         )
     grid_md = "\n".join(rows)
@@ -1635,8 +1871,7 @@ def _render_stage_g(args, trials, plt, png_dir, now,
     if plt is not None and slo_winners:
         rel = _render_stage_g_heatmaps(plt, g_trials, png_dir, inner_key, inner_label)
         chart_section = "\n\n".join(
-            f"### {name}\n\n![{name}]({png_dir.name}/{p})"
-            for name, p in rel.items()
+            f"### {name}\n\n![{name}]({png_dir.name}/{p})" for name, p in rel.items()
         )
 
     # Winner.
@@ -1646,14 +1881,15 @@ def _render_stage_g(args, trials, plt, png_dir, now,
         s = wt["summary"]
         inner_desc = (
             f"concurrency={s.get('concurrency')}"
-            if inner_is_c else f"OCR_MAX_WORKERS={s.get('omw')}"
+            if inner_is_c
+            else f"OCR_MAX_WORKERS={s.get('omw')}"
         )
         winner_md = (
             f"**Cell {wi}** — `{inner_desc}`, "
             f"`SGL_MAX_TOTAL_TOKENS={s.get('max_total_tokens')}` — "
             f"rps={_trial_rps(wt):.3f}, p99={_trial_p99(wt):.0f}ms, "
             f"mean={_trial_mean(wt):.0f}ms, fail={_trial_fail_rate(wt):.0%}, "
-            f"GPU%={(wt['summary'].get('utilization') or {}).get('gpu_compute', 0)*100:.0f}."
+            f"GPU%={(wt['summary'].get('utilization') or {}).get('gpu_compute', 0) * 100:.0f}."
         )
 
     fixed_md = (
@@ -1667,7 +1903,8 @@ def _render_stage_g(args, trials, plt, png_dir, now,
         "- Pool: 128 images from `OmniDocBench/images/` only (deterministic, alphabetical)\n"
         + (
             f"- `OCR_MAX_WORKERS={next(iter(omw_values))}` (fixed)\n"
-            if inner_is_c else ""
+            if inner_is_c
+            else ""
         )
         + "- `N=100` per cell, abort gate 15%"
     )
@@ -1719,18 +1956,24 @@ def _render_stage_g(args, trials, plt, png_dir, now,
 """
 
 
-def _render_stage_g_heatmaps(plt, g_trials: list[dict], png_dir: pathlib.Path,
-                             inner_key: str = "omw",
-                             inner_label: str = "OCR_MAX_WORKERS") -> dict[str, str]:
+def _render_stage_g_heatmaps(
+    plt,
+    g_trials: list[dict],
+    png_dir: pathlib.Path,
+    inner_key: str = "omw",
+    inner_label: str = "OCR_MAX_WORKERS",
+) -> dict[str, str]:
     """Two heatmaps: rps (higher better) and p99 (lower better). X axis is
     the varying inner axis (OMW or concurrency); Y axis is MAX_TOKENS."""
     if not g_trials:
         return {}
     inners = sorted({int(t["summary"].get(inner_key, 0) or 0) for t in g_trials})
-    mts    = sorted({int(t["summary"].get("max_total_tokens", 0)) for t in g_trials})
+    mts = sorted({int(t["summary"].get("max_total_tokens", 0)) for t in g_trials})
     idx = {
-        (int(t["summary"].get(inner_key, 0) or 0),
-         int(t["summary"].get("max_total_tokens", 0))): t
+        (
+            int(t["summary"].get(inner_key, 0) or 0),
+            int(t["summary"].get("max_total_tokens", 0)),
+        ): t
         for t in g_trials
     }
     rel_paths: dict[str, str] = {}
@@ -1740,8 +1983,10 @@ def _render_stage_g_heatmaps(plt, g_trials: list[dict], png_dir: pathlib.Path,
         ("p99 ms", _trial_p99, "{:.0f}", "Reds_r"),
         ("fail%", _trial_fail_rate, "{:.0%}", "Reds"),
     ]:
-        values = [[fn(idx[(o, m)]) if (o, m) in idx else float("nan")
-                   for o in inners] for m in mts]
+        values = [
+            [fn(idx[(o, m)]) if (o, m) in idx else float("nan") for o in inners]
+            for m in mts
+        ]
         fig, ax = plt.subplots(figsize=(max(4, len(inners) + 2), max(3, len(mts) + 1)))
         im = ax.imshow(values, aspect="auto", cmap=cmap)
         ax.set_xticks(range(len(inners)))
@@ -1755,8 +2000,15 @@ def _render_stage_g_heatmaps(plt, g_trials: list[dict], png_dir: pathlib.Path,
             for xi in range(len(inners)):
                 v = values[yi][xi]
                 if v == v:
-                    ax.text(xi, yi, fmt.format(v), ha="center", va="center",
-                            color="white", fontsize=9)
+                    ax.text(
+                        xi,
+                        yi,
+                        fmt.format(v),
+                        ha="center",
+                        va="center",
+                        color="white",
+                        fontsize=9,
+                    )
         fig.colorbar(im, ax=ax)
         fig.tight_layout()
         safe = metric_name.replace(" ", "_").replace("%", "pct")
@@ -1773,8 +2025,9 @@ def _render_stage_g_heatmaps(plt, g_trials: list[dict], png_dir: pathlib.Path,
 # ---------------------------------------------------------------------------
 
 
-def _load_histograms_diff(pre_path: pathlib.Path | None,
-                          post_path: pathlib.Path) -> dict:
+def _load_histograms_diff(
+    pre_path: pathlib.Path | None, post_path: pathlib.Path
+) -> dict:
     """Parse `/metrics` snapshots and return the post-pre diff. If pre is
     missing/unreadable, the post is returned as-is (caller is responsible
     for the force-recreate-before-run invariant)."""
@@ -1849,8 +2102,8 @@ def _render_phase_bar_chart(plt, decomp: dict, png_dir: pathlib.Path) -> str | N
     if plt is None:
         return None
     segments = [
-        ("layout (CPU)",   decomp.get("layout", 0.0), "#4c72b0"),
-        ("ocr fan-out",    decomp.get("ocr_wall", 0.0), "#dd8452"),
+        ("layout (CPU)", decomp.get("layout", 0.0), "#4c72b0"),
+        ("ocr fan-out", decomp.get("ocr_wall", 0.0), "#dd8452"),
         ("other overhead", decomp.get("other", 0.0), "#55a868"),
     ]
     fig, ax = plt.subplots(figsize=(9, 2.6))
@@ -1858,17 +2111,36 @@ def _render_phase_bar_chart(plt, decomp: dict, png_dir: pathlib.Path) -> str | N
     for label, width, color in segments:
         if width <= 0:
             continue
-        ax.barh(0, width, left=left, color=color, edgecolor="white",
-                linewidth=1.5, label=f"{label}: {width:.2f}s")
-        ax.text(left + width / 2, 0, f"{width:.2f}s", ha="center",
-                va="center", color="white", fontsize=9, fontweight="bold")
+        ax.barh(
+            0,
+            width,
+            left=left,
+            color=color,
+            edgecolor="white",
+            linewidth=1.5,
+            label=f"{label}: {width:.2f}s",
+        )
+        ax.text(
+            left + width / 2,
+            0,
+            f"{width:.2f}s",
+            ha="center",
+            va="center",
+            color="white",
+            fontsize=9,
+            fontweight="bold",
+        )
         left += width
     # Ideal-parallel floor — the OCR slice if fan-out were perfectly parallel.
     floor = decomp.get("ideal_floor")
     if floor is not None and floor > 0:
-        ax.axvline(decomp.get("layout", 0.0) + floor, linestyle="--",
-                   color="#c44e52", linewidth=1.5,
-                   label=f"ideal-parallel floor: layout + {floor:.2f}s")
+        ax.axvline(
+            decomp.get("layout", 0.0) + floor,
+            linestyle="--",
+            color="#c44e52",
+            linewidth=1.5,
+            label=f"ideal-parallel floor: layout + {floor:.2f}s",
+        )
     ax.set_yticks([])
     ax.set_xlabel("seconds (mean per /glmocr/parse request)")
     ax.set_title("Mean request phase decomposition")
@@ -1881,8 +2153,9 @@ def _render_phase_bar_chart(plt, decomp: dict, png_dir: pathlib.Path) -> str | N
     return out.name
 
 
-def _render_stage_cpu(args, trials, plt, png_dir, now,
-                      resource_png, resource_table) -> str:
+def _render_stage_cpu(
+    args, trials, plt, png_dir, now, resource_png, resource_table
+) -> str:
     # Pick the single stage-e trial (c=12 cell). If multiple are present
     # we take the first — this renderer is intended for one cell.
     if not trials:
@@ -1901,7 +2174,8 @@ def _render_stage_cpu(args, trials, plt, png_dir, now,
     ocr_h = pm.find_histogram(hists, "glmocr_ocr_region_seconds")
     # Flask histogram is grouped by url_rule; scope to /glmocr/parse.
     parse_h = pm.find_histogram(
-        hists, "flask_http_request_duration_seconds",
+        hists,
+        "flask_http_request_duration_seconds",
         match_labels={"url_rule": "/glmocr/parse"},
     )
 
@@ -1955,28 +2229,32 @@ def _render_stage_cpu(args, trials, plt, png_dir, now,
         f"{int(s.get('requests_attempted') or s.get('total') or 0)} |"
     )
 
-    e2e_table = "\n".join([
-        "| Signal | container | p50 | p95 | p99 | mean | max | samples |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
-        client_row,
-        hrow("Server-observed /glmocr/parse", "cpu", parse_h),
-    ])
+    e2e_table = "\n".join(
+        [
+            "| Signal | container | p50 | p95 | p99 | mean | max | samples |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+            client_row,
+            hrow("Server-observed /glmocr/parse", "cpu", parse_h),
+        ]
+    )
 
     # ---- Pipeline phase breakdown ----------------------------------------
     # Every timed phase, tagged with which container it runs in. OCR
     # region = one SGLang call, so the phase is measured on the cpu
     # container (aiohttp round-trip including SGLang server processing)
     # but the heavy lifting happens on the gpu container.
-    phase_table = "\n".join([
-        "| Phase | container | p50 | p95 | p99 | mean | max | samples |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
-        hrow("Layout inference (PP-DocLayoutV3)", "cpu", layout_h),
-        hrow("OCR region RTT (client side)", "cpu→gpu", ocr_h),
-        hrow("SGLang server E2E (per call)", "gpu", sgl_e2e),
-        hrow("SGLang scheduler queue time", "gpu", sgl_queue),
-        hrow("SGLang time-to-first-token", "gpu", sgl_ttft),
-        hrow("SGLang inter-token latency", "gpu", sgl_itl),
-    ])
+    phase_table = "\n".join(
+        [
+            "| Phase | container | p50 | p95 | p99 | mean | max | samples |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+            hrow("Layout inference (PP-DocLayoutV3)", "cpu", layout_h),
+            hrow("OCR region RTT (client side)", "cpu→gpu", ocr_h),
+            hrow("SGLang server E2E (per call)", "gpu", sgl_e2e),
+            hrow("SGLang scheduler queue time", "gpu", sgl_queue),
+            hrow("SGLang time-to-first-token", "gpu", sgl_ttft),
+            hrow("SGLang inter-token latency", "gpu", sgl_itl),
+        ]
+    )
 
     # ---- Decomposition (mean values) -------------------------------------
     mean_total = parse_h.mean() if parse_h and parse_h.count else None
@@ -2014,7 +2292,8 @@ def _render_stage_cpu(args, trials, plt, png_dir, now,
     phase_png = _render_phase_bar_chart(plt, decomp, png_dir) if decomp else None
     phase_md = (
         f"![phase decomposition]({png_dir.name}/{phase_png})\n"
-        if phase_png else "_(no phase decomposition — metrics unavailable)_\n"
+        if phase_png
+        else "_(no phase decomposition — metrics unavailable)_\n"
     )
 
     # ---- Worker concurrency ---------------------------------------------
@@ -2045,7 +2324,7 @@ def _render_stage_cpu(args, trials, plt, png_dir, now,
         f"p99={_trial_p99(t):.0f}ms, "
         f"fail={_trial_fail_rate(t):.0%}, "
         f"SLO={'✅' if slo_ok else '❌'}. "
-        f"Most-saturated resource during cell: **{pname}** ({pval*100:.0f}%)."
+        f"Most-saturated resource during cell: **{pname}** ({pval * 100:.0f}%)."
     )
 
     # ---- Derived fraction (for prose) -----------------------------------
@@ -2064,12 +2343,15 @@ def _render_stage_cpu(args, trials, plt, png_dir, now,
     regions_per_req = (n_regions / n_requests) if n_requests else 0.0
 
     # SGLang gauge summary from probe JSONL (running / queued averaged).
-    sgl_gauge_md = _sglang_gauge_summary(pathlib.Path(args.probe) if args.probe else None)
+    sgl_gauge_md = _sglang_gauge_summary(
+        pathlib.Path(args.probe) if args.probe else None
+    )
 
     # SGLang-side note about how to read the table.
     sgl_note = (
-        "" if sgl_e2e else
-        "\n_(SGLang histograms absent — pass `--sglang-metrics-pre/--sglang-metrics-post` "
+        ""
+        if sgl_e2e
+        else "\n_(SGLang histograms absent — pass `--sglang-metrics-pre/--sglang-metrics-post` "
         "to populate the gpu-side rows.)_\n"
     )
 
@@ -2194,6 +2476,7 @@ def _sglang_gauge_summary(probe_path: pathlib.Path | None) -> str:
 # Entry point.
 # ---------------------------------------------------------------------------
 
+
 def render_stage_cpu(args: argparse.Namespace) -> None:
     trials = json.loads(pathlib.Path(args.trials).read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -2210,8 +2493,9 @@ def render_stage_cpu(args: argparse.Namespace) -> None:
         if plt is not None:
             resource_png = _render_resource_chart(plt, probe_path, png_dir)
 
-    body = _render_stage_cpu(args, trials, plt, png_dir, now,
-                             resource_png, resource_table)
+    body = _render_stage_cpu(
+        args, trials, plt, png_dir, now, resource_png, resource_table
+    )
     out_md.write_text(body, encoding="utf-8")
     print(f"[render_report] wrote {out_md}")
 
@@ -2246,38 +2530,60 @@ def main() -> int:
     pp.add_argument("--prom-url", default="http://localhost:9090")
 
     pt = sub.add_parser("stage")
-    pt.add_argument("--trials", required=True,
-                    help="loadtest/results/raw/<run-id>/_trials.json from "
-                         "tune_params.py --stage")
+    pt.add_argument(
+        "--trials",
+        required=True,
+        help="loadtest/results/raw/<run-id>/_trials.json from tune_params.py --stage",
+    )
     pt.add_argument("--out", required=True)
     pt.add_argument("--run-id", required=True)
-    pt.add_argument("--probe", default=None,
-                    help="optional probe.jsonl to include resource-usage "
-                         "summary + chart")
-    pt.add_argument("--stage", choices=["a", "b", "c"], default=None,
-                    help="override stage inferred from trial kinds")
+    pt.add_argument(
+        "--probe",
+        default=None,
+        help="optional probe.jsonl to include resource-usage summary + chart",
+    )
+    pt.add_argument(
+        "--stage",
+        choices=["a", "b", "c"],
+        default=None,
+        help="override stage inferred from trial kinds",
+    )
 
     # CPU-focus single-cell report. Different from `stage` in that it
     # consumes pre/post /metrics snapshots and produces a phase-breakdown
     # PNG instead of throughput-vs-knob charts.
     pc = sub.add_parser("stage-cpu")
-    pc.add_argument("--trials", required=True,
-                    help="loadtest/results/raw/<run-id>/_trials.json")
-    pc.add_argument("--probe", required=True,
-                    help="runtime_probe_loop JSONL for resource time-series")
-    pc.add_argument("--metrics-pre", default=None,
-                    help="/metrics snapshot BEFORE the run (pairs with "
-                         "--metrics-post for histogram diff). Optional if "
-                         "the cpu container was force-recreated immediately "
-                         "before the run.")
-    pc.add_argument("--metrics-post", required=True,
-                    help="/metrics snapshot AFTER the run")
-    pc.add_argument("--sglang-metrics-pre", default=None,
-                    help="SGLang /metrics snapshot BEFORE the run — unlocks "
-                         "gpu-side percentile rows (sglang:e2e_*, "
-                         "sglang:queue_time, sglang:time_to_first_token).")
-    pc.add_argument("--sglang-metrics-post", default=None,
-                    help="SGLang /metrics snapshot AFTER the run.")
+    pc.add_argument(
+        "--trials", required=True, help="loadtest/results/raw/<run-id>/_trials.json"
+    )
+    pc.add_argument(
+        "--probe",
+        required=True,
+        help="runtime_probe_loop JSONL for resource time-series",
+    )
+    pc.add_argument(
+        "--metrics-pre",
+        default=None,
+        help="/metrics snapshot BEFORE the run (pairs with "
+        "--metrics-post for histogram diff). Optional if "
+        "the cpu container was force-recreated immediately "
+        "before the run.",
+    )
+    pc.add_argument(
+        "--metrics-post", required=True, help="/metrics snapshot AFTER the run"
+    )
+    pc.add_argument(
+        "--sglang-metrics-pre",
+        default=None,
+        help="SGLang /metrics snapshot BEFORE the run — unlocks "
+        "gpu-side percentile rows (sglang:e2e_*, "
+        "sglang:queue_time, sglang:time_to_first_token).",
+    )
+    pc.add_argument(
+        "--sglang-metrics-post",
+        default=None,
+        help="SGLang /metrics snapshot AFTER the run.",
+    )
     pc.add_argument("--out", required=True)
     pc.add_argument("--run-id", required=True)
 

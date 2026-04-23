@@ -26,6 +26,7 @@ Exposes:
   GET  /health               — always 200 {"status": "ok"}
   POST /glmocr/parse         — same contract as upstream glmocr.server
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -61,15 +62,18 @@ async def _startup() -> None:
     def _load_config(path: str):
         try:
             from glmocr.config import load_config  # type: ignore
+
             return load_config(path)
         except Exception:
             pass
         try:
             from glmocr.config import Config  # type: ignore
+
             return Config.from_yaml(path)
         except Exception:
             pass
         import yaml
+
         with open(path, "r", encoding="utf-8") as fh:
             return yaml.safe_load(fh)
 
@@ -87,11 +91,13 @@ async def _startup() -> None:
     # same instrumentation the sync gunicorn workers apply in wsgi.py.
     try:
         import runtime_app
+
         runtime_app.instrument_pipeline(pipeline)
         logger.info("runtime_app.instrument_pipeline() applied")
     except Exception:
-        logger.warning("runtime_app.instrument_pipeline() skipped:\n%s",
-                       traceback.format_exc())
+        logger.warning(
+            "runtime_app.instrument_pipeline() skipped:\n%s", traceback.format_exc()
+        )
 
 
 @app.on_event("shutdown")
@@ -149,9 +155,7 @@ async def parse(request: Request) -> JSONResponse:
         # pipeline.process is a generator that yields one result per input
         # unit. We materialize it inside the thread so the caller gets the
         # full list.
-        return list(
-            pipeline.process(request_data, save_layout_visualization=False)
-        )
+        return list(pipeline.process(request_data, save_layout_visualization=False))
 
     try:
         results = await asyncio.to_thread(_run_sync)
@@ -159,7 +163,8 @@ async def parse(request: Request) -> JSONResponse:
         logger.error("parse error: %s", e)
         logger.debug(traceback.format_exc())
         return JSONResponse(
-            {"error": f"Parse error: {e}"}, status_code=500,
+            {"error": f"Parse error: {e}"},
+            status_code=500,
         )
 
     if not results:
@@ -171,9 +176,8 @@ async def parse(request: Request) -> JSONResponse:
             status_code=200,
         )
     json_result = [r.json_result for r in results]
-    markdown_result = "\n\n---\n\n".join(
-        r.markdown_result or "" for r in results
-    )
+    markdown_result = "\n\n---\n\n".join(r.markdown_result or "" for r in results)
     return JSONResponse(
-        _build_response(json_result, markdown_result), status_code=200,
+        _build_response(json_result, markdown_result),
+        status_code=200,
     )

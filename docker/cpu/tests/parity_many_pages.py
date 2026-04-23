@@ -15,6 +15,7 @@ Usage inside container:
 
 where N is the number of pages to test (default 50).
 """
+
 from __future__ import annotations
 
 import glob
@@ -33,9 +34,7 @@ from transformers import (
 
 sys.path.insert(0, "/app")
 from layout_postprocess import (  # noqa: E402
-    compute_paddle_format_results,
     np_post_process_object_detection,
-    paddle_to_all_results,
 )
 
 
@@ -49,8 +48,10 @@ BOX_TOL_PIXELS = float(os.environ.get("PARITY_BOX_TOL", "0.5"))
 
 
 def _iou(b1, b2):
-    x1 = max(b1[0], b2[0]); y1 = max(b1[1], b2[1])
-    x2 = min(b1[2], b2[2]); y2 = min(b1[3], b2[3])
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
     if x2 <= x1 or y2 <= y1:
         return 0.0
     inter = (x2 - x1) * (y2 - y1)
@@ -115,7 +116,9 @@ def main() -> int:
 
         target_sizes_torch = torch.tensor([img.size[::-1]])
         torch_raw = processor.post_process_object_detection(
-            outputs, threshold=threshold, target_sizes=target_sizes_torch,
+            outputs,
+            threshold=threshold,
+            target_sizes=target_sizes_torch,
         )[0]
 
         # Numpy path — compare at the raw (pre-int-cast) post-proc output,
@@ -147,7 +150,9 @@ def main() -> int:
 
         if len(torch_boxes) != len(np_boxes):
             n_count_mismatch += 1
-            print(f"[parity] {Path(p).name}: count {len(torch_boxes)} vs {len(np_boxes)}")
+            print(
+                f"[parity] {Path(p).name}: count {len(torch_boxes)} vs {len(np_boxes)}"
+            )
             continue
 
         n = len(torch_boxes)
@@ -178,12 +183,14 @@ def main() -> int:
 
         if (idx + 1) % 10 == 0:
             elapsed = time.perf_counter() - t0
-            print(f"[parity] progress {idx+1}/{len(paths)}  "
-                  f"ok={n_pages_ok}  elapsed={elapsed:.1f}s")
+            print(
+                f"[parity] progress {idx + 1}/{len(paths)}  "
+                f"ok={n_pages_ok}  elapsed={elapsed:.1f}s"
+            )
 
     elapsed = time.perf_counter() - t0
     print()
-    print(f"[parity] summary:")
+    print("[parity] summary:")
     print(f"  pages:               {len(paths)}")
     print(f"  pages ok:            {n_pages_ok}")
     print(f"  empty on both paths: {n_empty_both}")

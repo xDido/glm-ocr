@@ -1,0 +1,129 @@
+# CLAUDE.md
+
+> **Copy this file to the repo root as `CLAUDE.md`**. It is loaded into every Claude Code session in this repo.
+
+---
+
+## Project identity
+
+This is **glmocr-prod**: the AWS production deployment of a GLM-OCR document-OCR service. The local dev stack (Windows + Docker Compose + RTX 3060 Ti) has already been built, measured, and tuned; this repo is the port to Fargate + SageMaker + Go CDK.
+
+**Architecture in one line:** a Fargate ECS service (CPU layout + OCR orchestration) calls a SageMaker real-time endpoint (SGLang GLM-OCR) through a task-local SigV4-proxy sidecar. Everything deployed via Go AWS CDK v2.
+
+**Reference docs (read when you need them):**
+- `docs/prod/00-START-HERE.md` — reading order for the whole handoff.
+- `docs/prod/01-prod-architecture.md` — system diagram + component rationale.
+- `docs/prod/02-cdk-go-structure.md` — Go CDK layout.
+- `docs/prod/12-cpu-container-spec.md` — how to rebuild `docker/cpu/` from scratch.
+- `docs/prod/13-loadtest-spec.md` — how to rebuild `scripts/` + `loadtest/` from scratch.
+- `docs/prod/reference/env-tuned.md` — authoritative tuned-knob list.
+- `docs/prod/09-runbook.md` — on-call + tuning effects.
+- `docs/ARCHITECTURE.md` — carried over from dev repo; deep reference for CPU container internals (useful when porting the tuned optimizations later).
+- `docs/OPTIMIZATIONS.md` — carried over from dev; kept/rejected optimizations with measured numbers.
+
+---
+
+## Tech stack
+
+- **Infra:** AWS CDK v2 (Go). Target account, region, stage via CDK context (`--context stage=prod`).
+- **CPU layer:** ECS Fargate (8 vCPU / 16 GB), x86_64, running `docker/cpu/Dockerfile.slim` (unchanged from dev).
+- **GPU layer:** SageMaker real-time endpoint on `ml.g4dn.2xlarge` (T4, 16 GB VRAM), BYOC container wrapping `lmsysorg/sglang`.
+- **OCR engine:** SGLang serving `zai-org/GLM-OCR` with NEXTN speculative decoding (aliases to EAGLE internally).
+- **Layout detector:** PP-DocLayoutV3 via ONNX Runtime, numpy post-processing (Conv-dominated, ~1,100 ms/call).
+- **Observability:** Grafana Cloud Mimir (metrics) + CloudWatch (SageMaker + ECS). Alloy sidecar in each Fargate task.
+- **Secrets:** AWS Secrets Manager (`glmocr/prod/*`).
+- **Config knobs:** SSM Parameter Store (`/glmocr/prod/*`).
+- **CI:** GitHub Actions with OIDC. See `docs/prod/08-ci-cd.md`.
+
+---
+
+## Tuned-knob cheat sheet
+
+Authoritative copy: `docs/prod/reference/env-tuned.md`. Don't change these without evidence — each was picked from measurement on a g4dn-class CPU + a 16 GB GPU equivalent.
+
+```ini
+# CPU (Fargate task env)
+CPU_WORKERS=4
+CPU_THREADS=16
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+OCR_MAX_WORKERS=32
+OCR_CONN_POOL=2048
+OCR_RETRY_MAX=2
+LAYOUT_BACKEND=onnx
+LAYOUT_POSTPROC=numpy
+LAYOUT_ONNX_THREADS=2
+LAYOUT_BATCH_ENABLED=true
+LAYOUT_BATCH_MAX=8            # don't exceed 8 — caused c=64 disconnects
+LAYOUT_BATCH_WINDOW_MS=20
+LAYOUT_ASYNC=false            # FastAPI sidecar didn't help; see memory
+SGLANG_HOST=127.0.0.1         # always local — sigv4-proxy sidecar
+SGLANG_PORT=30000
+
+# SageMaker endpoint env (SGLang)
+SGL_MAX_RUNNING_REQUESTS=64
+SGL_MEM_FRACTION_STATIC=0.95
+SGL_CONTEXT_LENGTH=24576
+SGL_SCHEDULE_POLICY=lpm       # beats fcfs by 16-28% — don't change
+SGL_SPECULATIVE=true
+SGL_SPEC_ALGORITHM=NEXTN      # aliases to EAGLE internally
+SGL_SPEC_NUM_STEPS=3
+```
+
+---
+
+## Things the previous session learned the hard way
+
+Distilled from `memory/` + `docs/OPTIMIZATIONS.md`. Full context in `docs/prod/reference/memory-seed.md`.
+
+1. **CPU-side layout forward is the binding constraint.** Raising `SGL_MAX_RUNNING_REQUESTS`, lowering `SGL_SCHEDULE_CONSERVATIVENESS`, and shrinking `SGL_CONTEXT_LENGTH` were all tested — all net-negative. The GPU running-batch peaks at 9–16 because CPU layout is slower than SGLang can consume. Framework swaps (FastAPI, LitServe, RayServe) also don't help; the bottleneck is the ONNX Conv kernel, not HTTP admission.
+
+2. **Single load-test runs are ±15–25% noisy.** Never keep/rollback on one matrix run. Always average ≥2.
+
+3. **DocLayout-YOLO is NOT faster on this CPU.** Despite public benchmarks claiming 3× — those were GPU. On Zen3/Cascade-Lake CPU, YOLO is 3× *slower* at imgsz=1024. Don't swap detectors without re-running `docker/cpu/tests/probe_doclayout_yolo.py` on the prod Fargate vCPU class.
+
+4. **FastAPI async sidecar is net-worse than gunicorn.** Removes the gthread back-pressure; c=40+ triggers HealthWatchdog because SGLang saturates. Leave `LAYOUT_ASYNC=false`.
+
+5. **CUDA IPC Transport is gated by VRAM.** Fails on 8 GB dev card (33 OOMs). Plumbing is in the container; try enabling on 16 GB g4dn after first-ship smoke. If it OOMs there too, disable.
+
+6. **`LAYOUT_BATCH_MAX=12` caused c=64 disconnects.** Keep at 8. The coalescer's win was 5× rps at 2-worker — shipped win — but it's also the fragility cliff.
+
+7. **`LAYOUT_INPUT_SIZE=640x640` was reverted.** Parity was validated only on OmniDocBench; not safe for passport/ID/receipt distributions. Don't lower input size without a parity test on the actual production document mix.
+
+8. **Layout on CUDA was rejected** on 8 GB dev. At 16 GB (g4dn/prod), torch CUDA context would steal ~1 GB/worker from SGLang's KV cache; re-evaluate only if moving to ≥24 GB VRAM SageMaker instances.
+
+9. **OpenVINO EP was misleadingly "3× faster"** — the apparent win was 15% silent empty responses. Root cause is batch=1 baked into PP-DocLayoutV3's torch source. Fix is a detector swap, not a provider swap.
+
+---
+
+## Conventions
+
+- **Go CDK code lives in `internal/stacks/`.** One file per stack. Constructs export typed accessors (e.g. `SagemakerStack.GrantInvoke(role)`), not raw strings.
+- **Docker images** live in `docker/<component>/` and are all **built from scratch in this repo** per the specs in `docs/prod/12-*.md`, `docs/prod/03-*.md`, and `docs/prod/06-*.md`. No files are copied from the dev repo. MVP ships simpler than dev's tuned stack; the advanced optimizations are future-port work with a documented path.
+- **Tests:** `go test ./...` runs Go + CDK tests. CDK assertion tests cover stack-shape invariants, not wiring trivia.
+- **Branching:** main is prod. Feature branches for everything; PRs trigger `cdk-diff`; merge to main runs `cdk-deploy` with manual approval (see `docs/prod/08-ci-cd.md`).
+- **Commits:** conventional commits (`feat:`, `fix:`, `docs:`, `chore:`, `perf:`, `refactor:`).
+- **Secrets:** never in code, never in git. Always Secrets Manager + SSM. See `docs/prod/07-secrets-and-config.md`.
+
+---
+
+## When in doubt
+
+- Architecture question → `docs/prod/01-prod-architecture.md`
+- "What knob do I turn for X?" → `docs/prod/09-runbook.md` + `docs/prod/reference/env-tuned.md`
+- "Why was this decided?" → `docs/prod/reference/memory-seed.md`
+- "How do I deploy?" → `docs/prod/08-ci-cd.md` + `docs/prod/prompts/08-first-smoke.md`
+- "How do I implement chunk N?" → `docs/prod/prompts/0N-*.md`
+
+---
+
+## Instructions for you (Claude Code)
+
+- **Before touching infra:** read the relevant prompt under `docs/prod/prompts/` cover-to-cover. They are copy-pasteable and sequential.
+- **Before touching tuned knobs:** cross-check against `docs/prod/reference/env-tuned.md` and the "hard-earned lessons" above.
+- **Don't re-run dev-rejected experiments** without a structural reason (new hardware, new model, etc.). See the memory seed.
+- **Use Agent (subagent_type=Explore)** sparingly — this repo is small and your reads are cheap. Reserve it for multi-file codebase questions.
+- **Commit often.** Every stack = its own PR if possible.
+- **Don't run `cdk deploy` without approval.** All prod deploys go through CI with manual approval.
+
+Have fun.

@@ -32,6 +32,7 @@ transformers<5 while glmocr pulls transformers 5.5.4 for the
 on a thin wrapper module is sufficient for a transformer-detector with
 a single static-shape input.
 """
+
 from __future__ import annotations
 
 import os
@@ -66,8 +67,10 @@ def _export_raw(model, proc, out_path: Path) -> None:
         def forward(self, pixel_values: "torch.Tensor") -> tuple:
             out = self.m(pixel_values=pixel_values)
             return (
-                out.logits, out.pred_boxes,
-                out.order_logits, out.out_masks,
+                out.logits,
+                out.pred_boxes,
+                out.order_logits,
+                out.out_masks,
                 out.last_hidden_state,
             )
 
@@ -79,8 +82,11 @@ def _export_raw(model, proc, out_path: Path) -> None:
         str(out_path),
         input_names=["pixel_values"],
         output_names=[
-            "logits", "pred_boxes",
-            "order_logits", "out_masks", "last_hidden_state",
+            "logits",
+            "pred_boxes",
+            "order_logits",
+            "out_masks",
+            "last_hidden_state",
         ],
         dynamic_axes={
             "pixel_values": {0: "batch"},
@@ -131,70 +137,72 @@ def _export_fused(model, proc, out_path: Path) -> None:
             super().__init__()
             self.m = m
 
-        def forward(self, pixel_values: "torch.Tensor",
-                    target_sizes: "torch.Tensor") -> tuple:
+        def forward(
+            self, pixel_values: "torch.Tensor", target_sizes: "torch.Tensor"
+        ) -> tuple:
             out = self.m(pixel_values=pixel_values)
-            logits = out.logits                # (B, N, C)
-            pred_boxes = out.pred_boxes        # (B, N, 4) cxcywh normalized
-            order_logits = out.order_logits    # (B, N, N)
-            out_masks = out.out_masks          # (B, N, Hm, Wm)
+            logits = out.logits  # (B, N, C)
+            pred_boxes = out.pred_boxes  # (B, N, 4) cxcywh normalized
+            order_logits = out.order_logits  # (B, N, N)
+            out_masks = out.out_masks  # (B, N, Hm, Wm)
 
             B, N, C = logits.shape
 
             # Reading-order decoder: vote-rank via pairwise sigmoid scores.
             order_scores = torch.sigmoid(order_logits)
             triu_part = order_scores.triu(diagonal=1).sum(dim=1)
-            tril_part = (1.0 - order_scores.transpose(1, 2)).tril(
-                diagonal=-1
-            ).sum(dim=1)
-            votes = triu_part + tril_part                               # (B, N)
-            pointers = torch.argsort(votes, dim=1)                      # (B, N)
-            ranks = torch.arange(
-                N, dtype=pointers.dtype, device=pointers.device
-            ).unsqueeze(0).expand(B, -1).contiguous()
+            tril_part = (
+                (1.0 - order_scores.transpose(1, 2)).tril(diagonal=-1).sum(dim=1)
+            )
+            votes = triu_part + tril_part  # (B, N)
+            pointers = torch.argsort(votes, dim=1)  # (B, N)
+            ranks = (
+                torch.arange(N, dtype=pointers.dtype, device=pointers.device)
+                .unsqueeze(0)
+                .expand(B, -1)
+                .contiguous()
+            )
             # Functional scatter to keep the graph traceable.
-            order_seq = torch.zeros_like(pointers).scatter(
-                1, pointers, ranks
-            )                                                           # (B, N)
+            order_seq = torch.zeros_like(pointers).scatter(1, pointers, ranks)  # (B, N)
 
             # cxcywh → xyxy, then rescale to image coords.
             centers = pred_boxes[..., :2]
             dims = pred_boxes[..., 2:]
             boxes_xyxy = torch.cat(
                 [centers - 0.5 * dims, centers + 0.5 * dims], dim=-1
-            )                                                           # (B, N, 4)
+            )  # (B, N, 4)
             img_h = target_sizes[:, 0].to(boxes_xyxy.dtype)
             img_w = target_sizes[:, 1].to(boxes_xyxy.dtype)
-            scale = torch.stack(
-                [img_w, img_h, img_w, img_h], dim=1
-            ).unsqueeze(1)                                              # (B, 1, 4)
+            scale = torch.stack([img_w, img_h, img_w, img_h], dim=1).unsqueeze(
+                1
+            )  # (B, 1, 4)
             boxes_xyxy = boxes_xyxy * scale
 
             # Sigmoid + TopK over flattened (N·C).
-            scores_all = torch.sigmoid(logits)                          # (B, N, C)
-            flat = scores_all.flatten(1)                                # (B, N*C)
+            scores_all = torch.sigmoid(logits)  # (B, N, C)
+            flat = scores_all.flatten(1)  # (B, N*C)
             scores_topk, indices = torch.topk(flat, N, dim=-1)
-            labels_topk = (indices % C).to(torch.int64)                 # (B, N)
-            query_idx = (indices // C).to(torch.int64)                  # (B, N)
+            labels_topk = (indices % C).to(torch.int64)  # (B, N)
+            query_idx = (indices // C).to(torch.int64)  # (B, N)
 
             # Gather boxes / masks / order_seqs by query_idx.
             boxes_topk = boxes_xyxy.gather(
                 1, query_idx.unsqueeze(-1).expand(-1, -1, 4)
-            )                                                           # (B, N, 4)
+            )  # (B, N, 4)
             Hm = out_masks.shape[-2]
             Wm = out_masks.shape[-1]
             masks_topk = out_masks.gather(
                 1, query_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, Hm, Wm)
-            )                                                           # (B, N, Hm, Wm)
-            order_seq_topk = order_seq.gather(1, query_idx)             # (B, N)
+            )  # (B, N, Hm, Wm)
+            order_seq_topk = order_seq.gather(1, query_idx)  # (B, N)
 
             return (
-                scores_topk,           # (B, N) fp32
-                labels_topk,           # (B, N) int64
-                boxes_topk,            # (B, N, 4) fp32 in image coords
-                order_seq_topk,        # (B, N) int64
-                masks_topk,            # (B, N, Hm, Wm) fp32 — raw mask logits
-                out.last_hidden_state, # (B, N, D) fp32
+                scores_topk,  # (B, N) fp32
+                labels_topk,  # (B, N) int64
+                boxes_topk,  # (B, N, 4) fp32 in image coords
+                order_seq_topk,  # (B, N) int64
+                masks_topk,  # (B, N, Hm, Wm) fp32 — raw mask logits
+                out.last_hidden_state,  # (B, N, D) fp32
             )
 
     wrapped = WrappedDetectorFused(model).eval()
@@ -206,17 +214,21 @@ def _export_fused(model, proc, out_path: Path) -> None:
         str(out_path),
         input_names=["pixel_values", "target_sizes"],
         output_names=[
-            "scores_topk", "labels_topk", "boxes_topk",
-            "order_seq_topk", "masks_topk", "last_hidden_state",
+            "scores_topk",
+            "labels_topk",
+            "boxes_topk",
+            "order_seq_topk",
+            "masks_topk",
+            "last_hidden_state",
         ],
         dynamic_axes={
-            "pixel_values":      {0: "batch"},
-            "target_sizes":      {0: "batch"},
-            "scores_topk":       {0: "batch"},
-            "labels_topk":       {0: "batch"},
-            "boxes_topk":        {0: "batch"},
-            "order_seq_topk":    {0: "batch"},
-            "masks_topk":        {0: "batch"},
+            "pixel_values": {0: "batch"},
+            "target_sizes": {0: "batch"},
+            "scores_topk": {0: "batch"},
+            "labels_topk": {0: "batch"},
+            "boxes_topk": {0: "batch"},
+            "order_seq_topk": {0: "batch"},
+            "masks_topk": {0: "batch"},
             "last_hidden_state": {0: "batch"},
         },
         opset_version=17,

@@ -15,6 +15,7 @@ SIGKILL diagnosis:
   handler runs. The dumps show up in `docker logs glmocr-cpu` with the
   worker's pid so we can correlate with the later SIGKILL error line.
 """
+
 from __future__ import annotations
 
 import faulthandler

@@ -25,6 +25,7 @@ Semantic parity targets match upstream bit-for-bit except where stated:
   triu/tril partial-sum formulation is deterministic).
 - Polygon extraction uses cv2 (identical to upstream).
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple, Union
@@ -87,8 +88,9 @@ def _np_get_order_seqs(order_logits: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def _extract_custom_vertices(polygon: np.ndarray,
-                             sharp_angle_thresh: float = 45.0) -> List[Tuple[float, float]]:
+def _extract_custom_vertices(
+    polygon: np.ndarray, sharp_angle_thresh: float = 45.0
+) -> List[Tuple[float, float]]:
     # Verbatim port of PPDocLayoutV3ImageProcessor.extract_custom_vertices.
     poly = np.array(polygon)
     n = len(poly)
@@ -110,15 +112,17 @@ def _extract_custom_vertices(polygon: np.ndarray,
             angle_cos = np.clip((vector_1 @ vector_2) / denom, -1.0, 1.0)
             angle = np.degrees(np.arccos(angle_cos))
             if abs(angle - sharp_angle_thresh) < 1:
-                dir_vec = (vector_1 / np.linalg.norm(vector_1)
-                           + vector_2 / np.linalg.norm(vector_2))
+                dir_vec = vector_1 / np.linalg.norm(
+                    vector_1
+                ) + vector_2 / np.linalg.norm(vector_2)
                 dir_norm = np.linalg.norm(dir_vec)
                 if dir_norm == 0:
                     res.append(tuple(current_point))
                 else:
                     dir_vec = dir_vec / dir_norm
-                    step_size = (np.linalg.norm(vector_1)
-                                 + np.linalg.norm(vector_2)) / 2
+                    step_size = (
+                        np.linalg.norm(vector_1) + np.linalg.norm(vector_2)
+                    ) / 2
                     new_point = current_point + dir_vec * step_size
                     res.append(tuple(new_point))
             else:
@@ -140,9 +144,9 @@ def _mask2polygon(mask: np.ndarray, epsilon_ratio: float = 0.004):
     return _extract_custom_vertices(polygon_points)
 
 
-def _extract_polygon_points_by_masks(boxes: np.ndarray,
-                                     masks: np.ndarray,
-                                     scale_ratio: Tuple[float, float]) -> List[np.ndarray]:
+def _extract_polygon_points_by_masks(
+    boxes: np.ndarray, masks: np.ndarray, scale_ratio: Tuple[float, float]
+) -> List[np.ndarray]:
     """Port of PPDocLayoutV3ImageProcessor._extract_polygon_points_by_masks.
 
     boxes: (N, 4) xyxy in image space.
@@ -166,16 +170,21 @@ def _extract_polygon_points_by_masks(boxes: np.ndarray,
             polygon_points.append(rect)
             continue
 
-        x_coords = [int(round(float(x_min) * scale_width)),
-                    int(round(float(x_max) * scale_width))]
+        x_coords = [
+            int(round(float(x_min) * scale_width)),
+            int(round(float(x_max) * scale_width)),
+        ]
         x_start, x_end = np.clip(x_coords, 0, mask_width)
-        y_coords = [int(round(float(y_min) * scale_height)),
-                    int(round(float(y_max) * scale_height))]
+        y_coords = [
+            int(round(float(y_min) * scale_height)),
+            int(round(float(y_max) * scale_height)),
+        ]
         y_start, y_end = np.clip(y_coords, 0, mask_height)
         cropped_mask = masks[i, y_start:y_end, x_start:x_end]
 
         resized_mask = cv2.resize(
-            cropped_mask.astype(np.uint8), (box_w, box_h),
+            cropped_mask.astype(np.uint8),
+            (box_w, box_h),
             interpolation=cv2.INTER_NEAREST,
         )
 
@@ -274,15 +283,19 @@ def np_post_process_object_detection(
             processor_size["width"] / float(target_size[1]),
             processor_size["height"] / float(target_size[0]),
         )
-        polygon_points = _extract_polygon_points_by_masks(filt_boxes, filt_masks, scale_ratio)
+        polygon_points = _extract_polygon_points_by_masks(
+            filt_boxes, filt_masks, scale_ratio
+        )
 
-        results.append({
-            "scores": score_b[keep][sort_idx],
-            "labels": label_b[keep][sort_idx],
-            "boxes": filt_boxes,
-            "polygon_points": polygon_points,
-            "order_seq": filt_order[sort_idx],
-        })
+        results.append(
+            {
+                "scores": score_b[keep][sort_idx],
+                "labels": label_b[keep][sort_idx],
+                "boxes": filt_boxes,
+                "polygon_points": polygon_points,
+                "order_seq": filt_order[sort_idx],
+            }
+        )
     return results
 
 
@@ -392,8 +405,9 @@ def _nms(boxes: np.ndarray, iou_same: float = 0.6, iou_diff: float = 0.95) -> Li
     return selected
 
 
-def _check_containment(boxes: np.ndarray, preserve_indices=None,
-                       category_index=None, mode=None):
+def _check_containment(
+    boxes: np.ndarray, preserve_indices=None, category_index=None, mode=None
+):
     n = len(boxes)
     contains_other = np.zeros(n, dtype=int)
     contained_by_other = np.zeros(n, dtype=int)
@@ -434,9 +448,14 @@ def _unclip_boxes(boxes: np.ndarray, unclip_ratio=None) -> np.ndarray:
                 new_h = height * height_ratio
                 cx = x1 + width / 2
                 cy = y1 + height / 2
-                new_box = [class_id, score,
-                           cx - new_w / 2, cy - new_h / 2,
-                           cx + new_w / 2, cy + new_h / 2]
+                new_box = [
+                    class_id,
+                    score,
+                    cx - new_w / 2,
+                    cy - new_h / 2,
+                    cx + new_w / 2,
+                    cy + new_h / 2,
+                ]
                 if len(box) > 6:
                     new_box.extend(box[6:])
                 expanded.append(new_box)
@@ -450,9 +469,14 @@ def _unclip_boxes(boxes: np.ndarray, unclip_ratio=None) -> np.ndarray:
     cx = boxes[:, 2] + widths / 2
     cy = boxes[:, 3] + heights / 2
     expanded = np.column_stack(
-        (boxes[:, 0], boxes[:, 1],
-         cx - new_w / 2, cy - new_h / 2,
-         cx + new_w / 2, cy + new_h / 2)
+        (
+            boxes[:, 0],
+            boxes[:, 1],
+            cx - new_w / 2,
+            cy - new_h / 2,
+            cx + new_w / 2,
+            cy + new_h / 2,
+        )
     )
     if boxes.shape[1] > 6:
         expanded = np.column_stack((expanded, boxes[:, 6:]))
@@ -552,8 +576,10 @@ def np_apply_layout_postprocess(
                     if layout_mode == "union":
                         continue
                     contains_other, contained_by_other = _check_containment(
-                        boxes_array[:, :6], preserve_indices,
-                        category_index, mode=layout_mode,
+                        boxes_array[:, :6],
+                        preserve_indices,
+                        category_index,
+                        mode=layout_mode,
                     )
                     if layout_mode == "large":
                         keep_mask &= contained_by_other == 0
@@ -613,14 +639,16 @@ def np_apply_layout_postprocess(
                 poly[:, 0] = np.clip(poly[:, 0], 0, img_width)
                 poly[:, 1] = np.clip(poly[:, 1], 0, img_height)
 
-            image_results.append({
-                "cls_id": cls_id,
-                "label": label_name,
-                "score": score,
-                "coordinate": [int(x1), int(y1), int(x2), int(y2)],
-                "order": order,
-                "polygon_points": poly,
-            })
+            image_results.append(
+                {
+                    "cls_id": cls_id,
+                    "label": label_name,
+                    "score": score,
+                    "coordinate": [int(x1), int(y1), int(x2), int(y2)],
+                    "order": order,
+                    "polygon_points": poly,
+                }
+            )
 
         paddle_format_results.append(image_results)
 
@@ -660,7 +688,10 @@ def compute_paddle_format_results(
         pre_threshold = threshold
 
     raw_results = np_post_process_object_detection(
-        logits, pred_boxes, order_logits, out_masks,
+        logits,
+        pred_boxes,
+        order_logits,
+        out_masks,
         target_sizes=target_sizes,
         threshold=pre_threshold,
         processor_size=processor_size,
@@ -668,7 +699,10 @@ def compute_paddle_format_results(
 
     if threshold_by_class:
         raw_results = np_apply_per_class_threshold(
-            raw_results, threshold, threshold_by_class, id2label,
+            raw_results,
+            threshold,
+            threshold_by_class,
+            id2label,
         )
 
     return np_apply_layout_postprocess(
@@ -714,18 +748,22 @@ def paddle_to_all_results(
             y2n = int(float(y2) / img_height * 1000)
             poly_array = item["polygon_points"]
             polygon = [
-                [int(float(p[0]) / img_width * 1000),
-                 int(float(p[1]) / img_height * 1000)]
+                [
+                    int(float(p[0]) / img_width * 1000),
+                    int(float(p[1]) / img_height * 1000),
+                ]
                 for p in poly_array
             ]
-            results.append({
-                "index": valid_index,
-                "label": label,
-                "score": float(score),
-                "bbox_2d": [x1n, y1n, x2n, y2n],
-                "polygon": polygon,
-                "task_type": task_type,
-            })
+            results.append(
+                {
+                    "index": valid_index,
+                    "label": label,
+                    "score": float(score),
+                    "bbox_2d": [x1n, y1n, x2n, y2n],
+                    "polygon": polygon,
+                    "task_type": task_type,
+                }
+            )
             valid_index += 1
         all_results.append(results)
     return all_results
@@ -760,7 +798,9 @@ def run_numpy_layout_pipeline(
         processor_size=processor_size,
     )
     return paddle_to_all_results(
-        paddle_format_results, img_sizes_wh, label_task_mapping,
+        paddle_format_results,
+        img_sizes_wh,
+        label_task_mapping,
     )
 
 
@@ -819,16 +859,20 @@ def _post_process_from_fused(
             processor_size["height"] / float(target_size[0]),
         )
         polygon_points = _extract_polygon_points_by_masks(
-            filt_boxes, filt_masks, scale_ratio,
+            filt_boxes,
+            filt_masks,
+            scale_ratio,
         )
 
-        results.append({
-            "scores": score_b[keep][sort_idx],
-            "labels": label_b[keep][sort_idx],
-            "boxes": filt_boxes,
-            "polygon_points": polygon_points,
-            "order_seq": filt_order[sort_idx],
-        })
+        results.append(
+            {
+                "scores": score_b[keep][sort_idx],
+                "labels": label_b[keep][sort_idx],
+                "boxes": filt_boxes,
+                "polygon_points": polygon_points,
+                "order_seq": filt_order[sort_idx],
+            }
+        )
     return results
 
 
@@ -853,7 +897,8 @@ def compute_paddle_format_results_from_fused(
          masks_topk_logits, last_hidden_state)
     """
     target_sizes = np.array(
-        [(h, w) for (w, h) in img_sizes_wh], dtype=np.int64,
+        [(h, w) for (w, h) in img_sizes_wh],
+        dtype=np.int64,
     )
 
     if threshold_by_class:
@@ -861,11 +906,20 @@ def compute_paddle_format_results_from_fused(
     else:
         pre_threshold = threshold
 
-    (scores_topk, labels_topk, boxes_topk, order_seq_topk,
-     masks_topk_logits, _last_hs) = ort_run_fused(pixel_values, target_sizes)
+    (
+        scores_topk,
+        labels_topk,
+        boxes_topk,
+        order_seq_topk,
+        masks_topk_logits,
+        _last_hs,
+    ) = ort_run_fused(pixel_values, target_sizes)
 
     raw_results = _post_process_from_fused(
-        scores_topk, labels_topk, boxes_topk, order_seq_topk,
+        scores_topk,
+        labels_topk,
+        boxes_topk,
+        order_seq_topk,
         masks_topk_logits,
         target_sizes=target_sizes,
         threshold=pre_threshold,
@@ -874,7 +928,10 @@ def compute_paddle_format_results_from_fused(
 
     if threshold_by_class:
         raw_results = np_apply_per_class_threshold(
-            raw_results, threshold, threshold_by_class, id2label,
+            raw_results,
+            threshold,
+            threshold_by_class,
+            id2label,
         )
 
     return np_apply_layout_postprocess(

@@ -18,6 +18,7 @@ a dedicated collector when GLMOCR_PIPELINE_METRICS=true.
 This module is deliberately side-effect-free with respect to glmocr: it only
 reads.
 """
+
 from __future__ import annotations
 
 import json as _json
@@ -42,16 +43,34 @@ bp = Blueprint("glmocr_runtime", __name__)
 CONFIG_PATH = os.environ.get("GLMOCR_CONFIG", "/app/config.yaml")
 
 ENV_KEYS = (
-    "CPU_WORKERS", "CPU_THREADS", "GUNICORN_TIMEOUT", "GLMOCR_PORT",
-    "OCR_MAX_WORKERS", "OCR_CONNECT_TIMEOUT", "OCR_REQUEST_TIMEOUT",
-    "OCR_RETRY_MAX", "OCR_RETRY_BACKOFF_BASE", "OCR_RETRY_BACKOFF_MAX",
-    "OCR_CONN_POOL", "OCR_MODEL_NAME",
-    "LAYOUT_ENABLED", "LAYOUT_DEVICE", "LAYOUT_USE_POLYGON",
-    "SGLANG_HOST", "SGLANG_PORT", "SGLANG_SCHEME",
-    "SGL_MODEL_PATH", "SGL_SERVED_MODEL_NAME", "SGL_TP_SIZE", "SGL_DTYPE",
-    "SGL_MAX_RUNNING_REQUESTS", "SGL_MAX_PREFILL_TOKENS",
-    "SGL_MAX_TOTAL_TOKENS", "SGL_MEM_FRACTION_STATIC",
-    "SGL_CHUNKED_PREFILL", "SGL_SCHEDULE_POLICY",
+    "CPU_WORKERS",
+    "CPU_THREADS",
+    "GUNICORN_TIMEOUT",
+    "GLMOCR_PORT",
+    "OCR_MAX_WORKERS",
+    "OCR_CONNECT_TIMEOUT",
+    "OCR_REQUEST_TIMEOUT",
+    "OCR_RETRY_MAX",
+    "OCR_RETRY_BACKOFF_BASE",
+    "OCR_RETRY_BACKOFF_MAX",
+    "OCR_CONN_POOL",
+    "OCR_MODEL_NAME",
+    "LAYOUT_ENABLED",
+    "LAYOUT_DEVICE",
+    "LAYOUT_USE_POLYGON",
+    "SGLANG_HOST",
+    "SGLANG_PORT",
+    "SGLANG_SCHEME",
+    "SGL_MODEL_PATH",
+    "SGL_SERVED_MODEL_NAME",
+    "SGL_TP_SIZE",
+    "SGL_DTYPE",
+    "SGL_MAX_RUNNING_REQUESTS",
+    "SGL_MAX_PREFILL_TOKENS",
+    "SGL_MAX_TOTAL_TOKENS",
+    "SGL_MEM_FRACTION_STATIC",
+    "SGL_CHUNKED_PREFILL",
+    "SGL_SCHEDULE_POLICY",
 )
 
 
@@ -81,7 +100,9 @@ def _loaded_config() -> dict[str, Any]:
         "pipeline.ocr_api.model": ocr_api.get("model"),
         "pipeline.layout.device": layout.get("device"),
         "pipeline.layout.use_polygon": layout.get("use_polygon"),
-        "pipeline.maas.enabled": pipeline.get("maas", {}).get("enabled") if isinstance(pipeline, dict) else None,
+        "pipeline.maas.enabled": pipeline.get("maas", {}).get("enabled")
+        if isinstance(pipeline, dict)
+        else None,
     }
 
 
@@ -103,15 +124,17 @@ def _runtime_actual() -> dict[str, Any]:
         for child in master.children(recursive=False):
             try:
                 with child.oneshot():
-                    workers.append({
-                        "pid": child.pid,
-                        "ppid": child.ppid(),
-                        "threads": child.num_threads(),
-                        "status": child.status(),
-                        "rss_mb": round(child.memory_info().rss / 1_048_576, 1),
-                        "started_at": round(child.create_time(), 2),
-                        "name": child.name(),
-                    })
+                    workers.append(
+                        {
+                            "pid": child.pid,
+                            "ppid": child.ppid(),
+                            "threads": child.num_threads(),
+                            "status": child.status(),
+                            "rss_mb": round(child.memory_info().rss / 1_048_576, 1),
+                            "started_at": round(child.create_time(), 2),
+                            "name": child.name(),
+                        }
+                    )
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
@@ -138,7 +161,10 @@ def _http_get_json(url: str, timeout: float = 3.0) -> dict[str, Any]:
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return {"status": resp.status, "body": _json.loads(resp.read().decode("utf-8"))}
+            return {
+                "status": resp.status,
+                "body": _json.loads(resp.read().decode("utf-8")),
+            }
     except urllib.error.HTTPError as exc:
         return {"status": exc.code, "error": exc.reason, "body": None}
     except Exception as exc:
@@ -149,7 +175,10 @@ def _http_get_text(url: str, timeout: float = 3.0) -> dict[str, Any]:
     try:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return {"status": resp.status, "text": resp.read().decode("utf-8", errors="replace")}
+            return {
+                "status": resp.status,
+                "text": resp.read().decode("utf-8", errors="replace"),
+            }
     except Exception as exc:
         return {"status": None, "error": repr(exc), "text": None}
 
@@ -211,15 +240,17 @@ def _sglang_info() -> dict[str, Any]:
 
 @bp.route("/runtime", methods=["GET"])
 def runtime() -> Any:
-    return jsonify({
-        "generated_at": round(time.time(), 2),
-        "cpu": {
-            "env_claimed": _env_claimed(),
-            "config_loaded": _loaded_config(),
-            "runtime_actual": _runtime_actual(),
-        },
-        "sglang": _sglang_info(),
-    })
+    return jsonify(
+        {
+            "generated_at": round(time.time(), 2),
+            "cpu": {
+                "env_claimed": _env_claimed(),
+                "config_loaded": _loaded_config(),
+                "runtime_actual": _runtime_actual(),
+            },
+            "sglang": _sglang_info(),
+        }
+    )
 
 
 @bp.route("/runtime/summary", methods=["GET"])
@@ -239,33 +270,59 @@ def runtime_summary() -> Any:
                 return sgl_metrics[n]
         return None
 
-    return jsonify({
-        "cpu_workers":          {"env": env.get("CPU_WORKERS"),
-                                 "actual": actual.get("worker_count")},
-        "cpu_threads_per_worker": {"env": env.get("CPU_THREADS"),
-                                   "actual_per_worker": [w["threads"] for w in actual.get("workers", [])]},
-        "ocr_max_workers":      {"env": env.get("OCR_MAX_WORKERS"),
-                                 "config": cfg.get("pipeline.max_workers")},
-        "sglang_max_running":   {"env": env.get("SGL_MAX_RUNNING_REQUESTS"),
-                                 "runtime": sgl_info_body.get("max_running_requests"),
-                                 "live_running": _sgl_any("sglang:num_running_reqs", "sglang_num_running_reqs"),
-                                 "live_queued":  _sgl_any("sglang:num_queue_reqs",   "sglang_num_queue_reqs")},
-        "sglang_batch_tokens":  {"env_prefill": env.get("SGL_MAX_PREFILL_TOKENS"),
-                                 "env_total": env.get("SGL_MAX_TOTAL_TOKENS"),
-                                 "runtime_prefill": sgl_info_body.get("max_prefill_tokens"),
-                                 "runtime_total":   sgl_info_body.get("max_total_tokens")},
-        "sglang_dtype":         {"env": env.get("SGL_DTYPE"),
-                                 "runtime": sgl_info_body.get("dtype")},
-        "sglang_tp_size":       {"env": env.get("SGL_TP_SIZE"),
-                                 "runtime": sgl_info_body.get("tp_size")},
-        "sglang_mem_fraction":  {"env": env.get("SGL_MEM_FRACTION_STATIC"),
-                                 "runtime": sgl_info_body.get("mem_fraction_static")},
-        "sglang_chunked":       {"env": env.get("SGL_CHUNKED_PREFILL"),
-                                 "runtime": sgl_info_body.get("chunked_prefill_size")
-                                             or sgl_info_body.get("enable_chunked_prefill")},
-        "sglang_model":         {"env": env.get("SGL_MODEL_PATH"),
-                                 "runtime": sgl_info_body.get("model_path")},
-    })
+    return jsonify(
+        {
+            "cpu_workers": {
+                "env": env.get("CPU_WORKERS"),
+                "actual": actual.get("worker_count"),
+            },
+            "cpu_threads_per_worker": {
+                "env": env.get("CPU_THREADS"),
+                "actual_per_worker": [w["threads"] for w in actual.get("workers", [])],
+            },
+            "ocr_max_workers": {
+                "env": env.get("OCR_MAX_WORKERS"),
+                "config": cfg.get("pipeline.max_workers"),
+            },
+            "sglang_max_running": {
+                "env": env.get("SGL_MAX_RUNNING_REQUESTS"),
+                "runtime": sgl_info_body.get("max_running_requests"),
+                "live_running": _sgl_any(
+                    "sglang:num_running_reqs", "sglang_num_running_reqs"
+                ),
+                "live_queued": _sgl_any(
+                    "sglang:num_queue_reqs", "sglang_num_queue_reqs"
+                ),
+            },
+            "sglang_batch_tokens": {
+                "env_prefill": env.get("SGL_MAX_PREFILL_TOKENS"),
+                "env_total": env.get("SGL_MAX_TOTAL_TOKENS"),
+                "runtime_prefill": sgl_info_body.get("max_prefill_tokens"),
+                "runtime_total": sgl_info_body.get("max_total_tokens"),
+            },
+            "sglang_dtype": {
+                "env": env.get("SGL_DTYPE"),
+                "runtime": sgl_info_body.get("dtype"),
+            },
+            "sglang_tp_size": {
+                "env": env.get("SGL_TP_SIZE"),
+                "runtime": sgl_info_body.get("tp_size"),
+            },
+            "sglang_mem_fraction": {
+                "env": env.get("SGL_MEM_FRACTION_STATIC"),
+                "runtime": sgl_info_body.get("mem_fraction_static"),
+            },
+            "sglang_chunked": {
+                "env": env.get("SGL_CHUNKED_PREFILL"),
+                "runtime": sgl_info_body.get("chunked_prefill_size")
+                or sgl_info_body.get("enable_chunked_prefill"),
+            },
+            "sglang_model": {
+                "env": env.get("SGL_MODEL_PATH"),
+                "runtime": sgl_info_body.get("model_path"),
+            },
+        }
+    )
 
 
 # Histogram bucket boundaries (seconds) for auto-generated Flask request
@@ -275,8 +332,20 @@ def runtime_summary() -> Any:
 # a single flat line. Under real OCR load a cold-start request can easily
 # exceed a minute, so extend the tail.
 _FLASK_LATENCY_BUCKETS = (
-    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
-    20.0, 30.0, 60.0, 90.0, 120.0, 180.0,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    30.0,
+    60.0,
+    90.0,
+    120.0,
+    180.0,
 )
 
 
@@ -294,13 +363,19 @@ def _install_prometheus(app):
             from prometheus_flask_exporter.multiprocess import (  # type: ignore
                 GunicornInternalPrometheusMetrics,
             )
+
             return GunicornInternalPrometheusMetrics(
-                app, path="/metrics", group_by="url_rule",
+                app,
+                path="/metrics",
+                group_by="url_rule",
                 buckets=_FLASK_LATENCY_BUCKETS,
             )
         from prometheus_flask_exporter import PrometheusMetrics  # type: ignore
+
         return PrometheusMetrics(
-            app, path="/metrics", group_by="url_rule",
+            app,
+            path="/metrics",
+            group_by="url_rule",
             buckets=_FLASK_LATENCY_BUCKETS,
         )
     except Exception as exc:  # pragma: no cover
@@ -369,6 +444,7 @@ def _install_pipeline_gauges(app):
         return response
 
     from flask import request  # local import — only needed when enabled
+
     app.before_request(_track_parse_entry)
     app.after_request(_track_parse_exit)
 
@@ -387,13 +463,18 @@ def install(app) -> None:
     except AttributeError:
         from flask import Flask
         from werkzeug.middleware.dispatcher import DispatcherMiddleware  # type: ignore
+
         side = Flask("glmocr_runtime_side")
         side.register_blueprint(bp)
         return DispatcherMiddleware(app, {"/runtime": side})
 
     _install_prometheus(app)
 
-    if os.environ.get("GLMOCR_PIPELINE_METRICS", "false").lower() in ("true", "1", "yes"):
+    if os.environ.get("GLMOCR_PIPELINE_METRICS", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    ):
         _install_pipeline_gauges(app)
 
     _install_config_gauges()
@@ -407,10 +488,29 @@ def install(app) -> None:
 # region calls to SGLang) so we can see where the request is spending
 # its time without a profiler.
 _LAYOUT_LATENCY_BUCKETS = (
-    0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    8.0,
+    12.0,
+    20.0,
 )
 _OCR_REGION_LATENCY_BUCKETS = (
-    0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
 )
 
 
@@ -480,14 +580,16 @@ def instrument_pipeline(pipeline) -> None:
                     paddle_to_all_results,
                 )
 
-                hf_home = (os.environ.get("HF_HOME")
-                           or "/root/.cache/huggingface")
+                hf_home = os.environ.get("HF_HOME") or "/root/.cache/huggingface"
                 graph_filename = (
-                    "pp_doclayout_v3_fused.onnx" if layout_graph == "fused"
+                    "pp_doclayout_v3_fused.onnx"
+                    if layout_graph == "fused"
                     else "pp_doclayout_v3.onnx"
                 )
                 onnx_path = os.path.join(
-                    hf_home, "glmocr-layout-onnx", graph_filename,
+                    hf_home,
+                    "glmocr-layout-onnx",
+                    graph_filename,
                 )
                 if not os.path.exists(onnx_path):
                     raise FileNotFoundError(
@@ -500,7 +602,9 @@ def instrument_pipeline(pipeline) -> None:
                     os.environ.get("LAYOUT_ONNX_THREADS", "1")
                 )
                 _sess = _ort.InferenceSession(
-                    onnx_path, ort_opts, providers=["CPUExecutionProvider"],
+                    onnx_path,
+                    ort_opts,
+                    providers=["CPUExecutionProvider"],
                 )
 
                 # Capture detector config + processor reference before we
@@ -533,17 +637,22 @@ def instrument_pipeline(pipeline) -> None:
 
                 del ld._model
                 import gc as _gc
+
                 _gc.collect()
                 ld._model = _NumpySentinel()
 
                 if layout_graph == "fused":
+
                     def _ort_run_fused(np_pixel_values, np_target_sizes):
-                        return _sess.run(None, {
-                            "pixel_values": np_pixel_values,
-                            "target_sizes": np_target_sizes,
-                        })
-                    _chunk_orchestrator = (
-                        lambda pixel_values, img_sizes_wh:
+                        return _sess.run(
+                            None,
+                            {
+                                "pixel_values": np_pixel_values,
+                                "target_sizes": np_target_sizes,
+                            },
+                        )
+
+                    _chunk_orchestrator = lambda pixel_values, img_sizes_wh: (
                         compute_paddle_format_results_from_fused(
                             pixel_values=pixel_values,
                             ort_run_fused=_ort_run_fused,
@@ -558,10 +667,11 @@ def instrument_pipeline(pipeline) -> None:
                         )
                     )
                 else:
+
                     def _ort_run(np_pixel_values):
                         return _sess.run(None, {"pixel_values": np_pixel_values})
-                    _chunk_orchestrator = (
-                        lambda pixel_values, img_sizes_wh:
+
+                    _chunk_orchestrator = lambda pixel_values, img_sizes_wh: (
                         compute_paddle_format_results(
                             pixel_values=pixel_values,
                             ort_run=_ort_run,
@@ -576,8 +686,12 @@ def instrument_pipeline(pipeline) -> None:
                         )
                     )
 
-                def _numpy_process(images, save_visualization=False,
-                                   global_start_idx=0, use_polygon=False):
+                def _numpy_process(
+                    images,
+                    save_visualization=False,
+                    global_start_idx=0,
+                    use_polygon=False,
+                ):
                     # Match glmocr.layout.PPDocLayoutDetector.process contract:
                     # returns (list[list[dict]], dict[int, Image]).
                     pil_images = [
@@ -586,18 +700,21 @@ def instrument_pipeline(pipeline) -> None:
                     ]
                     all_paddle_format: list = []
                     for chunk_start in range(0, len(pil_images), _ld_batch_size):
-                        chunk = pil_images[chunk_start:chunk_start + _ld_batch_size]
+                        chunk = pil_images[chunk_start : chunk_start + _ld_batch_size]
                         inputs = _ld_processor(images=chunk, return_tensors="np")
                         pixel_values = inputs["pixel_values"]
                         img_sizes_wh = [img.size for img in chunk]
                         paddle_chunk = _chunk_orchestrator(
-                            pixel_values, img_sizes_wh,
+                            pixel_values,
+                            img_sizes_wh,
                         )
                         all_paddle_format.extend(paddle_chunk)
 
                     img_sizes_wh_full = [img.size for img in pil_images]
                     all_results = paddle_to_all_results(
-                        all_paddle_format, img_sizes_wh_full, _ld_label_task_mapping,
+                        all_paddle_format,
+                        img_sizes_wh_full,
+                        _ld_label_task_mapping,
                     )
 
                     vis_images: dict = {}
@@ -605,6 +722,7 @@ def instrument_pipeline(pipeline) -> None:
                         from glmocr.utils.visualization_utils import (
                             draw_layout_boxes,
                         )
+
                         for idx, img_results in enumerate(all_paddle_format):
                             vis_images[global_start_idx + idx] = draw_layout_boxes(
                                 image=_np_mod.array(pil_images[idx]),
@@ -641,10 +759,11 @@ def instrument_pipeline(pipeline) -> None:
                 from types import SimpleNamespace as _SNS
                 import torch as _torch
 
-                hf_home = (os.environ.get("HF_HOME")
-                           or "/root/.cache/huggingface")
+                hf_home = os.environ.get("HF_HOME") or "/root/.cache/huggingface"
                 onnx_path = os.path.join(
-                    hf_home, "glmocr-layout-onnx", "pp_doclayout_v3.onnx",
+                    hf_home,
+                    "glmocr-layout-onnx",
+                    "pp_doclayout_v3.onnx",
                 )
                 if not os.path.exists(onnx_path):
                     raise FileNotFoundError(
@@ -657,7 +776,9 @@ def instrument_pipeline(pipeline) -> None:
                     os.environ.get("LAYOUT_ONNX_THREADS", "1")
                 )
                 _sess = _ort.InferenceSession(
-                    onnx_path, ort_opts, providers=["CPUExecutionProvider"],
+                    onnx_path,
+                    ort_opts,
+                    providers=["CPUExecutionProvider"],
                 )
                 _orig_model = ld._model
                 _orig_config = getattr(_orig_model, "config", None)
@@ -697,6 +818,7 @@ def instrument_pipeline(pipeline) -> None:
                 ld._model = _OnnxLayoutModel()
                 del _orig_model
                 import gc as _gc
+
                 _gc.collect()
                 print(
                     f"[layout] onnxruntime backend enabled "
@@ -716,17 +838,24 @@ def instrument_pipeline(pipeline) -> None:
         # a sentinel, so torch.compile would be a no-op (or worse, error).
         # Measured regression on the current 4-worker CPU setup (see .env),
         # so this is off by default anyway.
-        if (not _numpy_path_installed
-                and os.environ.get("LAYOUT_COMPILE", "false").lower() == "true"):
+        if (
+            not _numpy_path_installed
+            and os.environ.get("LAYOUT_COMPILE", "false").lower() == "true"
+        ):
             model = getattr(ld, "_model", None)
             if model is not None:
                 try:
                     import torch  # local import: runtime_app must not hard-depend on torch
+
                     ld._model = torch.compile(
-                        model, mode="reduce-overhead", dynamic=True,
+                        model,
+                        mode="reduce-overhead",
+                        dynamic=True,
                     )
-                    print("[layout] torch.compile enabled (mode=reduce-overhead, dynamic=True)",
-                          flush=True)
+                    print(
+                        "[layout] torch.compile enabled (mode=reduce-overhead, dynamic=True)",
+                        flush=True,
+                    )
                 except Exception as e:
                     print(f"[layout] torch.compile skipped: {e}", flush=True)
 
@@ -745,9 +874,9 @@ def instrument_pipeline(pipeline) -> None:
             from concurrent.futures import Future as _Future
 
             batch_max = max(1, int(os.environ.get("LAYOUT_BATCH_MAX", "4")))
-            window_s = max(0.0,
-                           float(os.environ.get("LAYOUT_BATCH_WINDOW_MS", "20"))
-                           / 1000.0)
+            window_s = max(
+                0.0, float(os.environ.get("LAYOUT_BATCH_WINDOW_MS", "20")) / 1000.0
+            )
             q: "_queue.Queue" = _queue.Queue()
 
             def _batcher_loop():
@@ -787,23 +916,33 @@ def instrument_pipeline(pipeline) -> None:
                             fut.set_exception(exc)
 
             t = _threading.Thread(
-                target=_batcher_loop, name="layout-batcher", daemon=True,
+                target=_batcher_loop,
+                name="layout-batcher",
+                daemon=True,
             )
             t.start()
-            print(f"[layout] batcher enabled (max={batch_max}, "
-                  f"window_ms={int(window_s*1000)})", flush=True)
+            print(
+                f"[layout] batcher enabled (max={batch_max}, "
+                f"window_ms={int(window_s * 1000)})",
+                flush=True,
+            )
 
             def _batched_layout(*args, **kwargs):
                 # Extract positional + keyword arguments matching
                 # glmocr's PPDocLayoutDetector.process signature.
                 if args:
                     images = args[0]
-                    save_viz = (args[1] if len(args) > 1
-                                else kwargs.get("save_visualization", False))
-                    gsi = (args[2] if len(args) > 2
-                           else kwargs.get("global_start_idx", 0))
-                    use_poly = (args[3] if len(args) > 3
-                                else kwargs.get("use_polygon", False))
+                    save_viz = (
+                        args[1]
+                        if len(args) > 1
+                        else kwargs.get("save_visualization", False)
+                    )
+                    gsi = (
+                        args[2] if len(args) > 2 else kwargs.get("global_start_idx", 0)
+                    )
+                    use_poly = (
+                        args[3] if len(args) > 3 else kwargs.get("use_polygon", False)
+                    )
                 else:
                     images = kwargs["images"]
                     save_viz = kwargs.get("save_visualization", False)
@@ -857,22 +996,46 @@ def instrument_pipeline(pipeline) -> None:
 # Values come from env vars present at worker-start time and never change
 # during the process lifetime.
 _CONFIG_KNOBS: tuple[tuple[str, str, str], ...] = (
-    ("glmocr_config_cpu_workers",         "CPU_WORKERS",
-     "Gunicorn worker processes in the CPU container."),
-    ("glmocr_config_cpu_threads",         "CPU_THREADS",
-     "Gthread threads per gunicorn worker."),
-    ("glmocr_config_ocr_max_workers",     "OCR_MAX_WORKERS",
-     "Per-request SGLang fan-out pool."),
-    ("glmocr_config_ocr_conn_pool",       "OCR_CONN_POOL",
-     "HTTP connection pool size for SGLang calls."),
-    ("glmocr_config_sgl_max_running",     "SGL_MAX_RUNNING_REQUESTS",
-     "SGLang concurrent-request batching cap."),
-    ("glmocr_config_sgl_max_total_tokens",   "SGL_MAX_TOTAL_TOKENS",
-     "SGLang KV-cache total-token budget."),
-    ("glmocr_config_sgl_max_prefill_tokens", "SGL_MAX_PREFILL_TOKENS",
-     "SGLang prefill-token batch cap."),
-    ("glmocr_config_sgl_chunked_size",    "SGL_CHUNKED_PREFILL_SIZE",
-     "SGLang chunked-prefill chunk size (tokens)."),
+    (
+        "glmocr_config_cpu_workers",
+        "CPU_WORKERS",
+        "Gunicorn worker processes in the CPU container.",
+    ),
+    (
+        "glmocr_config_cpu_threads",
+        "CPU_THREADS",
+        "Gthread threads per gunicorn worker.",
+    ),
+    (
+        "glmocr_config_ocr_max_workers",
+        "OCR_MAX_WORKERS",
+        "Per-request SGLang fan-out pool.",
+    ),
+    (
+        "glmocr_config_ocr_conn_pool",
+        "OCR_CONN_POOL",
+        "HTTP connection pool size for SGLang calls.",
+    ),
+    (
+        "glmocr_config_sgl_max_running",
+        "SGL_MAX_RUNNING_REQUESTS",
+        "SGLang concurrent-request batching cap.",
+    ),
+    (
+        "glmocr_config_sgl_max_total_tokens",
+        "SGL_MAX_TOTAL_TOKENS",
+        "SGLang KV-cache total-token budget.",
+    ),
+    (
+        "glmocr_config_sgl_max_prefill_tokens",
+        "SGL_MAX_PREFILL_TOKENS",
+        "SGLang prefill-token batch cap.",
+    ),
+    (
+        "glmocr_config_sgl_chunked_size",
+        "SGL_CHUNKED_PREFILL_SIZE",
+        "SGLang chunked-prefill chunk size (tokens).",
+    ),
 )
 
 

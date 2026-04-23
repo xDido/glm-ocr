@@ -30,6 +30,7 @@ Usage:
 If `--report` is omitted, the newest `*-asyncio-matrix.md` under
 loadtest/results/ is used.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -55,49 +56,65 @@ METRIC_SGL_QUEUE = "sglang:num_queue_reqs"
 # Selectors are injected into histogram queries. Scope notes clarify
 # whether the histogram counts HTTP requests or per-region calls.
 CPU_PHASES: list[tuple[str, str, str, str]] = [
-    ("Flask end-to-end",
-     "flask_http_request_duration_seconds",
-     'url_rule="/glmocr/parse",status="200"',
-     "per HTTP request"),
-    ("Layout forward (ONNX + pre/post)",
-     "glmocr_layout_seconds",
-     "",
-     "per HTTP request"),
-    ("OCR region call",
-     "glmocr_ocr_region_seconds",
-     "",
-     "per region (N per HTTP request)"),
+    (
+        "Flask end-to-end",
+        "flask_http_request_duration_seconds",
+        'url_rule="/glmocr/parse",status="200"',
+        "per HTTP request",
+    ),
+    (
+        "Layout forward (ONNX + pre/post)",
+        "glmocr_layout_seconds",
+        "",
+        "per HTTP request",
+    ),
+    (
+        "OCR region call",
+        "glmocr_ocr_region_seconds",
+        "",
+        "per region (N per HTTP request)",
+    ),
 ]
 
 # Per-trial phase decomposition — SGLang container histograms.
 SGLANG_PHASES: list[tuple[str, str, str, str]] = [
-    ("SGLang end-to-end",
-     "sglang:e2e_request_latency_seconds",
-     "",
-     "per SGLang request"),
-    ("Queue wait (scheduler)",
-     "sglang:queue_time_seconds",
-     "",
-     "per SGLang request"),
-    ("Time-to-first-token (prefill+first decode)",
-     "sglang:time_to_first_token_seconds",
-     "",
-     "per SGLang request"),
-    ("Inter-token latency (decode step)",
-     "sglang:inter_token_latency_seconds",
-     "",
-     "per decoded token"),
+    (
+        "SGLang end-to-end",
+        "sglang:e2e_request_latency_seconds",
+        "",
+        "per SGLang request",
+    ),
+    ("Queue wait (scheduler)", "sglang:queue_time_seconds", "", "per SGLang request"),
+    (
+        "Time-to-first-token (prefill+first decode)",
+        "sglang:time_to_first_token_seconds",
+        "",
+        "per SGLang request",
+    ),
+    (
+        "Inter-token latency (decode step)",
+        "sglang:inter_token_latency_seconds",
+        "",
+        "per decoded token",
+    ),
 ]
 
 
-def _prom_range(prom_url: str, query: str, start: float, end: float,
-                step: int = 1) -> list[tuple[float, float]]:
-    qs = urllib.parse.urlencode({
-        "query": query, "start": int(start), "end": int(end), "step": step,
-    })
+def _prom_range(
+    prom_url: str, query: str, start: float, end: float, step: int = 1
+) -> list[tuple[float, float]]:
+    qs = urllib.parse.urlencode(
+        {
+            "query": query,
+            "start": int(start),
+            "end": int(end),
+            "step": step,
+        }
+    )
     try:
         with urllib.request.urlopen(
-            f"{prom_url}/api/v1/query_range?{qs}", timeout=10,
+            f"{prom_url}/api/v1/query_range?{qs}",
+            timeout=10,
         ) as r:
             d = json.load(r)
     except Exception as exc:
@@ -154,13 +171,15 @@ def _fmt_ms(x: float) -> str:
 # Prometheus histogram queries over an arbitrary [start_ts, end_ts] window.
 # ---------------------------------------------------------------------------
 
+
 def _prom_instant(prom_url: str, query: str, at_ts: int) -> float:
     """Execute an instant Prometheus query at `at_ts`. Returns the first
     scalar value from the result, or NaN on any failure / empty result."""
     qs = urllib.parse.urlencode({"query": query, "time": at_ts})
     try:
         with urllib.request.urlopen(
-            f"{prom_url}/api/v1/query?{qs}", timeout=10,
+            f"{prom_url}/api/v1/query?{qs}",
+            timeout=10,
         ) as r:
             d = json.load(r)
     except Exception:
@@ -224,6 +243,7 @@ def _histogram_stats(
 # Phase decomposition rendering.
 # ---------------------------------------------------------------------------
 
+
 def render_phase_section(
     trial: dict,
     window: Optional[tuple[int, int]],
@@ -231,15 +251,11 @@ def render_phase_section(
 ) -> str:
     c = trial["concurrency"]
     interval = trial["interval"]
-    label = (f"c={c}, i={interval:g}s" if interval > 0
-             else f"c={c} (back-to-back)")
+    label = f"c={c}, i={interval:g}s" if interval > 0 else f"c={c} (back-to-back)"
     header = f"#### {label} — Mean request phase decomposition"
 
     if window is None:
-        return (
-            header
-            + "\n\n_(no matching window — phase decomposition unavailable)_\n"
-        )
+        return header + "\n\n_(no matching window — phase decomposition unavailable)_\n"
 
     start_ts, end_ts = window
 
@@ -252,7 +268,11 @@ def render_phase_section(
         ]
         for name, metric, selector, scope in phases:
             m, p50, p95, p99 = _histogram_stats(
-                prom_url, metric, selector, start_ts, end_ts,
+                prom_url,
+                metric,
+                selector,
+                start_ts,
+                end_ts,
             )
             rows.append(
                 f"| {name} | {scope} | {_fmt_ms(m)} | "
@@ -395,8 +415,7 @@ def find_windows_by_fingerprint(
     # Rank trials by wall_seconds desc so the most-distinctive (longest)
     # claim their segment first, avoiding accidental steals by shorter
     # trials with duplicate signatures.
-    trial_order = sorted(range(len(trials)),
-                         key=lambda i: -trials[i]["wall"])
+    trial_order = sorted(range(len(trials)), key=lambda i: -trials[i]["wall"])
     available = list(range(len(segments)))
     windows: dict[int, tuple[int, int]] = {}
     for ti in trial_order:
@@ -427,7 +446,7 @@ def find_windows_by_fingerprint(
         print(
             f"[augment] trial#{ti} c={trial['concurrency']} "
             f"i={trial['interval']} -> segment [{s[0]}..{s[1]}] "
-            f"dur={s[1]-s[0]}s peak={s[2]:.0f} (score={best_score:.2f})",
+            f"dur={s[1] - s[0]}s peak={s[2]:.0f} (score={best_score:.2f})",
             file=sys.stderr,
         )
     return windows
@@ -436,6 +455,7 @@ def find_windows_by_fingerprint(
 # ---------------------------------------------------------------------------
 # Augmentation rendering.
 # ---------------------------------------------------------------------------
+
 
 def render_trial_section(
     trial: dict,
@@ -491,8 +511,7 @@ def render_trial_section(
     )
 
     window_md = (
-        f"\n_Window: {start_ts}–{end_ts} "
-        f"(duration {end_ts - start_ts} s; step=1 s)_\n"
+        f"\n_Window: {start_ts}–{end_ts} (duration {end_ts - start_ts} s; step=1 s)_\n"
     )
     return "\n".join([header, "", worker_md, sgl_md, window_md])
 
@@ -518,7 +537,8 @@ def build_config_advisory(
         qs = urllib.parse.urlencode({"query": expr, "time": at})
         try:
             with urllib.request.urlopen(
-                f"{prom_url}/api/v1/query?{qs}", timeout=10,
+                f"{prom_url}/api/v1/query?{qs}",
+                timeout=10,
             ) as r:
                 d = json.load(r)
             res = d.get("data", {}).get("result") or []
@@ -531,11 +551,11 @@ def build_config_advisory(
     cfg_max_total = q("sglang:max_total_num_tokens", max_end)
 
     # Peak KV usage observed across the matrix window
-    peak_used = q(f"max_over_time(sum(sglang:num_used_tokens)[{dur}s:5s])",
-                  max_end)
+    peak_used = q(f"max_over_time(sum(sglang:num_used_tokens)[{dur}s:5s])", max_end)
     # Peak concurrent running requests
     peak_running = q(
-        f"max_over_time(sum(sglang:num_running_reqs)[{dur}s:5s])", max_end,
+        f"max_over_time(sum(sglang:num_running_reqs)[{dur}s:5s])",
+        max_end,
     )
     # Peak prompt + generation tokens in any single SGLang request.
     # histogram_quantile(1.0, ...) gives the bucket upper-bound of the
@@ -548,18 +568,19 @@ def build_config_advisory(
     # For per-request token length, the best proxy we have is the
     # total-tokens / total-requests ratio — plus the max-over-time of
     # the running-KV / running-req ratio as an overestimate.
-    total_prompt = q(f"sum(increase(sglang:prompt_tokens_total[{dur}s]))",
-                     max_end)
-    total_gen = q(f"sum(increase(sglang:generation_tokens_total[{dur}s]))",
-                  max_end)
-    total_req = q(f"sum(increase(sglang:num_requests_total[{dur}s]))",
-                  max_end)
+    total_prompt = q(f"sum(increase(sglang:prompt_tokens_total[{dur}s]))", max_end)
+    total_gen = q(f"sum(increase(sglang:generation_tokens_total[{dur}s]))", max_end)
+    total_req = q(f"sum(increase(sglang:num_requests_total[{dur}s]))", max_end)
     mean_prompt = total_prompt / total_req if total_req > 0 else math.nan
     mean_gen = total_gen / total_req if total_req > 0 else math.nan
     mean_total = mean_prompt + mean_gen if total_req > 0 else math.nan
 
     # ---- Advisory logic -------------------------------------------------
-    kv_util = peak_used / cfg_max_total if cfg_max_total and cfg_max_total == cfg_max_total else math.nan
+    kv_util = (
+        peak_used / cfg_max_total
+        if cfg_max_total and cfg_max_total == cfg_max_total
+        else math.nan
+    )
 
     max_total_advice: str
     if kv_util != kv_util:
@@ -567,21 +588,21 @@ def build_config_advisory(
     elif kv_util >= 0.90:
         max_total_advice = (
             f"**Raise** — peak used {peak_used:.0f}/{cfg_max_total:.0f} "
-            f"({kv_util*100:.0f}%). KV pool is nearly saturated, so new "
+            f"({kv_util * 100:.0f}%). KV pool is nearly saturated, so new "
             f"requests are queueing. Increase VRAM fraction or drop the "
             f"context length to grow the effective ceiling."
         )
     elif kv_util <= 0.40:
         max_total_advice = (
             f"**Consider lowering** — peak used only {peak_used:.0f}/{cfg_max_total:.0f} "
-            f"({kv_util*100:.0f}%). The configured ceiling is well above "
+            f"({kv_util * 100:.0f}%). The configured ceiling is well above "
             f"what the workload actually needs; you could reclaim VRAM "
             f"for CUDA graphs / activations."
         )
     else:
         max_total_advice = (
             f"**Hold** — peak used {peak_used:.0f}/{cfg_max_total:.0f} "
-            f"({kv_util*100:.0f}%). Comfortable middle band."
+            f"({kv_util * 100:.0f}%). Comfortable middle band."
         )
 
     # SGL_CONTEXT_LENGTH advice: compare mean/max per-request total tokens
@@ -626,7 +647,7 @@ def build_config_advisory(
         "\n"
         "| Knob | .env value | Observed | Advice |\n"
         "|---|---:|---:|---|\n"
-        f"| `sglang:max_total_num_tokens` (effective) | {int(cfg_max_total) if cfg_max_total == cfg_max_total else '—'} | peak used {int(peak_used) if peak_used == peak_used else '—'} ({kv_util*100:.0f}% util) | {max_total_advice} |\n"
+        f"| `sglang:max_total_num_tokens` (effective) | {int(cfg_max_total) if cfg_max_total == cfg_max_total else '—'} | peak used {int(peak_used) if peak_used == peak_used else '—'} ({kv_util * 100:.0f}% util) | {max_total_advice} |\n"
         f"| `SGL_CONTEXT_LENGTH` | 4096 (per .env) | mean req {int(mean_total) if mean_total == mean_total else '—'} tok (prompt {int(mean_prompt) if mean_prompt == mean_prompt else '—'} + gen {int(mean_gen) if mean_gen == mean_gen else '—'}) | {ctx_advice} |\n"
         f"| `SGL_MAX_RUNNING_REQUESTS` | (from .env) | peak {int(peak_running) if peak_running == peak_running else '—'} concurrent | Hold unless peak approaches the configured cap for long stretches. |\n"
         "\n"
@@ -667,6 +688,7 @@ def build_augmentation_section(
 # Entrypoint.
 # ---------------------------------------------------------------------------
 
+
 def _find_latest_matrix_report(results_dir: pathlib.Path) -> Optional[pathlib.Path]:
     candidates = sorted(
         results_dir.glob("*-asyncio-matrix.md"),
@@ -678,28 +700,39 @@ def _find_latest_matrix_report(results_dir: pathlib.Path) -> Optional[pathlib.Pa
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--report", type=pathlib.Path, default=None,
-                   help="matrix markdown report to augment; defaults to "
-                        "the newest *-asyncio-matrix.md under "
-                        "loadtest/results/")
+    p.add_argument(
+        "--report",
+        type=pathlib.Path,
+        default=None,
+        help="matrix markdown report to augment; defaults to "
+        "the newest *-asyncio-matrix.md under "
+        "loadtest/results/",
+    )
     p.add_argument("--prometheus-url", default="http://localhost:9090")
-    p.add_argument("--results-dir", type=pathlib.Path,
-                   default=pathlib.Path("loadtest/results"))
-    p.add_argument("--windows-json", type=pathlib.Path, default=None,
-                   help="Explicit per-trial windows. JSON file shaped as "
-                        '[{"c": 12, "interval": 0, "start": 1776778532, '
-                        '"end": 1776778820}, ...]. Used when Prometheus '
-                        "segment fingerprinting can't disambiguate trials "
-                        "(e.g. multiple paced c=1 trials in one coalesced "
-                        "segment). Overrides fingerprint matching for any "
-                        "(c, interval) pair listed here; fingerprint "
-                        "matching still applies to trials not in the file.")
+    p.add_argument(
+        "--results-dir", type=pathlib.Path, default=pathlib.Path("loadtest/results")
+    )
+    p.add_argument(
+        "--windows-json",
+        type=pathlib.Path,
+        default=None,
+        help="Explicit per-trial windows. JSON file shaped as "
+        '[{"c": 12, "interval": 0, "start": 1776778532, '
+        '"end": 1776778820}, ...]. Used when Prometheus '
+        "segment fingerprinting can't disambiguate trials "
+        "(e.g. multiple paced c=1 trials in one coalesced "
+        "segment). Overrides fingerprint matching for any "
+        "(c, interval) pair listed here; fingerprint "
+        "matching still applies to trials not in the file.",
+    )
     args = p.parse_args()
 
     report = args.report or _find_latest_matrix_report(args.results_dir)
     if not report or not report.exists():
-        print(f"[augment] no matrix report found under {args.results_dir}",
-              file=sys.stderr)
+        print(
+            f"[augment] no matrix report found under {args.results_dir}",
+            file=sys.stderr,
+        )
         return 1
     print(f"[augment] augmenting {report}")
 
@@ -716,11 +749,14 @@ def main() -> int:
     # typically ≥60 s).
     now = int(time.time())
     window_start = now - 4 * 60 * 60
-    timeline = _prom_range(args.prometheus_url, METRIC_IN_FLIGHT,
-                           window_start, now, step=5)
+    timeline = _prom_range(
+        args.prometheus_url, METRIC_IN_FLIGHT, window_start, now, step=5
+    )
     if not timeline:
-        print("[augment] no in-flight samples from Prometheus — is it up?",
-              file=sys.stderr)
+        print(
+            "[augment] no in-flight samples from Prometheus — is it up?",
+            file=sys.stderr,
+        )
         return 3
 
     # Fingerprint-match each trial to a Prometheus segment by
@@ -738,17 +774,17 @@ def main() -> int:
             for i, t in enumerate(trials):
                 if (t["concurrency"], t["interval"]) == key:
                     matched[i] = (int(entry["start"]), int(entry["end"]))
-                    print(f"[augment] explicit window override for "
-                          f"c={key[0]} i={key[1]}: "
-                          f"[{entry['start']}..{entry['end']}]",
-                          file=sys.stderr)
+                    print(
+                        f"[augment] explicit window override for "
+                        f"c={key[0]} i={key[1]}: "
+                        f"[{entry['start']}..{entry['end']}]",
+                        file=sys.stderr,
+                    )
                     break
 
     n_matched = sum(1 for w in matched if w is not None)
-    print(f"[augment] matched {n_matched}/{len(trials)} trials to "
-          f"Prometheus windows")
-    augmentation = build_augmentation_section(trials, matched,
-                                              args.prometheus_url)
+    print(f"[augment] matched {n_matched}/{len(trials)} trials to Prometheus windows")
+    augmentation = build_augmentation_section(trials, matched, args.prometheus_url)
 
     # Append the new section before the final "## Observability pointers"
     # section if present, else append at the end.
