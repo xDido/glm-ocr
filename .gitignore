@@ -18,3 +18,10 @@ node_modules/
 # Claude Code session state + ephemeral fetch dir
 .claude/
 .tmp_fetch/
+
+# Layout-swap benchmark artifacts (cloned OmniDocBench repo + 1651 generated predictions)
+eval/OmniDocBench/
+eval/predictions/
+results/
+docs.zip
+

@@ -101,6 +101,10 @@ services:
       LAYOUT_USE_POLYGON: ${LAYOUT_USE_POLYGON}
       LAYOUT_MODEL_DIR: ${LAYOUT_MODEL_DIR:-PaddlePaddle/PP-DocLayoutV3_safetensors}
       LAYOUT_BACKEND: ${LAYOUT_BACKEND:-torch}
+      # LAYOUT_VARIANT=paddle2onnx swaps the entire layout graph for the
+      # alex-dinh/PP-DocLayoutV3-ONNX export (same weights, no baked
+      # batch=1). Takes precedence over LAYOUT_BACKEND/LAYOUT_POSTPROC.
+      LAYOUT_VARIANT: ${LAYOUT_VARIANT:-torch}
       LAYOUT_ONNX_THREADS: ${LAYOUT_ONNX_THREADS:-1}
       # Phase 1 — numpy post-processing (drop torch from request path).
       # torch = upstream default, safe fallback | numpy = no-torch hot path.

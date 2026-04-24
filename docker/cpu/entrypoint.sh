@@ -31,6 +31,25 @@ if [[ "${LAYOUT_ENABLED,,}" == "true" && "${LAYOUT_BACKEND,,}" == "onnx" ]]; the
     python /app/export_layout_onnx.py
 fi
 
+# Paddle2ONNX variant: fetch alex-dinh/PP-DocLayoutV3-ONNX into the hf-cache
+# if not already present. Idempotent — the check is a plain -f so mounting an
+# already-populated cache skips the curl. Unlike the torch export, there's no
+# source to re-derive from, so this is download-or-nothing.
+if [[ "${LAYOUT_VARIANT,,}" == "paddle2onnx" ]]; then
+    : "${HF_HOME:=/root/.cache/huggingface}"
+    PADDLE_ONNX_PATH="${HF_HOME}/glmocr-layout-onnx/pp_doclayout_v3_paddle2onnx.onnx"
+    if [[ ! -f "${PADDLE_ONNX_PATH}" ]]; then
+        echo "[entrypoint] LAYOUT_VARIANT=paddle2onnx -> fetching model (~131 MB)"
+        mkdir -p "$(dirname "${PADDLE_ONNX_PATH}")"
+        curl -fsSL \
+            -o "${PADDLE_ONNX_PATH}" \
+            "https://huggingface.co/alex-dinh/PP-DocLayoutV3-ONNX/resolve/main/PP-DocLayoutV3.onnx"
+        echo "[entrypoint] fetched $(du -h "${PADDLE_ONNX_PATH}" | cut -f1) → ${PADDLE_ONNX_PATH}"
+    else
+        echo "[entrypoint] paddle2onnx model already cached at ${PADDLE_ONNX_PATH}"
+    fi
+fi
+
 # Multi-worker Prometheus metrics need a shared tmpfs-style dir. Wipe it on
 # start so stale dead-worker values from previous boots don't pollute the
 # aggregation.

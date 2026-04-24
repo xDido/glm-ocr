@@ -62,6 +62,7 @@ COPY export_layout_onnx.py /app/export_layout_onnx.py
 COPY wsgi.py /app/wsgi.py
 COPY runtime_app.py /app/runtime_app.py
 COPY layout_postprocess.py /app/layout_postprocess.py
+COPY layout_paddle2onnx.py /app/layout_paddle2onnx.py
 COPY async_app.py /app/async_app.py
 COPY gunicorn_conf.py /app/gunicorn_conf.py
 COPY config.yaml.template /app/config.yaml.template

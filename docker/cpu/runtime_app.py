@@ -568,9 +568,119 @@ def instrument_pipeline(pipeline) -> None:
         layout_backend = os.environ.get("LAYOUT_BACKEND", "torch").lower()
         layout_postproc = os.environ.get("LAYOUT_POSTPROC", "torch").lower()
         layout_graph = os.environ.get("LAYOUT_GRAPH", "raw").lower()
+        # LAYOUT_VARIANT=paddle2onnx swaps the whole layout backend for
+        # the alex-dinh/PP-DocLayoutV3-ONNX graph (Paddle2ONNX export of
+        # the same weights). The torch export bakes batch=1 into several
+        # Reshape initializers — see docs/OPTIMIZATIONS.md. The Paddle
+        # export has no baked dims and batch>1 works cleanly. Takes
+        # precedence over LAYOUT_BACKEND / LAYOUT_POSTPROC when set.
+        layout_variant = os.environ.get("LAYOUT_VARIANT", "torch").lower()
         _numpy_path_installed = False
 
-        if layout_backend == "onnx" and layout_postproc == "numpy":
+        if layout_variant == "paddle2onnx":
+            try:
+                import onnxruntime as _ort
+                from layout_paddle2onnx import run_paddle_layout_pipeline
+
+                hf_home = os.environ.get("HF_HOME") or "/root/.cache/huggingface"
+                paddle_onnx_path = os.path.join(
+                    hf_home,
+                    "glmocr-layout-onnx",
+                    "pp_doclayout_v3_paddle2onnx.onnx",
+                )
+                if not os.path.exists(paddle_onnx_path):
+                    raise FileNotFoundError(
+                        f"Paddle2ONNX graph missing at {paddle_onnx_path}. "
+                        "Fetch with: curl -fsSL -o "
+                        f"{paddle_onnx_path} "
+                        "https://huggingface.co/alex-dinh/PP-DocLayoutV3-ONNX/"
+                        "resolve/main/PP-DocLayoutV3.onnx"
+                    )
+
+                _paddle_opts = _ort.SessionOptions()
+                _paddle_opts.intra_op_num_threads = int(
+                    os.environ.get("LAYOUT_ONNX_THREADS", "1")
+                )
+                _paddle_sess = _ort.InferenceSession(
+                    paddle_onnx_path,
+                    _paddle_opts,
+                    providers=["CPUExecutionProvider"],
+                )
+
+                # glmocr uses a collapsed label vocabulary
+                # (display_formula + inline_formula → formula, etc.) that
+                # its label_task_mapping router knows. The Paddle2ONNX
+                # config.json uses the more granular original names.
+                # Class IDs are identical (same weights), so reusing
+                # glmocr's dict is the correct paddle→torch alignment.
+                _ld_id2label = dict(ld._model.config.id2label)
+                _ld_label_task_mapping = ld.label_task_mapping
+                _ld_threshold = ld.threshold
+                _ld_threshold_by_class = ld.threshold_by_class or {}
+                _ld_layout_nms = ld.layout_nms
+                _ld_layout_unclip_ratio = ld.layout_unclip_ratio
+                _ld_layout_merge_bboxes_mode = ld.layout_merge_bboxes_mode
+                _ld_batch_size = max(1, int(ld.batch_size))
+
+                # Same sentinel dance as the torch+numpy path — drop the
+                # torch model so gunicorn doesn't pay its RAM, while
+                # passing glmocr.start()'s not-None check.
+                class _PaddleSentinel:
+                    def __call__(self, *_a, **_kw):
+                        raise RuntimeError(
+                            "_PaddleSentinel invoked — LAYOUT_VARIANT=paddle2onnx "
+                            "bypasses ld._model; check ld.process override."
+                        )
+
+                del ld._model
+                import gc as _gc
+                _gc.collect()
+                ld._model = _PaddleSentinel()
+
+                def _paddle_process(
+                    images,
+                    save_visualization=False,
+                    global_start_idx=0,
+                    use_polygon=False,
+                ):
+                    pil_images = [
+                        img.convert("RGB") if img.mode != "RGB" else img
+                        for img in images
+                    ]
+                    all_results = run_paddle_layout_pipeline(
+                        pil_images,
+                        _paddle_sess,
+                        label_task_mapping=_ld_label_task_mapping,
+                        id2label=_ld_id2label,
+                        threshold=_ld_threshold,
+                        threshold_by_class=_ld_threshold_by_class,
+                        layout_nms=_ld_layout_nms,
+                        layout_unclip_ratio=_ld_layout_unclip_ratio,
+                        layout_merge_bboxes_mode=_ld_layout_merge_bboxes_mode,
+                        batch_size=_ld_batch_size,
+                    )
+                    # Visualization path intentionally not implemented —
+                    # batch bench doesn't exercise it. Add if needed.
+                    return all_results, {}
+
+                ld.process = _paddle_process
+                _numpy_path_installed = True
+                print(
+                    f"[layout] paddle2onnx backend enabled "
+                    f"(path={paddle_onnx_path}, "
+                    f"intra_op={_paddle_opts.intra_op_num_threads}); "
+                    f"torch model weights released; "
+                    f"batch>1 works — LAYOUT_BATCH_ENABLED can be true",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[layout] paddle2onnx backend unavailable, "
+                    f"falling back: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+
+        if not _numpy_path_installed and layout_backend == "onnx" and layout_postproc == "numpy":
             try:
                 import numpy as _np_mod
                 import onnxruntime as _ort
