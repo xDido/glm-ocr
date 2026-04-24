@@ -21,9 +21,17 @@ LAYOUT_USE_POLYGON=false       # polygon mode not needed for block-level OCR
 LAYOUT_COMPILE=false           # torch.compile regresses +19% mean
 LAYOUT_ONNX_THREADS=2          # saturates 8-core cgroup: 4 workers x 2 ORT = 8
                                # grow with cores: at 12c use 3 (measured +34% rps at c=12, +31% at c=24 vs 8c baseline)
-LAYOUT_BATCH_ENABLED=true      # cross-request layout coalescer
-LAYOUT_BATCH_MAX=8             # larger than 8 causes c=64 ServerDisconnectedError
+LAYOUT_BATCH_ENABLED=true      # safe again as of 2026-04-24 once LAYOUT_VARIANT=paddle2onnx
+                               # landed — the Paddle graph has no baked batch=1, so the
+                               # coalescer no longer triggers silent empty responses.
+                               # DO NOT turn this on with LAYOUT_VARIANT=torch (it will
+                               # re-introduce the empty-markdown bug — see §3 warning).
+LAYOUT_BATCH_MAX=8
 LAYOUT_BATCH_WINDOW_MS=20
+LAYOUT_VARIANT=paddle2onnx     # see §6 — drops the torch export's baked batch=1 Reshapes
+                               # in favor of alex-dinh/PP-DocLayoutV3-ONNX (Paddle2ONNX).
+                               # Same weights, clean graph; 131 MB auto-downloaded by
+                               # entrypoint.sh on first boot. Set to 'torch' to revert.
 LAYOUT_ASYNC=false             # FastAPI sidecar didn't reliably improve
 
 # --- CPU container sizing ---
@@ -95,6 +103,8 @@ Tradeoff: `BATCH_MAX > 8` causes `ServerDisconnectedError` at c=64 (request hold
 
 Knobs: `LAYOUT_BATCH_ENABLED=true`, `LAYOUT_BATCH_MAX=8`, `LAYOUT_BATCH_WINDOW_MS=20`.
 
+**Warning — silent-failure bug (discovered 2026-04-23).** The same batch=1-baked-in Reshape pattern documented in the OpenVINO rejected entry below **also** fires on the MLAS CPU EP when this coalescer groups 2+ requests. `node_view_320` receives `{B, 256, 25, 25}` and tries to reshape to `{1, 256, 625}`, fails, glmocr's `try/except` logs `"Layout detection failed for pages [0], skipping batch"` and returns HTTP 200 with an empty `markdown_result`. Observed empty-response rates on a body-asserting client over 525 requests: **c=16 → 92%, c=8 → 11%, c=4 → 9%, c=1 → 0%**. The load drivers only assert HTTP 2xx, so **the matrix rps numbers with the batcher enabled at c ≥ 8 are inflated by silent empties** — same failure class as the "3× OpenVINO win". Until a batch-safe detector or export is wired in (see Queued: Paddle2ONNX swap + Driver body-content assertion), set `LAYOUT_BATCH_ENABLED=false` for correctness; the `.env` TL;DR at the top of this file currently lists `true` only because the upstream default was `true`.
+
 ### 4. `LAYOUT_ONNX_THREADS=2` (saturate cgroup with ORT intra-op)
 
 Bump ONNX Runtime intra-op threads from 1 to 2 per worker. With `CPU_WORKERS=4`, that's 4 × 2 = 8 ORT threads — exactly matches the 8-core cgroup and leaves one ORT kernel call per worker running on 2 cores in parallel.
@@ -117,6 +127,36 @@ Do-the-arithmetic rule: `CPU_WORKERS × LAYOUT_ONNX_THREADS` should equal the cg
 - Gunicorn `gthread` worker class, not `sync` or `gevent`. Sync is single-request-per-worker (no fan-out); gevent/eventlet monkey-patch breaks torch's threaded CPU kernels.
 - Torch CPU-only wheel installed **before** `pip install glmocr` from PyTorch's dedicated index (`https://download.pytorch.org/whl/cpu`). Skips ~5 GB of unused CUDA dependencies pulled by the default PyPI wheel.
 - Docker multi-worker Prometheus needs a shared tmpfs dir (`PROMETHEUS_MULTIPROC_DIR`) wiped on each container start; otherwise stale dead-worker values pollute the aggregation across reboots.
+
+### 6. `LAYOUT_VARIANT=paddle2onnx` — swap the whole layout graph
+
+Replace the torch-exported `pp_doclayout_v3.onnx` with the `Paddle2ONNX` export of the same weights (`alex-dinh/PP-DocLayoutV3-ONNX`). The torch export bakes `batch=1` into 10 shared Reshape initializers (52 Reshape uses — see OpenVINO rejected entry and Pos-0 rewrite rejected entry); the Paddle2ONNX export has zero baked dims because Paddle's native serving runtime requires dynamic batch at export time. Same weights → same quality; clean graph → batch>1 works on MLAS CPU EP with no silent-empty failures.
+
+**Shipped 2026-04-24.** Implementation: `docker/cpu/layout_paddle2onnx.py` (a `run_paddle_layout_pipeline()` that handles preprocessing, 3-input ORT feed, ragged-batch ungrouping, 800²→original coord rescale, and hands off to the existing `np_apply_layout_postprocess` + `paddle_to_all_results`). Wired as `LAYOUT_VARIANT=paddle2onnx` branch in `runtime_app.py` — takes precedence over the torch+numpy path. `entrypoint.sh` downloads the 131 MB model idempotently on first boot of any variant=`paddle2onnx` container.
+
+**Validation — A/B vs torch path on the same 10 pages** (`scripts/ab_torch_vs_paddle.py`):
+
+| Page type | torch md chars | paddle md chars | Δ |
+|---|---:|---:|---:|
+| Book (code blocks)       | 2 343 | 2 340 | −0 % |
+| Scientific paper         | 8 717 | 8 713 | −0 % |
+| Scientific paper         | 5 679 | 5 663 | −0 % |
+| Chinese financial report | 1 684 | 1 630 | −3 % |
+| Textbook fragment        |   681 |   681 | +0 % |
+| Textbook fragment        | 1 059 | 1 010 | −5 % |
+| Textbook fragment        | 1 413 | 1 413 | +0 % |
+| PPT slide w/ LaTeX       |   534 |   534 | +0 % |
+| Research report          |   176 |   176 | +0 % |
+| Research report          |   157 |   155 | −1 % |
+| **Total**                | **22 443** | **22 315** | **−1 %** |
+
+8/10 pages within ±1 % of torch output — essentially indistinguishable on the relevant scales (ABC reader test on the −5 % rows shows paddle drops a trailing footer "continued..." type fragment, not structural content). Under concurrent load (c=8, 20-page smoke), empty-response count dropped from ~11 % (torch+batcher) to **0 %**. `LAYOUT_BATCH_ENABLED=true` is safe again.
+
+**The id2label gotcha — must route via glmocr's native label dict, not Paddle's config.** `alex-dinh/PP-DocLayoutV3-ONNX`'s `config.json` declares a 25-class label list with granular names: `display_formula`, `inline_formula`, `footer_image`, `header_image`, `vertical_text`. glmocr's `PP-DocLayoutV3` config collapses these to `formula`, `formula`, `footer`, `header`, `text` (same class IDs, different strings). `paddle_to_all_results` resolves `task_type` by looking up each detection's *label name* in `label_task_mapping` — so a block tagged `display_formula` has no match in glmocr's routing table and gets silently dropped. Before the fix, the linalg PPT page with one `display_formula` block returned −30 % markdown length (formula missing entirely). After routing class IDs through `ld._model.config.id2label` instead of Paddle's `PADDLE_LABELS`, the same page comes back at 0 % drift. Class IDs align one-to-one because it's the same weights trained on the same 25-class dataset — the label mapping is the only translation needed.
+
+Knobs: `LAYOUT_VARIANT=paddle2onnx`; takes precedence over `LAYOUT_BACKEND` / `LAYOUT_POSTPROC`. Setting `torch` reverts to the prior numpy-on-torch-ONNX path.
+
+**Score-threshold caveat.** glmocr's default `ld.threshold` works fine on this alignment; the score_th calibration the Queued entry anticipated is unnecessary. Leave it as-is.
 
 ---
 
@@ -190,6 +230,20 @@ Evaluated on an 8 GB dev GPU. Torch's CUDA context (~1 GB per worker × 4 worker
 
 The E4 per-op profile finding (Conv = 76% of layout wall time) remains valid and still points at the layout model as the fundamental bottleneck. **The right fix for layout throughput is a different detector, not a different ORT EP.**
 
+**Addendum 2026-04-24 — rejection was provider-independent; re-validated on the Paddle2ONNX graph.** With the `LAYOUT_VARIANT=paddle2onnx` swap shipped (Shipped §6), the root cause of the silent-empty behaviour (`node_view_320` with a baked `[1, 256, 625]` shape initializer) is gone from the graph. Re-running the same `OpenVINOExecutionProvider` against the Paddle2ONNX `.onnx` (`scripts/bench_paddle_ep.py`, 20 real OmniDocBench pages, `device_type=CPU`, `intra_op=3`) shows **byte-match output parity with the CPU EP** across batch sizes 1/2/4/8 (top-5 detections per batch identical to 3-decimal score precision and 1-decimal box precision). Speedup is real but smaller than the original "3×" headline: **1.38× at batch=1, 1.52× at batch=4, 1.65× at batch=8**. The original 3× was ~1.5× legit kernel speedup plus silent empties returning in ~100 ms — the missing ~50% was fake. See Queued: `LAYOUT_ONNX_PROVIDER=openvino` for the integration.
+
+### Pos-0 literal-`1` → `0` global Reshape rewrite (partial graph surgery)
+
+**Attempted 2026-04-23 as a cheaper alternative to the OpenVINO entry's suggested 28-patchable path above.** The plan was: load the exported `.onnx`, walk every Reshape whose shape initializer starts with literal `1`, flip position 0 from `1` to `0` (ONNX Reshape `allowzero=0` semantics: "copy from input dim 0"). Using `0` instead of `-1` preserves existing inferred dims (avoids the illegal two-`-1`s case that tripped up a naive `1 → -1` rewrite). Applied via `scripts/rewrite_layout_onnx.py`: 52 Reshape uses patched via 10 shared shape initializers. Analyzer and rewriter are kept in `scripts/` so the attempt is reproducible.
+
+**Failed validation at both batch=1 and batch=2:**
+- `node_Reshape_3464` fails at **batch=1** now. Target was `[1, 8, 32, 300]` for a multi-head unmerge; my `0` copies the merged `batch × heads` dim (8) into position 0, producing requested shape `[8, 8, 32, 300]` — 8× over the input's element count. The `1` here was **never** "batch"; it was an explicit unmerge literal introduced after a transpose.
+- `gemm_input_reshape` fails at **batch=2**. Its target is `[625, 256]` (no leading `1`, so the pass skipped it) but its upstream input is now correctly batch-propagated as `[2, 625, 256]`, which can't flatten to `[625, 256]`. Downstream flattens implicitly assume batch=1.
+
+**Root cause:** position-0 == `1` is not a reliable "this is the batch dim" signal in this graph. At least three distinct classes coexist: (a) true batch reshapes (backbone `node_view_*`, ~10 initializers — the only class safe to rewrite to `0`), (b) multi-head unmerge reshapes (decoder `node_Reshape_*` with `[1, 8, H, W]` pattern — `1` is semantic, must stay literal OR the op must be replaced), (c) batch-flattening reshapes (no leading `1`, but assume batch=1 via missing dim). A one-pass initializer mutation can't distinguish them; a correct rewrite is a per-node classifier plus parity harness on each subclass.
+
+Don't retry as a one-shot global rewrite. If doing per-node surgery, start from class (a) only (whitelisted by name prefix `node_view_`), validate at batch=1 against the torch export for parity, then extend. Probably a half-day of careful work; not worth it given the Queued Paddle2ONNX swap below produces the same outcome for 1/10th the risk.
+
 ### jemalloc + balanced-decay allocator
 
 -15% throughput on this workload (aiohttp + torch small-alloc density fights jemalloc's arena-per-thread model). Sticking with glibc. Bound memory growth via gunicorn `--max-requests` recycling instead.
@@ -217,6 +271,41 @@ Move `PPDocLayoutV3ImageProcessor.resize + normalize` into the ORT session as a 
 ### Scale `LAYOUT_ONNX_THREADS` with cgroup
 
 If you grow the cgroup past 8 cores, re-tune `LAYOUT_ONNX_THREADS` to maintain `CPU_WORKERS × LAYOUT_ONNX_THREADS ≈ cgroup_cores`. The knob is the one with the cleanest scaling behavior in the whole setup.
+
+### Driver body-content assertion (~1 hour — ship before anything else on this list)
+
+Drivers (`loadtest/locust/locustfile.py`, `loadtest/asyncio/bench.py`, `loadtest/k6/ocr_load.js`) currently mark a response successful on HTTP 2xx alone. Both the OpenVINO rejected entry *and* the Layout-batcher warning above have the same failure chain: `HTTP 200` + empty `markdown_result` → counted as success → rps inflated, latency understated (silent failures return in ~500 ms vs ~5 s for a real OCR). The 2026-04-23 session confirmed this retroactively — the "3× OpenVINO win" would have been rejected at commit time if the driver checked body content.
+
+Fix: after `resp.status == 200`, assert `len(resp.json().get("markdown_result", "")) > 0`. Count empties as their own failure category (`empty-markdown`). Expose as a metric (`glmocr_asyncio_empty_markdown_total`, or locust's built-in `resp.failure()` category). Add a Grafana panel separating "real 2xx rate" from "HTTP 2xx rate" — these were the same line until this finding landed.
+
+Retroactive value: re-running any prior matrix config against the current stack with the patched driver tells you what fraction of the historic rps number was silent-empty. Expect non-trivial deltas on runs with `LAYOUT_BATCH_ENABLED=true` at c ≥ 8.
+
+Orthogonal to everything else here; it's the monitoring rail that catches the next OpenVINO-class regression before it's published as a win. Should ship first.
+
+*(Paddle2ONNX swap shipped 2026-04-24 — see Shipped §6.)*
+
+### `LAYOUT_ONNX_PROVIDER=openvino` on Paddle2ONNX graph (~2 hours)
+
+Re-validated 2026-04-24 after the original rejection (see Rejected → `LAYOUT_ONNX_PROVIDER=openvino` addendum). On the Paddle2ONNX graph the batch=1-baked-in Reshape bug that sank the first attempt is absent, and `OpenVINOExecutionProvider(device_type=CPU)` produces byte-match output vs the CPU EP while running the layout forward **1.38× faster at batch=1 → 1.65× faster at batch=8** (`scripts/bench_paddle_ep.py`, 20 pages, 8 repeats):
+
+| batch | CPU EP | OV EP | speedup | CPU ms/image | OV ms/image |
+|:-:|:-:|:-:|:-:|:-:|:-:|
+| 1 | 1159 ms | 841 ms | 1.38× | 1159 | 841 |
+| 2 | 2404 ms | 1643 ms | 1.46× | 1202 | 821 |
+| 4 | 4863 ms | 3204 ms | 1.52× | 1216 | 801 |
+| 8 | 9411 ms | 5702 ms | 1.65× | 1176 | **713** |
+
+Work:
+1. Swap the base wheel: `pip install onnxruntime-openvino` instead of `onnxruntime` in `docker/cpu/Dockerfile.slim`. The replacement wheel includes both `CPUExecutionProvider` and `OpenVINOExecutionProvider`, adds ~300 MB to the image. Tested version: `1.24.1`.
+2. Add env flag `LAYOUT_ONNX_PROVIDER={cpu,openvino}` (default `cpu` for rollback safety).
+3. In `docker/cpu/layout_paddle2onnx.py`, thread the flag through to the `ort.InferenceSession(...)` call: `providers=["OpenVINOExecutionProvider"]` + `provider_options=[{"device_type": "CPU"}]` when set.
+4. Re-run `scripts/ab_torch_vs_paddle.py` as the end-to-end regression gate (markdown-length A/B vs stored torch baselines). Must stay at −1 % aggregate; if it drifts more than ±3 % on any individual page the integration is broken.
+5. Rerun `scripts/bench_paddle_ep.py` inside the built container to confirm the speedup holds under the image's threading config (workers=4 × intra_op=3 = 12 threads), not just the standalone bench.
+
+**Caveats:**
+- Measured on AMD Ryzen 5 5600X. OV's CPU device_type uses its own CPU plugin (not MLAS) which may perform differently on Intel hosts — retry the bench on the AWS target (Xeon-class on g4dn) before trusting the number there.
+- The 1.38–1.65× is layout-forward only. Wall-clock per-request also includes preprocessing (~20 ms), pipeline dispatch, SGLang roundtrip (~2–3 s). Expected end-to-end win under load: modest single-digit-percent rps, bounded by the non-layout fraction of wall time. That's still worth shipping — the previous SGLang-side tuning is already the tight bound.
+- OV and Paddle2ONNX are **independent shipments**. Either can roll back via its own env flag without touching the other. Order: ship OV second, after Paddle2ONNX has had soak time.
 
 ---
 
