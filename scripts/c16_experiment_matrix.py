@@ -1,8 +1,20 @@
-"""Run c=16 through a sequence of single-knob experiments and report deltas.
+"""Run single-knob experiments and report TTFT deltas with multi-rep averaging.
 
 Each experiment: apply env override → restart affected container → wait
-healthy → fire 20 requests @ c=16 → capture CPU + SGLang metrics → revert
-the env change → next.
+healthy → fire N requests @ c `reps` times → capture CPU + SGLang metrics →
+revert env → next.
+
+The multi-rep design (`--reps N`) is load-bearing: single-burst numbers
+at c≥16 have ±150% rps noise on this 8 GB card per the session's
+feedback_matrix_noise.md update. By running each config N times
+back-to-back (NO env revert between reps, so cache state is comparable)
+and reporting median + IQR, we get signal on TTFT/prefix-cache even
+at c=16.
+
+TTFT-related metrics have much tighter distributions than end-to-end
+rps (they're per-region histograms, not wall-to-count ratios), so
+this harness ranks configs on `ttft_mean_s` / `decode_only_s` /
+`prefix_cache_hit_pct` — NOT rps.
 
 Baseline (shipped 2026-04-24):
   LAYOUT_VARIANT=paddle2onnx, LAYOUT_ONNX_PROVIDER=openvino,
@@ -13,13 +25,16 @@ Baseline (shipped 2026-04-24):
 
 Usage (from repo root, stack up):
     PYTHONIOENCODING=utf-8 python scripts/c16_experiment_matrix.py
+    PYTHONIOENCODING=utf-8 python scripts/c16_experiment_matrix.py --reps 5 --c 8 --n 20
 """
 from __future__ import annotations
 
+import argparse
 import concurrent.futures as cf
 import json
 import random
 import re
+import statistics
 import subprocess
 import time
 import urllib.request
@@ -36,6 +51,7 @@ SGL_HEALTH = "http://localhost:30000/health"
 N = 20
 CONCURRENCY = 16
 SEED = 42
+DEFAULT_REPS = 3
 
 EXPERIMENTS = [
     # label,                                  env overrides,                                             container(s) to restart
@@ -223,62 +239,153 @@ def measure(n: int = N, c: int = CONCURRENCY) -> dict:
     }
 
 
-def pretty(label: str, r: dict) -> None:
+def _pick(reps: list[dict], *path: str) -> list[float]:
+    """Extract a nested metric across reps, e.g. _pick(reps, 'sgl_stage', 'ttft_mean_s')."""
+    out = []
+    for r in reps:
+        cur = r
+        for k in path:
+            cur = cur.get(k, {}) if isinstance(cur, dict) else 0
+        if isinstance(cur, (int, float)):
+            out.append(float(cur))
+    return out
+
+
+def agg(values: list[float]) -> dict[str, float]:
+    """median + IQR + min/max over a list of per-rep measurements."""
+    if not values:
+        return {"median": 0, "p25": 0, "p75": 0, "min": 0, "max": 0, "n": 0}
+    s = sorted(values)
+    n = len(s)
+    return {
+        "median": statistics.median(s),
+        "p25": s[max(0, int(n * 0.25))] if n > 1 else s[0],
+        "p75": s[min(n - 1, int(n * 0.75))] if n > 1 else s[0],
+        "min": s[0],
+        "max": s[-1],
+        "n": n,
+    }
+
+
+def pretty_rep(label: str, rep_idx: int, r: dict) -> None:
     cl, cpu, sgl = r["client"], r["cpu_stage"], r["sgl_stage"]
     print(
-        f"{label:<40s}  rps={cl['rps']:5.2f}  "
-        f"mean={cl['mean_s']:5.2f}s  p95={cl['p95_s']:5.2f}s  "
-        f"ok={cl['ok']}/{cl['n']} empty={cl['empty']}  "
-        f"layout={cpu['layout_mean_s']:4.1f}s  TTFT={sgl['ttft_mean_s']:4.1f}s  "
-        f"decode={sgl['decode_only_s']:4.2f}s  hit={sgl['prefix_cache_hit_pct']:4.1f}%",
+        f"  rep {rep_idx+1}: rps={cl['rps']:5.2f}  mean={cl['mean_s']:5.2f}s  "
+        f"TTFT={sgl['ttft_mean_s']:5.2f}s  decode={sgl['decode_only_s']:4.2f}s  "
+        f"hit={sgl['prefix_cache_hit_pct']:4.1f}%  "
+        f"layout={cpu['layout_mean_s']:4.1f}s  ok={cl['ok']}/{cl['n']} empty={cl['empty']}",
+        flush=True,
+    )
+
+
+def pretty_agg(label: str, reps: list[dict]) -> None:
+    ttft = agg(_pick(reps, "sgl_stage", "ttft_mean_s"))
+    decode = agg(_pick(reps, "sgl_stage", "decode_only_s"))
+    hit = agg(_pick(reps, "sgl_stage", "prefix_cache_hit_pct"))
+    layout = agg(_pick(reps, "cpu_stage", "layout_mean_s"))
+    rps = agg(_pick(reps, "client", "rps"))
+    mean_s = agg(_pick(reps, "client", "mean_s"))
+    empty = sum(_pick(reps, "client", "empty"))
+    print(
+        f"  [median±iqr over {len(reps)} reps]  "
+        f"TTFT={ttft['median']:.2f}s (p25={ttft['p25']:.2f}, p75={ttft['p75']:.2f})  "
+        f"decode={decode['median']:.2f}s  "
+        f"hit={hit['median']:.1f}%  "
+        f"layout={layout['median']:.2f}s  "
+        f"rps={rps['median']:.2f}  mean={mean_s['median']:.2f}s  "
+        f"total_empty={int(empty)}",
         flush=True,
     )
 
 
 def main() -> None:
-    print(f"[matrix] c={CONCURRENCY} n={N} seed={SEED}")
-    # Before each experiment, the stack must already be at baseline.
-    # We don't apply baseline env changes (it's a measurement-only step).
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--reps", type=int, default=DEFAULT_REPS,
+                    help="measurements per experiment; median+IQR reported across these")
+    ap.add_argument("--c", type=int, default=CONCURRENCY, help="concurrency level")
+    ap.add_argument("--n", type=int, default=N, help="requests per measurement")
+    ap.add_argument("--out", type=Path,
+                    default=REPO / "loadtest" / "results" / "c16-experiment-matrix-2026-04-24.json")
+    ap.add_argument("--experiments-only", type=str, default=None,
+                    help="comma-separated experiment label prefixes to run (default: all)")
+    args = ap.parse_args()
+
+    filt = None
+    if args.experiments_only:
+        filt = [s.strip() for s in args.experiments_only.split(",") if s.strip()]
+
+    print(f"[matrix] c={args.c} n={args.n} reps={args.reps} seed={SEED}")
+    if filt:
+        print(f"[matrix] filtered experiments: {filt}")
+
     results: dict[str, dict] = {}
 
     for label, overrides, containers in EXPERIMENTS:
+        if filt and not any(label.startswith(f) for f in filt):
+            continue
         print(f"\n=== {label} ===", flush=True)
         prior = patch_env(overrides) if overrides else {}
         try:
-            # Restart containers to pick up env
             for svc in containers:
                 print(f"  restarting {svc}...", flush=True)
                 restart(svc)
-                wait_healthy(CPU_HEALTH if svc == "cpu" else SGL_HEALTH, timeout=600)
+                wait_healthy(CPU_HEALTH if svc == "cpu" else SGL_HEALTH, timeout=900)
             if not containers:
                 print("  (no restart needed)", flush=True)
-            # brief settle
             time.sleep(5)
-            r = measure(N, CONCURRENCY)
-            results[label] = r
-            pretty(label, r)
+
+            # Multi-rep loop — NO env revert between reps, NO restart between reps.
+            # Cache state evolves naturally within a config; we measure the
+            # distribution of TTFT / decode / hit across reps.
+            reps: list[dict] = []
+            for i in range(args.reps):
+                r = measure(args.n, args.c)
+                pretty_rep(label, i, r)
+                reps.append(r)
+            results[label] = {
+                "overrides": overrides,
+                "containers": containers,
+                "reps": reps,
+                "agg": {
+                    "ttft_mean_s":         agg(_pick(reps, "sgl_stage", "ttft_mean_s")),
+                    "decode_only_s":       agg(_pick(reps, "sgl_stage", "decode_only_s")),
+                    "prefix_cache_hit_pct": agg(_pick(reps, "sgl_stage", "prefix_cache_hit_pct")),
+                    "layout_mean_s":       agg(_pick(reps, "cpu_stage", "layout_mean_s")),
+                    "ocr_region_mean_s":   agg(_pick(reps, "cpu_stage", "ocr_region_mean_s")),
+                    "rps":                 agg(_pick(reps, "client", "rps")),
+                    "mean_s":              agg(_pick(reps, "client", "mean_s")),
+                    "p95_s":               agg(_pick(reps, "client", "p95_s")),
+                    "empty_total":         sum(_pick(reps, "client", "empty")),
+                },
+            }
+            pretty_agg(label, reps)
         finally:
-            # Revert env back to baseline for next experiment
             if overrides:
                 restore_env(prior)
                 for svc in containers:
                     print(f"  reverting {svc}...", flush=True)
                     restart(svc)
-                    wait_healthy(CPU_HEALTH if svc == "cpu" else SGL_HEALTH, timeout=600)
+                    wait_healthy(CPU_HEALTH if svc == "cpu" else SGL_HEALTH, timeout=900)
 
-    # Summary
-    print("\n=== SUMMARY ===")
-    base = results.get("baseline", {}).get("client", {}).get("rps", 0)
-    print(f"{'experiment':<40s} {'rps':>6s} {'Δ-rps':>7s} {'mean':>7s} {'TTFT':>6s} {'layout':>7s} {'hit%':>6s} {'empty':>6s}")
-    for label, r in results.items():
-        cl, cpu, sgl = r["client"], r["cpu_stage"], r["sgl_stage"]
-        drps = ((cl["rps"] - base) / base * 100) if base and label != "baseline" else 0
-        print(f"{label:<40s} {cl['rps']:>6.2f} {drps:>+6.1f}% {cl['mean_s']:>6.2f}s {sgl['ttft_mean_s']:>5.2f}s {cpu['layout_mean_s']:>6.2f}s {sgl['prefix_cache_hit_pct']:>5.1f}% {cl['empty']:>6d}")
+    # Summary — rank by TTFT median (primary shipping metric)
+    print("\n=== SUMMARY — ranked by TTFT median ===")
+    print(f"{'experiment':<40s} {'TTFT (med/IQR)':>22s} {'decode':>8s} {'hit%':>7s} {'rps':>6s} {'mean':>8s} {'empty':>6s}")
+    base_ttft = None
+    ranked = sorted(results.items(), key=lambda kv: kv[1]["agg"]["ttft_mean_s"]["median"])
+    for label, r in ranked:
+        a = r["agg"]
+        if label == "baseline":
+            base_ttft = a["ttft_mean_s"]["median"]
+        delta = ""
+        if base_ttft and label != "baseline" and base_ttft > 0:
+            pct = (a["ttft_mean_s"]["median"] - base_ttft) / base_ttft * 100
+            delta = f" ({pct:+.0f}% vs base)"
+        ttft_str = f"{a['ttft_mean_s']['median']:.2f}/±{(a['ttft_mean_s']['p75']-a['ttft_mean_s']['p25'])/2:.2f}"
+        print(f"{label:<40s} {ttft_str:>22s} {a['decode_only_s']['median']:>7.2f}s {a['prefix_cache_hit_pct']['median']:>6.1f}% {a['rps']['median']:>6.2f} {a['mean_s']['median']:>7.2f}s {int(a['empty_total']):>6d}{delta}")
 
-    out = REPO / "loadtest" / "results" / "c16-experiment-matrix-2026-04-24.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(results, indent=2))
-    print(f"\n[done] {out}")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(results, indent=2))
+    print(f"\n[done] {args.out}")
 
 
 if __name__ == "__main__":
