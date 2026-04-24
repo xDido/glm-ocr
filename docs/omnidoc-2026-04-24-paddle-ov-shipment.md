@@ -219,6 +219,26 @@ The counterintuitive detail: prefix cache hit rate collapsed from 56.5 % to 12.3
 
 ## Attempted (and rolled back this session)
 
+### c=16 four-knob experiment matrix (all reverted — single-run noise swamped the signal)
+
+After shipping §6-§9 the c=16 latency was still ~2× c=8 per request. Four single-knob experiments at c=16, n=20, seed=42, measured via `scripts/c16_experiment_matrix.py`:
+
+| experiment | rps | Δrps (one-run) | mean | TTFT | layout | hit% |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| baseline (as-shipped) | 0.35 | — | 40.35 s | 13.84 s | 18.74 s | 9.2 % |
+| E1: `SGL_MEM_FRACTION_STATIC=0.95 + SGL_MAX_RUNNING_REQUESTS=16` | 0.28 | −22 % | 46.98 s | 20.91 s | 18.73 s | 13.4 % |
+| E2: `SGL_CUDA_GRAPH_MAX_BS=16` | 0.41 | +16 % | 26.58 s | 10.75 s | 11.38 s | 13.4 % |
+| E3: `OCR_MAX_WORKERS=16` | 0.34 | −4 % | 33.80 s | 12.16 s | 14.63 s | 13.4 % |
+| E4: `LAYOUT_BATCH_WINDOW_MS=50` | 0.55 | **+55 %** | 22.53 s | 7.15 s | 12.21 s | 20.3 % |
+
+E4 looked like a headline win. On confirmation runs (fresh sglang restart + 20-request warmup, then two sequential measurements), E4 alone gave rps 0.12–0.16 — i.e. **worse than baseline**. Four measurements of the same nominal config swung between 0.12 and 0.55, a factor of 4.5× with no config change. The "+55 %" was a single draw inside a very wide distribution.
+
+The combined E4+E2 was even worse (rps 0.21, TTFT 23.7 s) — likely a real interaction (E2's cuda-graph capture at bs=16 costs ~200-400 MB and the `SGL_MEM_FRACTION_STATIC=0.83` card had no budget for it), but single-run noise means we can't separate that interaction from measurement variance either.
+
+**All four experiments reverted.** The already-shipped `feedback_matrix_noise` memory has been flagging this for a while: *"single asyncio-matrix runs are ±15–25 % on rps; never commit keep/rollback on one run."* This session's c=16 variance was ±150 %, not 25 %. On the 8 GB dev card at c=16 the queue is deep enough and the KV cache thrashy enough that any single 20-request burst lands on some specific eviction pattern, and the same config measured a minute later lands on a different one.
+
+**Real conclusion: c=16 on this hardware cannot be tuned via single-burst bench measurements.** Either (a) get a proper multi-run averaged harness before re-attempting any of these knobs, or (b) re-bench on the T4 target where the KV cache is 8× larger and variance should drop substantially, or (c) accept that c=8 is the effective ceiling for this box and don't try to push past it with micro-knobs.
+
 ### Experiment A — explicit OV thread pin via `provider_options` (reverted)
 
 Hypothesis: the 3×–11× layout slowdown at c≥16 was OV's CPU plugin spawning its own thread pool (≈ cores × 2 by default) independently of ORT's `intra_op_num_threads`, causing 4 gunicorn workers × OV default = oversubscription on the 12-core cgroup.
