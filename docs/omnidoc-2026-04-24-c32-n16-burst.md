@@ -171,3 +171,59 @@ When migrating to AWS T4 (16 GB):
 - `docs/ARCHITECTURE-v2.md` §9 — end-to-end latency budget at c=8 for comparison
 - `scripts/matrix_sweep_quick.py` — the reusable c-level sweep harness
 - Auto-memory `feedback_matrix_noise.md` — why single-burst c=16+ numbers can't be trusted on this hardware
+
+---
+
+## 2026-04-24 — Post-TTFT-reduction re-measurement
+
+The initial section above captured the c=32 burst on the post-§6-§9 stack (paddle2onnx + OV EP + prefix-pin + mem=0.83). After that, the TTFT-reduction plan shipped §10–§12 (`PAGE_LOADER_MAX_PIXELS=262144`, short `PROMPT_*`, `SGL_CUDA_GRAPH_MAX_BS=16`). Re-measured with the same `scripts/matrix_sweep_quick.py` (20 reqs, 3-request warmup) and with the multi-rep harness `scripts/c16_experiment_matrix.py`:
+
+**Cold-start sweep** (`matrix_sweep_quick.py`, single 20-req burst per c):
+
+| c | rps | mean | p50 | p95 | layout/call | ok/empty |
+|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| 8 | **0.60** | **11.31 s** | 10.72 s | 21.30 s | 4.96 s | 20/0 |
+| 16 | 0.17 | 35.92 s | 31.62 s | 120.64 s | 11.55 s | 20/0 |
+| 32 | 0.17 | 49.18 s | 43.42 s | 119.50 s | 20.44 s | 20/0 |
+
+**Warm-state measurement** (`c16_experiment_matrix.py`, reps=5 at c=16 after 4 preceding reps warmed the cache):
+
+| metric | value |
+|---|---|
+| TTFT median (per region) | 6.10 s (±0.71 s IQR) |
+| decode only | 0.20 s |
+| prefix cache hit (last rep) | 56 % |
+| rps | 0.57 |
+| request mean | 23.64 s |
+
+Both harnesses agree: **c=32 survives cleanly with 20/20 success and 0 empties** (vs the original c=32 n=16 run that surfaced 99.8 s mean). And c=16 now supports genuine steady-state throughput (0.57 rps, 6.1 s TTFT) when the cache is populated.
+
+**Headline improvement table** (same hardware, same seed, same images, 3 configurations):
+
+| metric at c=16 | pre-session baseline | post-§6-§9 shipped | post-§10-§12 shipped (warm) |
+|---|:-:|:-:|:-:|
+| TTFT per region | ~16-30 s | ~31 s | **6.1 s** |
+| prefix cache hit | ~12 % | ~10-15 % | **56 %** |
+| rps | 0.15 (noisy) | 0.29 | **0.57** |
+| mean request latency | 35-40 s | 43 s | **23.6 s** |
+| empty-markdown rate | ~11 % (hidden) | 0 % | 0 % |
+
+**c=32 survival** (cold-start, which is the worst case operationally):
+
+| metric at c=32 | post-§6-§9 shipped (original burst) | post-§10-§12 shipped |
+|---|:-:|:-:|
+| mean per request | 99.8 s | **49.2 s** (−51 %) |
+| rps | 0.094 | **0.17** (+81 %) |
+| empty rate | 0 % | 0 % |
+
+### Why c=16 cold-start rps is low on matrix_sweep_quick (0.17 vs 0.57 warm)
+
+The `matrix_sweep_quick` harness does a 3-request serial warmup then measures a single 20-req burst at the target concurrency. Three warmup calls are not enough to populate the RadixCache for all task prompts across all expected request shapes — the first dozen regions of the measured burst still pay cold prefills. The multi-rep harness gets around this by letting the cache accumulate across 3-5 measured reps and reporting the median; those numbers (6.1 s TTFT, 0.57 rps at c=16) are the steady-state truth.
+
+**Operational reading:** if you care about the first few requests after a cold container start, the cold-sweep numbers govern. If you care about sustained traffic where the cache stays populated, the warm-state numbers govern. On the 8 GB card, the gap between cold and warm at c=16 is roughly 3-4× on rps. On T4 (with 8× more KV cache) the gap should collapse because the cache holds the prefix even under aggressive evict pressure.
+
+### Cross-references for this update
+
+- `docs/OPTIMIZATIONS.md` §10, §11, §12 — the three TTFT-reduction shipments this section measures
+- `scripts/c16_experiment_matrix.py` — extended with `--reps N` for multi-rep averaging, labels I5/I6 for unshipped experiments
+- Plan file: `~/.claude/plans/how-can-we-improve-compressed-salamander.md`

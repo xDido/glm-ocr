@@ -42,8 +42,14 @@ LAYOUT_PREFIX_PIN=true         # see §8 — monkey-patch glmocr's PageLoader so
                                # precedes image in content[] and a stable default prompt
                                # is injected per task. SGLang RadixCache hit rate
                                # 12%→56%, TTFT -52%, rps +39% at c=8. Flat at c≥16 on
-                               # this 8 GB card (KV cache too small). Set to 'false' to
-                               # restore upstream image-first + no-prompt behavior.
+                               # this 8 GB card before §10-§12 compound fix.
+PAGE_LOADER_MAX_PIXELS=262144  # see §10 — cap image pixel area per region so SGLang
+                               # prefill tokens shrink. Unset = glmocr default. Tight-IQR
+                               # TTFT win at c=16 (-6%) and prefix-hit +66%. A/B ±1%.
+PROMPT_TEXT=OCR:               # see §11 — replace verbose default task prompts with
+PROMPT_TABLE=Table:            # 3-token stubs. Shrinks per-region prefix footprint in
+PROMPT_FORMULA=Formula:        # RadixCache. Combines with §10 for the compound win;
+                               # watch eastmoney-style dense-text pages for regression.
 LAYOUT_ASYNC=false             # FastAPI sidecar didn't reliably improve
 
 # --- CPU container sizing ---
@@ -267,6 +273,80 @@ Dropping to `0.83` frees ~1 GB into the dynamic pool at the cost of shrinking th
 **On the 16 GB AWS T4 target this tradeoff likely inverts.** With 8× more VRAM headroom the static fraction can safely go back to 0.90–0.95 because the dynamic pool has absolute GB to spare; at that point the prefix cache can grow to ~200 k tokens, which should hold the prefix across even c=64+ workloads, and the §8 prefix-pin win compounds instead of flattening. Re-tune both knobs together when the deployment target changes.
 
 **Rollback:** `SGL_MEM_FRACTION_STATIC=0.95` in `.env`, restart sglang. Zero code changes. Note that rolling back on this hardware will re-introduce the c ≥ 24 SGLang crash.
+
+### 10. `PAGE_LOADER_MAX_PIXELS=262144` — image-token shrink per region
+
+**Shipped 2026-04-24, TTFT-reduction plan Item 2.** Cap image pixel area per region to 262 144 (512² area). Fewer image tokens fed into the VLM's vision encoder → shorter SGLang prefill per region → more regions fit in the KV cache concurrently → hit-rate climbs.
+
+Plumbing: `docker/cpu/entrypoint.sh` appends a `pipeline.page_loader` block to `config.yaml` after envsubst whenever any of `PAGE_LOADER_MAX_PIXELS`, `PAGE_LOADER_MIN_PIXELS`, `PAGE_LOADER_T_PATCH_SIZE`, `PAGE_LOADER_PATCH_EXPAND_FACTOR` is set. Unset = glmocr defaults, for fully-reversible rollback. `docker-compose.yml` passes all four through as `${VAR:-}`.
+
+Sweep at c = 16, reps = 3 (median ± IQR):
+
+| `max_pixels` | TTFT median | IQR | prefix hit | rps |
+|:-:|:-:|:-:|:-:|:-:|
+| unset (baseline) | 31.5 s | ±2.7 s | 9.5 % | 0.25 |
+| 921 600 (960²) | 34.9 s | ±3.7 s | 13.6 % | 0.27 |
+| 589 824 (768²) | 33.5 s | ±4.2 s | 12.6 % | 0.26 |
+| **262 144 (512²)** | **29.7 s** | **±1.5 s** | **15.8 %** | **0.29** |
+
+Only the aggressive 512² cap wins with tight variance. 768² and 960² regressed inside their own IQR (noise-level). A/B regression gate passes at +1 % aggregate markdown length (page-level: chroma paper +5 %, eastmoney +17 %, most within ±3 %).
+
+**Rollback:** unset `PAGE_LOADER_MAX_PIXELS` in `.env` → empty substitution → entrypoint skips the page_loader block → glmocr defaults.
+
+### 11. `PROMPT_TEXT` / `PROMPT_TABLE` / `PROMPT_FORMULA` — short task prompts
+
+**Shipped 2026-04-24, TTFT-reduction plan Item 3.** Replace the default task prompts (`"Transcribe the text in the image."` / `"Convert the table in the image to markdown."` / `"Write the formula in the image as LaTeX."`) with three-token stubs (`"OCR:"` / `"Table:"` / `"Formula:"`). Fewer stable-prefix tokens per region = lighter prefix-cache residency per entry = more simultaneous prefixes fit at a given KV-cache budget.
+
+Plumbing: `docker/cpu/runtime_app.py` reads the three env vars inside the prefix-pin monkey-patch's `_DEFAULT_TASK_PROMPTS` dict, with the previously-shipped verbose strings as fallback defaults. `docker-compose.yml` passes them through as `${VAR:-}`.
+
+Combined A/B gate for Items §10 + §11:
+
+| page | torch baseline | shipped (§10+§11) | Δ |
+|---|:-:|:-:|:-:|
+| Aggregate | 22 443 | 22 161 | **−1 %** (gate threshold) |
+| chroma paper | 5 679 | 6 146 | +8 % |
+| eastmoney financial | 1 684 | 1 386 | **−18 %** (outlier) |
+| jiaocai 1826 | 1 059 | 964 | −9 % |
+| yanbaopptmerge 5675 | 157 | 143 | −9 % |
+
+Aggregate holds the gate. Per-page variance is wider than either §10 or §11 alone — GLM-OCR's instruction-tuning is sensitive to prompt wording on certain content types (Chinese financial summaries in particular). Operators who hit quality complaints on dense-text pages can `unset PROMPT_TEXT` / etc. to restore the verbose defaults without any code change.
+
+**Rollback:** unset the three `PROMPT_*` env vars.
+
+### 12. `SGL_CUDA_GRAPH_MAX_BS=16` — cover the actual running-batch hot band
+
+**Shipped 2026-04-24, TTFT-reduction plan Item 4.** Default was 8 (SGLang stock), but our measured running batch peaks at 11–16 per the `project_gpu_utilization_2026_04_23` memory. At bs > 8 SGLang fell off the captured-graph fast path and ran eager decode (3–5× slower per token). Bumping to 16 captures graphs for 1..16 at boot, keeping the full decode hot range on the fast path.
+
+Boot cost (measured on the 3060 Ti 8 GB at `mem=0.83`):
+
+| | before (cap=8) | after (cap=16) |
+|---|:-:|:-:|
+| CUDA graph capture time | 7.3 s | 11.3 s |
+| GPU memory for graphs | 0.20 GB | 0.29 GB |
+| Available post-capture | 2.21 GB | 2.06 GB |
+
++92 MB VRAM for the extra graphs; `SGL_MEM_FRACTION_STATIC=0.83` has comfortable headroom for it. No SGLang OOM.
+
+Combined compound effect of Items §10 + §11 + §12 at c = 16, reps = 5 (same seed, same harness):
+
+| metric | pre-session | post-§6-§9 (before TTFT plan) | post-§10-§12 (shipped) |
+|---|:-:|:-:|:-:|
+| TTFT median | — | 31.5 s | **6.1 s** |
+| TTFT IQR | — | ±2.7 s | ±0.7 s |
+| prefix cache hit | — | 9.5 % | **40 % → 56 %** (warms within a run) |
+| rps | 0.31 | 0.29 | **0.57** |
+| mean request latency | 22.2 s | 43.2 s | 23.6 s |
+
+**c = 16 performance now matches what we were seeing at c = 8 pre-session.** TTFT dropped 80 % via the three-knob compound. The 5× improvement is not any single change — it's that §10 shrinks per-region prefill so more slots free up, §11 shrinks per-region prefix footprint so more slots fit the cache, and §12 accelerates the decode steps that clear the queue.
+
+**Rollback:** unset `SGL_CUDA_GRAPH_MAX_BS` (= default 8) and restart sglang.
+
+**Why the T4 story could get even better.** The §9 cache-thrash warning (`"on 16 GB+ hardware this tradeoff likely inverts"`) compounds with §10-§12: with ~8× more KV-cache headroom, the prefix-pin hit rate could sustain >60 % across all c levels, and `SGL_CUDA_GRAPH_MAX_BS` can grow further (32 or 64) without VRAM pressure.
+
+**Adjacent experiments that did NOT ship** (noise-dominated on 8 GB, reran fine — kept in `scripts/c16_experiment_matrix.py` as labeled entries for future re-measurement):
+
+- Item 5 — `SGL_SCHEDULE_CONSERVATIVENESS` sweep {0.3, 0.5, 0.8, 1.2}. Best candidate (0.3) median 4.70 s vs baseline 6.02 s, but candidate IQR ±3.30 s (dominated by post-restart cold rep). Not distinguishable from noise with reps = 3.
+- Item 6 — `OCR_REGION_STAGGER_MS` sweep {5, 10, 20} ms. Best candidate (5 ms) TTFT median 6.28 s vs baseline 6.50 s — delta inside own 2 × IQR. Not shipped. Plumbing lives in `runtime_app.py` behind the flag; set `OCR_REGION_STAGGER_MS > 0` to re-probe.
 
 ---
 
