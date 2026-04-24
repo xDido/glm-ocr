@@ -111,6 +111,14 @@ services:
       # wheel which the slim image now installs). Ignored on the torch
       # variant — OV on that graph re-introduces the Reshape silent-empty.
       LAYOUT_ONNX_PROVIDER: ${LAYOUT_ONNX_PROVIDER:-cpu}
+      # Optional page_loader knobs — only injected when set. Entrypoint
+      # appends a pipeline.page_loader block to config.yaml at render time.
+      # Shrinking max_pixels cuts image-token count per region (dominant
+      # contributor to SGLang prefill). Defaults unset → glmocr defaults.
+      PAGE_LOADER_MAX_PIXELS: ${PAGE_LOADER_MAX_PIXELS:-}
+      PAGE_LOADER_MIN_PIXELS: ${PAGE_LOADER_MIN_PIXELS:-}
+      PAGE_LOADER_T_PATCH_SIZE: ${PAGE_LOADER_T_PATCH_SIZE:-}
+      PAGE_LOADER_PATCH_EXPAND_FACTOR: ${PAGE_LOADER_PATCH_EXPAND_FACTOR:-}
       # LAYOUT_PREFIX_PIN=true monkey-patches glmocr's PageLoader to place
       # the text prompt BEFORE the image in the content array and inject a
       # default prompt per task type. This lets SGLang's RadixCache share

@@ -19,6 +19,24 @@ else
 fi
 
 envsubst < "${TEMPLATE}" > /app/config.yaml
+
+# Optional pipeline.page_loader block — only appended when any of the four
+# knobs is set. Smaller max_pixels cuts image-token count per region and
+# directly shortens SGLang prefill (the dominant TTFT component at c≥16).
+# Leaving all four unset preserves glmocr upstream defaults. See
+# docs/OPTIMIZATIONS.md §TBD (max_pixels shrink).
+if [[ -n "${PAGE_LOADER_MAX_PIXELS:-}${PAGE_LOADER_MIN_PIXELS:-}${PAGE_LOADER_T_PATCH_SIZE:-}${PAGE_LOADER_PATCH_EXPAND_FACTOR:-}" ]]; then
+    {
+        echo ""
+        echo "  # Appended by entrypoint when PAGE_LOADER_* env vars are set."
+        echo "  page_loader:"
+        [[ -n "${PAGE_LOADER_MAX_PIXELS:-}" ]]            && echo "    max_pixels: ${PAGE_LOADER_MAX_PIXELS}"
+        [[ -n "${PAGE_LOADER_MIN_PIXELS:-}" ]]            && echo "    min_pixels: ${PAGE_LOADER_MIN_PIXELS}"
+        [[ -n "${PAGE_LOADER_T_PATCH_SIZE:-}" ]]          && echo "    t_patch_size: ${PAGE_LOADER_T_PATCH_SIZE}"
+        [[ -n "${PAGE_LOADER_PATCH_EXPAND_FACTOR:-}" ]]   && echo "    patch_expand_factor: ${PAGE_LOADER_PATCH_EXPAND_FACTOR}"
+    } >> /app/config.yaml
+fi
+
 echo "[entrypoint] rendered /app/config.yaml:"
 sed 's/^/  | /' /app/config.yaml
 

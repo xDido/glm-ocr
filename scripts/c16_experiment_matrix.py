@@ -56,10 +56,16 @@ DEFAULT_REPS = 3
 EXPERIMENTS = [
     # label,                                  env overrides,                                             container(s) to restart
     ("baseline",                              {},                                                         []),
+    # Prior session's single-burst matrix (kept for reference; don't re-run unless at high reps)
     ("E1: mem=0.95 + max_running=16",         {"SGL_MEM_FRACTION_STATIC": "0.95", "SGL_MAX_RUNNING_REQUESTS": "16"}, ["sglang"]),
     ("E2: cuda_graph_max_bs=16",              {"SGL_CUDA_GRAPH_MAX_BS": "16"},                           ["sglang"]),
     ("E3: ocr_max_workers=16",                {"OCR_MAX_WORKERS": "16"},                                 ["cpu"]),
     ("E4: layout_batch_window_ms=50",         {"LAYOUT_BATCH_WINDOW_MS": "50"},                          ["cpu"]),
+    # TTFT-reduction plan Item 2: image-token shrink sweep.
+    # Smaller max_pixels → fewer image tokens per region → less prefill work.
+    ("I2: max_pixels=921600",                 {"PAGE_LOADER_MAX_PIXELS": "921600"},                      ["cpu"]),
+    ("I2: max_pixels=589824",                 {"PAGE_LOADER_MAX_PIXELS": "589824"},                      ["cpu"]),
+    ("I2: max_pixels=262144",                 {"PAGE_LOADER_MAX_PIXELS": "262144"},                      ["cpu"]),
 ]
 
 
