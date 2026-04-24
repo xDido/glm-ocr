@@ -546,6 +546,98 @@ def instrument_pipeline(pipeline) -> None:
         # Already registered (re-import); nothing to do.
         return
 
+    # -------------------------------------------------------------------
+    # Experiment: prefix-caching fix for SGLang RadixCache.
+    #
+    # glmocr's PageLoader.build_request_from_image puts the image FIRST
+    # in the content array and the text prompt (if any) SECOND. Combined
+    # with our config having no task_prompt_mapping at all, every region
+    # request is just `content=[{image_url}]` — each region starts with
+    # a completely different token sequence (the image tokens) so
+    # RadixCache has no shared prefix to cache.
+    #
+    # Result: SGLang metrics show only 12% prefix_cache hit rate on
+    # glm-ocr and ~13s mean TTFT at c=8, vs ~0.5s actual decode time.
+    # The GPU spends >95% of per-region wall time on queue + redundant
+    # prefill, not on real inference.
+    #
+    # Fix: monkey-patch PageLoader.build_request_from_image to
+    #   (a) inject a stable task-prompt mapping (same string per
+    #       task_type, so the first N tokens of every request are
+    #       identical)
+    #   (b) place the text item FIRST and the image SECOND, so the
+    #       prefix cache has a chance to hit on the prompt tokens.
+    #
+    # Guard: skip if LAYOUT_PREFIX_PIN=false. Rollback is env-var only.
+    # Regression gate: scripts/ab_torch_vs_paddle.py must show ±1%
+    # aggregate vs the prior shipped path; if the chat template doesn't
+    # accept text-first content, output will drift and the A/B will
+    # catch it.
+    # -------------------------------------------------------------------
+    if os.environ.get("LAYOUT_PREFIX_PIN", "true").lower() != "false":
+        try:
+            from glmocr.dataloader.page_loader import PageLoader as _PL
+            from glmocr.dataloader.page_loader import load_image_to_base64 as _enc
+
+            # Minimal, stable prompts — keep them short so they don't
+            # bloat every prefill; keep them literal-identical across
+            # regions so they slot into the cache as a reusable prefix.
+            _DEFAULT_TASK_PROMPTS = {
+                "text":    "Transcribe the text in the image.",
+                "table":   "Convert the table in the image to markdown.",
+                "formula": "Write the formula in the image as LaTeX.",
+            }
+
+            _orig_build = _PL.build_request_from_image
+
+            def _patched_build(self, image, task_type="text"):
+                # Respect an operator-provided mapping if they set one;
+                # otherwise inject our default.
+                prompt_text = None
+                if self.task_prompt_mapping:
+                    prompt_text = self.task_prompt_mapping.get(task_type)
+                if not prompt_text:
+                    prompt_text = _DEFAULT_TASK_PROMPTS.get(task_type, _DEFAULT_TASK_PROMPTS["text"])
+
+                encoded = _enc(
+                    image,
+                    t_patch_size=self.t_patch_size,
+                    max_pixels=self.max_pixels,
+                    image_format=self.image_format,
+                    patch_expand_factor=self.patch_expand_factor,
+                    min_pixels=self.min_pixels,
+                )
+                # TEXT FIRST, IMAGE SECOND — the flip that enables prefix caching.
+                content = [
+                    {"type": "text", "text": prompt_text},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/{self.image_format.lower()};base64,{encoded}"}},
+                ]
+                return {
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
+                    "top_p": self.top_p,
+                    "top_k": self.top_k,
+                    "repetition_penalty": self.repetition_penalty,
+                }
+
+            if _PL.build_request_from_image is not _patched_build:
+                _PL.build_request_from_image = _patched_build
+                print(
+                    "[prefix] patched PageLoader.build_request_from_image: "
+                    "text content first, image second; default prompts "
+                    f"{list(_DEFAULT_TASK_PROMPTS.keys())} "
+                    "(set LAYOUT_PREFIX_PIN=false to disable)",
+                    flush=True,
+                )
+        except Exception as e:
+            print(
+                f"[prefix] patch failed, falling back to upstream behavior: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
     # Layout: one call per page-batch. We only care about wall time; the
     # batch size is visible in other gauges and lots of batches are size 1
     # in this benchmark anyway.

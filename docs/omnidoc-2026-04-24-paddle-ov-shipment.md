@@ -187,6 +187,22 @@ Layout's share dropped from ~50 % (pre-OV-EP) to 29 %. Further layout cuts (TRT 
 
 ---
 
+## Also shipped (prefix-cache fix — late-session)
+
+After the OV tuning attempt, SGLang's own `/metrics` revealed the bigger latency wasn't OV-side at all — **actual GPU decode was 0.5 s / region, but TTFT was 13.2 s, and prefix-cache hit rate was 12 %**. glmocr's `PageLoader.build_request_from_image` was putting the image *first* in the message content array and (because our config has no `task_prompt_mapping`) no text at all — every region's request started with different tokens, so RadixCache had nothing to cache.
+
+Fix shipped as §8 `LAYOUT_PREFIX_PIN=true`: `runtime_app.py` monkey-patches `PageLoader` to inject a stable default prompt per task type and put the text item first in `content[]`. Measured on one 20-page c=8 burst after the patch:
+
+| | pre | post |
+|---|---|---|
+| Prefix-cache hit rate (SGLang) | 12 % | **56.5 %** |
+| TTFT mean | 13.2 s | 6.34 s |
+| Client rps @ c=8 | 0.41 | **0.57** (+39 %) |
+| OCR stage per region | 8.23 s | **5.12 s** (−38 %) |
+| A/B regression gate | baseline | passes at aggregate −1 % |
+
+At c ≥ 16 the patch is flat (the 37 k-token KV cache on the 8 GB card thrashes under 100+ concurrent regions, evicting the prefix before reuse). On the 16 GB T4 target cache is ~8× bigger and the win should carry further.
+
 ## Attempted (and rolled back this session)
 
 ### Experiment A — explicit OV thread pin via `provider_options` (reverted)

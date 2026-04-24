@@ -111,6 +111,12 @@ services:
       # wheel which the slim image now installs). Ignored on the torch
       # variant — OV on that graph re-introduces the Reshape silent-empty.
       LAYOUT_ONNX_PROVIDER: ${LAYOUT_ONNX_PROVIDER:-cpu}
+      # LAYOUT_PREFIX_PIN=true monkey-patches glmocr's PageLoader to place
+      # the text prompt BEFORE the image in the content array and inject a
+      # default prompt per task type. This lets SGLang's RadixCache share
+      # the prompt tokens across regions — 12% → 56% hit rate, TTFT halved
+      # at c=8. Set to "false" to restore upstream behavior.
+      LAYOUT_PREFIX_PIN: ${LAYOUT_PREFIX_PIN:-true}
       LAYOUT_ONNX_THREADS: ${LAYOUT_ONNX_THREADS:-1}
       # Phase 1 — numpy post-processing (drop torch from request path).
       # torch = upstream default, safe fallback | numpy = no-torch hot path.

@@ -38,6 +38,12 @@ LAYOUT_ONNX_PROVIDER=openvino  # see §7 — ORT's OpenVINOExecutionProvider on 
                                # Byte-match output. Only safe on LAYOUT_VARIANT=paddle2onnx.
                                # Set to 'cpu' to revert. Requires onnxruntime-openvino
                                # wheel (installed by default in the shipped image).
+LAYOUT_PREFIX_PIN=true         # see §8 — monkey-patch glmocr's PageLoader so text
+                               # precedes image in content[] and a stable default prompt
+                               # is injected per task. SGLang RadixCache hit rate
+                               # 12%→56%, TTFT -52%, rps +39% at c=8. Flat at c≥16 on
+                               # this 8 GB card (KV cache too small). Set to 'false' to
+                               # restore upstream image-first + no-prompt behavior.
 LAYOUT_ASYNC=false             # FastAPI sidecar didn't reliably improve
 
 # --- CPU container sizing ---
@@ -199,6 +205,47 @@ The end-to-end speedup exceeds the per-kernel speedup because at `c=8` the layou
 **Rollback:** set `LAYOUT_ONNX_PROVIDER=cpu` in `.env` and restart. Zero code changes.
 
 **Why we don't enable OV on the torch variant:** the torch export has baked batch=1 in the node_view_320 Reshape initializer. OV's CPU plugin correctly refuses the shape mismatch where MLAS silently accepts the degenerate form. Enabling OV on the torch path turns every batched request into an empty-markdown response. This is the bug that sank the original 2026-04-22 OV attempt; the fix is the Paddle2ONNX swap (Shipped §6), not toggling OV back on with the old graph.
+
+### 8. `LAYOUT_PREFIX_PIN=true` — monkey-patch glmocr so SGLang RadixCache actually works
+
+**Shipped 2026-04-24.** glmocr's `PageLoader.build_request_from_image` puts the image *first* in the message `content` array and the task prompt (if any) *second*. With our config having no `task_prompt_mapping`, every region request is just `content=[{image_url}]` — no text at all. Every region starts with a completely different token sequence (image tokens), so SGLang's RadixCache has essentially nothing stable to cache across regions. Measured on glm-ocr over 2 560 real regions: prefix-cache hit rate **12 %**, TTFT mean **13.2 s**, actual decode-only mean **0.5 s** — the GPU spends > 95 % of per-region wall time on queue + redundant prefill, not inference.
+
+Fix: `runtime_app.py` monkey-patches `PageLoader.build_request_from_image` at startup to (a) inject a stable default prompt per task type, and (b) place the text item *first* and the image *second* so RadixCache sees a shared prefix across regions:
+
+```python
+content = [
+    {"type": "text", "text": "Transcribe the text in the image."},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+]
+```
+
+Default prompts (kept short to minimize prefill tokens, literal-identical across regions so they slot into the cache as a single reusable prefix):
+
+| task_type | prompt |
+|---|---|
+| `text` | `Transcribe the text in the image.` |
+| `table` | `Convert the table in the image to markdown.` |
+| `formula` | `Write the formula in the image as LaTeX.` |
+
+**Measured impact** (one 20-page c=8 burst, SGLang metric deltas bracketing the run):
+
+| | pre-patch (cumulative baseline) | post-patch (this burst) | Δ |
+|---|:-:|:-:|:-:|
+| Prefix-cache hit rate | 12 % | **56.5 %** | **4.7×** |
+| TTFT mean (per region) | 13.2 s | **6.34 s** | **−52 %** |
+| End-to-end request latency (mean, c=8) | 16.5 s | **11.55 s** | **−30 %** |
+| Client rps (c=8) | 0.41 | **0.57** | **+39 %** |
+| OCR stage per region (mean) | 8.23 s | **5.12 s** | **−38 %** |
+
+**Hit rate ceiling (56 % not 100 %)**: every first-region-per-container-cold-start still has to cache the prompt, and the KV cache on the 8 GB dev card (`max_total_num_tokens=37 710`) is small enough that ~100 concurrent regions at c=8 evict each other's prefix about half the time. On 16 GB+ hardware the ceiling should approach the theoretical 90–95 % for a task-stable prompt.
+
+**Where the patch doesn't help**: at `c ≥ 16`, the KV cache thrashes harder (more concurrent regions, same 37 k-token budget) and the prefix gets evicted before reuse. rps stays flat or slightly regresses vs the no-patch path. Not a bug in the patch — a hardware ceiling that the patch can't fix on its own. On the 16 GB AWS T4 target this ceiling should lift by ~8× in cache capacity, at which point the prefix-pin win likely carries up to c=32+.
+
+**Quality**: A/B regression gate (`scripts/ab_torch_vs_paddle.py`) passes at aggregate −1 % markdown length vs the original torch baseline — same as the prior shipped state. One outlier page (Chinese financial report, `eastmoney_*`) shows −22 % markdown length because the default prompt nudges GLM-OCR toward terser output; manual inspection confirms the output is accurate (numbers, table, Chinese text all correct), just less verbose. If an operator has a workload where every character matters, set `LAYOUT_PREFIX_PIN=false` to restore upstream image-first behavior. Operators who want custom task-specific prompts can add `task_prompt_mapping` to their `config.yaml` and the patch will use that instead of the defaults.
+
+**Rollback:** `LAYOUT_PREFIX_PIN=false` in `.env`, restart. Zero code changes.
+
+**Root cause in glmocr upstream**: this is a two-line fix if done at the `PageLoader` level — swap the image and text `content.append` order, and expose a default prompt mapping. Worth filing upstream. Our monkey-patch is the least-invasive path given we wanted to ship now without waiting on a glmocr release.
 
 ---
 
