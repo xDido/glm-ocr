@@ -601,10 +601,33 @@ def instrument_pipeline(pipeline) -> None:
                 _paddle_opts.intra_op_num_threads = int(
                     os.environ.get("LAYOUT_ONNX_THREADS", "1")
                 )
+                # LAYOUT_ONNX_PROVIDER selects between the stock CPU
+                # kernels (MLAS) and OpenVINO EP's CPU plugin. OV on the
+                # Paddle2ONNX graph is ~1.4-1.5× faster with byte-match
+                # output (see docs/OPTIMIZATIONS.md Queued entry
+                # "LAYOUT_ONNX_PROVIDER=openvino"). OV is NOT safe on the
+                # torch-exported graph (baked batch=1 Reshape); we only
+                # honor this flag on the paddle2onnx variant.
+                _layout_provider = os.environ.get("LAYOUT_ONNX_PROVIDER", "cpu").lower()
+                _paddle_providers = ["CPUExecutionProvider"]
+                _paddle_provider_opts = None
+                if _layout_provider == "openvino":
+                    if "OpenVINOExecutionProvider" in _ort.get_available_providers():
+                        _paddle_providers = ["OpenVINOExecutionProvider"]
+                        _paddle_provider_opts = [{"device_type": "CPU"}]
+                    else:
+                        print(
+                            "[layout] LAYOUT_ONNX_PROVIDER=openvino set but "
+                            "OpenVINOExecutionProvider not available — "
+                            "install onnxruntime-openvino wheel. "
+                            "Falling back to CPUExecutionProvider.",
+                            flush=True,
+                        )
                 _paddle_sess = _ort.InferenceSession(
                     paddle_onnx_path,
                     _paddle_opts,
-                    providers=["CPUExecutionProvider"],
+                    providers=_paddle_providers,
+                    provider_options=_paddle_provider_opts,
                 )
 
                 # glmocr uses a collapsed label vocabulary
@@ -668,6 +691,7 @@ def instrument_pipeline(pipeline) -> None:
                 print(
                     f"[layout] paddle2onnx backend enabled "
                     f"(path={paddle_onnx_path}, "
+                    f"provider={_paddle_providers[0]}, "
                     f"intra_op={_paddle_opts.intra_op_num_threads}); "
                     f"torch model weights released; "
                     f"batch>1 works — LAYOUT_BATCH_ENABLED can be true",

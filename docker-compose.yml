@@ -105,6 +105,12 @@ services:
       # alex-dinh/PP-DocLayoutV3-ONNX export (same weights, no baked
       # batch=1). Takes precedence over LAYOUT_BACKEND/LAYOUT_POSTPROC.
       LAYOUT_VARIANT: ${LAYOUT_VARIANT:-torch}
+      # LAYOUT_ONNX_PROVIDER={cpu,openvino} selects the ORT execution
+      # provider backing LAYOUT_VARIANT=paddle2onnx. openvino = OV EP
+      # (~1.4-1.5× faster, byte-match output, requires onnxruntime-openvino
+      # wheel which the slim image now installs). Ignored on the torch
+      # variant — OV on that graph re-introduces the Reshape silent-empty.
+      LAYOUT_ONNX_PROVIDER: ${LAYOUT_ONNX_PROVIDER:-cpu}
       LAYOUT_ONNX_THREADS: ${LAYOUT_ONNX_THREADS:-1}
       # Phase 1 — numpy post-processing (drop torch from request path).
       # torch = upstream default, safe fallback | numpy = no-torch hot path.
