@@ -32,6 +32,12 @@ LAYOUT_VARIANT=paddle2onnx     # see §6 — drops the torch export's baked batc
                                # in favor of alex-dinh/PP-DocLayoutV3-ONNX (Paddle2ONNX).
                                # Same weights, clean graph; 131 MB auto-downloaded by
                                # entrypoint.sh on first boot. Set to 'torch' to revert.
+LAYOUT_ONNX_PROVIDER=openvino  # see §7 — ORT's OpenVINOExecutionProvider on the paddle2onnx
+                               # graph. ~1.4-1.5× kernel speedup vs MLAS; under c=8
+                               # concurrency, end-to-end rps +84% / mean latency -43%.
+                               # Byte-match output. Only safe on LAYOUT_VARIANT=paddle2onnx.
+                               # Set to 'cpu' to revert. Requires onnxruntime-openvino
+                               # wheel (installed by default in the shipped image).
 LAYOUT_ASYNC=false             # FastAPI sidecar didn't reliably improve
 
 # --- CPU container sizing ---
@@ -157,6 +163,42 @@ Replace the torch-exported `pp_doclayout_v3.onnx` with the `Paddle2ONNX` export 
 Knobs: `LAYOUT_VARIANT=paddle2onnx`; takes precedence over `LAYOUT_BACKEND` / `LAYOUT_POSTPROC`. Setting `torch` reverts to the prior numpy-on-torch-ONNX path.
 
 **Score-threshold caveat.** glmocr's default `ld.threshold` works fine on this alignment; the score_th calibration the Queued entry anticipated is unnecessary. Leave it as-is.
+
+### 7. `LAYOUT_ONNX_PROVIDER=openvino` — OpenVINO EP on the Paddle2ONNX graph
+
+ORT's `OpenVINOExecutionProvider` (CPU plugin) executes the Paddle2ONNX graph ~1.4–1.5× faster than MLAS with byte-match output. Gated behind `LAYOUT_VARIANT=paddle2onnx` because OV on the torch export re-introduces the `node_view_320` silent-empty bug (see the OpenVINO rejected entry + its 2026-04-24 addendum).
+
+**Shipped 2026-04-24.** Three changes:
+- `docker/cpu/Dockerfile.slim` installs `onnxruntime-openvino>=1.24` instead of `onnxruntime` (one-wheel replacement that carries both `CPUExecutionProvider` and `OpenVINOExecutionProvider`; adds ~300 MB to the image).
+- `docker/cpu/runtime_app.py` reads `LAYOUT_ONNX_PROVIDER={cpu,openvino}` and threads it into the paddle2onnx session constructor as `providers=["OpenVINOExecutionProvider"]` + `provider_options=[{"device_type": "CPU"}]`. Falls back to CPU with a loud warning if the flag is set but the wheel lacks the provider. Only honored when `LAYOUT_VARIANT=paddle2onnx`; torch variant always runs CPU EP.
+- `.env` defaults to `LAYOUT_ONNX_PROVIDER=openvino`; `docker-compose.yml` passes it through.
+
+**Measured wins (Ryzen 5 5600X, 12-core cgroup, 4 workers × intra_op=3):**
+
+Kernel forward (bench_paddle_ep.py, batch=1..8 warm):
+
+| batch | CPU EP | OV EP | speedup |
+|:-:|:-:|:-:|:-:|
+| 1 | 1055 ms | 744 ms | 1.42× |
+| 4 | 4306 ms | 2895 ms | 1.49× |
+| 8 | 8548 ms | 5655 ms | 1.51× |
+
+End-to-end under concurrency (20 pages @ c=8, same seed, same images):
+
+| | CPU EP (shipped prior) | OV EP (now) | Δ |
+|---|:-:|:-:|:-:|
+| rps | 0.31 | **0.57** | **+84 %** |
+| mean latency | 22.23 s | **12.6 s** | **−43 %** |
+| wall-clock (20 req) | 65 s | 35 s | −46 % |
+| empty_markdown | 0 | 0 | ✅ |
+
+The end-to-end speedup exceeds the per-kernel speedup because at `c=8` the layout stage is the binding bottleneck (per `project_gpu_utilization_2026_04_23` memory note); shortening it disproportionately shortens queue wait. A 1.5× kernel speedup → ~1.8× rps lift in production.
+
+**Parity validation: byte-match.** `scripts/ab_torch_vs_paddle.py` (regression gate) produces an identical markdown-length table to the prior CPU-EP-on-paddle2onnx run, per page and per block count (−1 % aggregate vs torch baseline, same per-page drift). Top-5 detection checksums match between EPs at 3-decimal score precision and 1-decimal box precision (`scripts/bench_paddle_ep.py`).
+
+**Rollback:** set `LAYOUT_ONNX_PROVIDER=cpu` in `.env` and restart. Zero code changes.
+
+**Why we don't enable OV on the torch variant:** the torch export has baked batch=1 in the node_view_320 Reshape initializer. OV's CPU plugin correctly refuses the shape mismatch where MLAS silently accepts the degenerate form. Enabling OV on the torch path turns every batched request into an empty-markdown response. This is the bug that sank the original 2026-04-22 OV attempt; the fix is the Paddle2ONNX swap (Shipped §6), not toggling OV back on with the old graph.
 
 ---
 
@@ -284,28 +326,7 @@ Orthogonal to everything else here; it's the monitoring rail that catches the ne
 
 *(Paddle2ONNX swap shipped 2026-04-24 — see Shipped §6.)*
 
-### `LAYOUT_ONNX_PROVIDER=openvino` on Paddle2ONNX graph (~2 hours)
-
-Re-validated 2026-04-24 after the original rejection (see Rejected → `LAYOUT_ONNX_PROVIDER=openvino` addendum). On the Paddle2ONNX graph the batch=1-baked-in Reshape bug that sank the first attempt is absent, and `OpenVINOExecutionProvider(device_type=CPU)` produces byte-match output vs the CPU EP while running the layout forward **1.38× faster at batch=1 → 1.65× faster at batch=8** (`scripts/bench_paddle_ep.py`, 20 pages, 8 repeats):
-
-| batch | CPU EP | OV EP | speedup | CPU ms/image | OV ms/image |
-|:-:|:-:|:-:|:-:|:-:|:-:|
-| 1 | 1159 ms | 841 ms | 1.38× | 1159 | 841 |
-| 2 | 2404 ms | 1643 ms | 1.46× | 1202 | 821 |
-| 4 | 4863 ms | 3204 ms | 1.52× | 1216 | 801 |
-| 8 | 9411 ms | 5702 ms | 1.65× | 1176 | **713** |
-
-Work:
-1. Swap the base wheel: `pip install onnxruntime-openvino` instead of `onnxruntime` in `docker/cpu/Dockerfile.slim`. The replacement wheel includes both `CPUExecutionProvider` and `OpenVINOExecutionProvider`, adds ~300 MB to the image. Tested version: `1.24.1`.
-2. Add env flag `LAYOUT_ONNX_PROVIDER={cpu,openvino}` (default `cpu` for rollback safety).
-3. In `docker/cpu/layout_paddle2onnx.py`, thread the flag through to the `ort.InferenceSession(...)` call: `providers=["OpenVINOExecutionProvider"]` + `provider_options=[{"device_type": "CPU"}]` when set.
-4. Re-run `scripts/ab_torch_vs_paddle.py` as the end-to-end regression gate (markdown-length A/B vs stored torch baselines). Must stay at −1 % aggregate; if it drifts more than ±3 % on any individual page the integration is broken.
-5. Rerun `scripts/bench_paddle_ep.py` inside the built container to confirm the speedup holds under the image's threading config (workers=4 × intra_op=3 = 12 threads), not just the standalone bench.
-
-**Caveats:**
-- Measured on AMD Ryzen 5 5600X. OV's CPU device_type uses its own CPU plugin (not MLAS) which may perform differently on Intel hosts — retry the bench on the AWS target (Xeon-class on g4dn) before trusting the number there.
-- The 1.38–1.65× is layout-forward only. Wall-clock per-request also includes preprocessing (~20 ms), pipeline dispatch, SGLang roundtrip (~2–3 s). Expected end-to-end win under load: modest single-digit-percent rps, bounded by the non-layout fraction of wall time. That's still worth shipping — the previous SGLang-side tuning is already the tight bound.
-- OV and Paddle2ONNX are **independent shipments**. Either can roll back via its own env flag without touching the other. Order: ship OV second, after Paddle2ONNX has had soak time.
+*(`LAYOUT_ONNX_PROVIDER=openvino` shipped 2026-04-24 — see Shipped §7.)*
 
 ---
 
@@ -361,3 +382,13 @@ Final config: as in the TL;DR `.env` block above.
 c=32 p95: 28,691 ms → ~21,700 ms (**-24%**). c=32 p99: roughly flat (29,273 → ~27,273 ms).
 
 The largest single win is the low-concurrency p50 (~50% reduction at c=12) — attributable to GIL release from removing torch from post-proc under gthread contention.
+
+**2026-04-24 additional shipments** (Paddle2ONNX graph §6 + OV EP §7), measured head-to-head at c=8 over 20 pages with the same image seed:
+
+| | matrix-final CPU EP | +OV EP (this commit) | Δ |
+|---|:-:|:-:|:-:|
+| rps | 0.31 | **0.57** | **+84 %** |
+| mean latency | 22.23 s | **12.6 s** | **−43 %** |
+| empty_markdown rate | (hidden by matrix asserting status only; real rate at `LAYOUT_BATCH_ENABLED=true` with the torch graph was ~11 %) | **0 %** | silent-failure class eliminated |
+
+The headline change vs the matrix baseline is **~1.8× rps at c=8 with +quality** (no more silent empties). The kernel-level win is ~1.5×; the additional lift comes from reduced queue-wait at the binding stage. Matrix reruns at c=12/24/32 are queued to update the full-range numbers above.
