@@ -66,6 +66,10 @@ EXPERIMENTS = [
     ("I2: max_pixels=921600",                 {"PAGE_LOADER_MAX_PIXELS": "921600"},                      ["cpu"]),
     ("I2: max_pixels=589824",                 {"PAGE_LOADER_MAX_PIXELS": "589824"},                      ["cpu"]),
     ("I2: max_pixels=262144",                 {"PAGE_LOADER_MAX_PIXELS": "262144"},                      ["cpu"]),
+    # TTFT-reduction plan Item 3: prompt shortening.
+    # Shorter prompts cut per-region prefix-cache footprint.
+    ("I3: prompt=OCR",                        {"PROMPT_TEXT": "OCR:", "PROMPT_TABLE": "Table:", "PROMPT_FORMULA": "Formula:"}, ["cpu"]),
+    ("I3: prompt=single_char",                {"PROMPT_TEXT": "T:", "PROMPT_TABLE": "B:", "PROMPT_FORMULA": "F:"},             ["cpu"]),
 ]
 
 

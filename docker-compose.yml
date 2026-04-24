@@ -119,6 +119,11 @@ services:
       PAGE_LOADER_MIN_PIXELS: ${PAGE_LOADER_MIN_PIXELS:-}
       PAGE_LOADER_T_PATCH_SIZE: ${PAGE_LOADER_T_PATCH_SIZE:-}
       PAGE_LOADER_PATCH_EXPAND_FACTOR: ${PAGE_LOADER_PATCH_EXPAND_FACTOR:-}
+      # Task prompt overrides (Item 3). Unset = shipped defaults preserved.
+      # Shorter prompts ("OCR:") cut per-region prefix-cache footprint.
+      PROMPT_TEXT: ${PROMPT_TEXT:-}
+      PROMPT_TABLE: ${PROMPT_TABLE:-}
+      PROMPT_FORMULA: ${PROMPT_FORMULA:-}
       # LAYOUT_PREFIX_PIN=true monkey-patches glmocr's PageLoader to place
       # the text prompt BEFORE the image in the content array and inject a
       # default prompt per task type. This lets SGLang's RadixCache share

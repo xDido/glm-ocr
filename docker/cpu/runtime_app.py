@@ -582,10 +582,18 @@ def instrument_pipeline(pipeline) -> None:
             # Minimal, stable prompts — keep them short so they don't
             # bloat every prefill; keep them literal-identical across
             # regions so they slot into the cache as a reusable prefix.
+            # Task prompts are env-configurable (Item 3 of the TTFT-reduction
+            # plan at ~/.claude/plans/how-can-we-improve-compressed-salamander.md).
+            # Defaults preserve the shipped behavior; shorter alternatives
+            # (e.g. "OCR:") shrink the stable prefix tokens per region and can
+            # lift prefix-cache hit rate under c≥16 concurrency. GLM-OCR is
+            # instruction-tuned so aggressive shortening risks output-style
+            # drift — regression-gate via scripts/ab_torch_vs_paddle.py plus
+            # manual spot-check before shipping a change.
             _DEFAULT_TASK_PROMPTS = {
-                "text":    "Transcribe the text in the image.",
-                "table":   "Convert the table in the image to markdown.",
-                "formula": "Write the formula in the image as LaTeX.",
+                "text":    os.environ.get("PROMPT_TEXT",    "Transcribe the text in the image."),
+                "table":   os.environ.get("PROMPT_TABLE",   "Convert the table in the image to markdown."),
+                "formula": os.environ.get("PROMPT_FORMULA", "Write the formula in the image as LaTeX."),
             }
 
             _orig_build = _PL.build_request_from_image
