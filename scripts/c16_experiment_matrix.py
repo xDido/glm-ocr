@@ -70,6 +70,18 @@ EXPERIMENTS = [
     # Shorter prompts cut per-region prefix-cache footprint.
     ("I3: prompt=OCR",                        {"PROMPT_TEXT": "OCR:", "PROMPT_TABLE": "Table:", "PROMPT_FORMULA": "Formula:"}, ["cpu"]),
     ("I3: prompt=single_char",                {"PROMPT_TEXT": "T:", "PROMPT_TABLE": "B:", "PROMPT_FORMULA": "F:"},             ["cpu"]),
+    # TTFT-reduction plan Item 5: scheduler conservativeness sweep.
+    # Lower → SGLang packs batches tighter → more parallelism. Higher → safer
+    # against eviction thrash. 1.0 is SGLang default; unset also falls back to 1.0.
+    ("I5: sched_cons=0.3",                    {"SGL_SCHEDULE_CONSERVATIVENESS": "0.3"},                  ["sglang"]),
+    ("I5: sched_cons=0.5",                    {"SGL_SCHEDULE_CONSERVATIVENESS": "0.5"},                  ["sglang"]),
+    ("I5: sched_cons=0.8",                    {"SGL_SCHEDULE_CONSERVATIVENESS": "0.8"},                  ["sglang"]),
+    ("I5: sched_cons=1.2",                    {"SGL_SCHEDULE_CONSERVATIVENESS": "1.2"},                  ["sglang"]),
+    # TTFT-reduction plan Item 6: arrival stagger.
+    # Per-call sleep smooths bursty region arrivals at SGLang.
+    ("I6: stagger=5ms",                       {"OCR_REGION_STAGGER_MS": "5"},                             ["cpu"]),
+    ("I6: stagger=10ms",                      {"OCR_REGION_STAGGER_MS": "10"},                            ["cpu"]),
+    ("I6: stagger=20ms",                      {"OCR_REGION_STAGGER_MS": "20"},                            ["cpu"]),
 ]
 
 

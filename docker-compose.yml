@@ -124,6 +124,10 @@ services:
       PROMPT_TEXT: ${PROMPT_TEXT:-}
       PROMPT_TABLE: ${PROMPT_TABLE:-}
       PROMPT_FORMULA: ${PROMPT_FORMULA:-}
+      # Item 6: arrival stagger. When > 0, wraps OCRClient.process with a
+      # small sleep on entry to smooth bursty region submissions at SGLang.
+      # 0 = disabled (default). Sweep {5, 10, 20} ms to find best tradeoff.
+      OCR_REGION_STAGGER_MS: ${OCR_REGION_STAGGER_MS:-0}
       # LAYOUT_PREFIX_PIN=true monkey-patches glmocr's PageLoader to place
       # the text prompt BEFORE the image in the content array and inject a
       # default prompt per task type. This lets SGLang's RadixCache share

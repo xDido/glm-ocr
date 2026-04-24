@@ -646,6 +646,53 @@ def instrument_pipeline(pipeline) -> None:
                 flush=True,
             )
 
+    # Item 6 of the TTFT-reduction plan: optional arrival stagger.
+    # OCR_REGION_STAGGER_MS > 0 wraps OCRClient.process with a small sleep on
+    # entry. Smooths bursty region arrivals at SGLang so the prefix cache has
+    # a chance to populate before duplicate-prompt siblings pile in. Also
+    # reduces thread-pool queue pressure at the CPU container side.
+    # Tradeoff: adds serial latency on the critical path; net-positive only
+    # if TTFT drop exceeds (stagger_ms × regions_per_request / OCR_MAX_WORKERS).
+    _ocr_stagger_ms = 0
+    try:
+        _ocr_stagger_ms = int(os.environ.get("OCR_REGION_STAGGER_MS", "0"))
+    except ValueError:
+        _ocr_stagger_ms = 0
+    if _ocr_stagger_ms > 0:
+        try:
+            _oc = getattr(pipeline, "ocr_client", None)
+            if _oc is not None and hasattr(_oc, "process"):
+                import threading as _th
+                import time as _time
+                _stagger_sec = _ocr_stagger_ms / 1000.0
+                _orig_ocr_process = _oc.process
+                _stagger_counter = [0]
+                _stagger_lock = _th.Lock()
+
+                def _staggered_process(*args, **kwargs):
+                    # Per-call monotonic offset: 0, STAGGER, 2×STAGGER, ...
+                    # reset periodically so long-lived workers don't accumulate
+                    # unbounded delay. Spread = up to OCR_MAX_WORKERS × stagger.
+                    with _stagger_lock:
+                        idx = _stagger_counter[0]
+                        _stagger_counter[0] = (idx + 1) % 32  # matches OCR_MAX_WORKERS=32
+                    _time.sleep(_stagger_sec * idx)
+                    return _orig_ocr_process(*args, **kwargs)
+
+                _oc.process = _staggered_process
+                print(
+                    f"[stagger] OCR_REGION_STAGGER_MS={_ocr_stagger_ms} — "
+                    f"inter-region stagger enabled (max spread "
+                    f"{_ocr_stagger_ms * 32}ms over 32-worker cycle)",
+                    flush=True,
+                )
+        except Exception as e:
+            print(
+                f"[stagger] patch failed, falling back to no-stagger: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
     # Layout: one call per page-batch. We only care about wall time; the
     # batch size is visible in other gauges and lots of batches are size 1
     # in this benchmark anyway.
