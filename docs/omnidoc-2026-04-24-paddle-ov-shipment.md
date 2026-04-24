@@ -187,9 +187,30 @@ Layout's share dropped from ~50 % (pre-OV-EP) to 29 %. Further layout cuts (TRT 
 
 ---
 
+## Attempted (and rolled back this session)
+
+### Experiment A — explicit OV thread pin via `provider_options` (reverted)
+
+Hypothesis: the 3×–11× layout slowdown at c≥16 was OV's CPU plugin spawning its own thread pool (≈ cores × 2 by default) independently of ORT's `intra_op_num_threads`, causing 4 gunicorn workers × OV default = oversubscription on the 12-core cgroup.
+
+Change: passed `provider_options=[{"device_type":"CPU","num_of_threads":"3","num_streams":"1"}]` to the OV EP session constructor. Rebuilt, re-ran the matrix at c=8/16/24 n=20.
+
+Result — **net negative**:
+
+| c | layout s/call (unpinned) | layout s/call (pinned at 3) | Δ |
+|:-:|:-:|:-:|:-:|
+| 8  | 3.23 | **8.21** | +154 % worse |
+| 16 | 10.34 | 24.37 | +136 % worse |
+| 24 | 36.14 | 31.22 | −13 % better |
+
+Inference: OV's unpinned default is doing something smarter than "one fixed small pool per session" — likely sharing a global thread pool across sessions or ramping up under load. My aggressive `num_of_threads=3` starved the c=8 path (where OV had been effectively using more threads). The marginal c=24 improvement wasn't worth the c=8 regression; rolled back in the same session, commit `<TBD>`. The comment block in `runtime_app.py`'s OV branch documents this so we don't retry with the same small pin.
+
+Next experiments (not yet attempted): raise `num_of_threads` to `cgroup_cores / n_workers = 3` × some multiplier — or set it per-worker rather than per-session; try `num_streams > 1` with appropriate `num_of_threads` scaling; OR move to experiment B (startup prewarm across batch sizes 1..8) which targets the per-batch-shape recompile hypothesis rather than the thread one. No A/B gate broken by any of this — all three approaches are purely perf experiments against a stable correctness baseline.
+
 ## Queued (not shipped this session)
 
-- **OV EP thread/compile tuning for c≥16 scaling** (~2 hrs) — the matrix result shows OV EP wins at c=8 but degrades at c=16+ (layout 3×–11× slower per call). Try `provider_options={"num_streams":"1","num_of_threads":"3"}` to explicitly cap OV's internal parallelism; pre-warm the session at batch sizes 1..8 during startup so shape-specific compile overhead is front-loaded rather than paid per-incoming-batch-shape. If tuning still caps at c=8, document the hardware ceiling and add a runtime auto-fallback to CPU EP when the upstream queue depth exceeds a threshold.
+- **Experiment B — OV startup prewarm across batch sizes** (~1 hr) — at worker startup, run the OV session once at each batch size 1..8 so any shape-specific compile is paid up-front. Targets the alternative hypothesis (OV recompiling per new batch shape as the batcher coalesces different counts).
+- **Experiment C — runtime auto-fallback on queue depth** (~2 hrs) — monitor in-flight request count; fall back to CPU EP when it exceeds a threshold (e.g. 8). Bulletproof but lower ceiling.
 - **Driver body-content assertion** (~1 hr) — every OCR load driver (locust, asyncio, k6) currently marks HTTP 2xx as success. The silent-empty class of bug is invisible to them. Add `len(resp.json()['markdown_result']) > 0` as a success predicate, expose `empty-markdown` as its own failure category. This is the monitoring rail that would have caught both the OpenVINO and `LAYOUT_BATCH_ENABLED` regressions at commit time. **Also the prerequisite to computing a true rps comparison** against the historical matrix numbers (which were inflated by silent empties). Should ship before the next OV-class experiment.
 - **TRT / GPU layout on T4 target** — per `project_kernel_levers_2026_04_23` memory, layout forward is 76 % Conv and Conv on T4 is 20× faster than Ryzen CPU. The 8 GB dev card can't host layout + SGLang. On the 16 GB AWS g4dn target, moving layout to GPU via TRT (batch-safe on Paddle2ONNX) is the next ~20× opportunity after exhausting CPU tuning.
 - **Full OmniDocBench F1 evaluator run** — predictions dir `eval/predictions/` still has the 1647/1651 torch-path OCR outputs from the afternoon. The `ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204` Docker image is pulled. Eval is ~60–90 min wall; needed to anchor a proper quality baseline before quality-sensitive changes (detector swap, threshold tuning).

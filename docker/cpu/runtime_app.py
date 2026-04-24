@@ -614,6 +614,17 @@ def instrument_pipeline(pipeline) -> None:
                 if _layout_provider == "openvino":
                     if "OpenVINOExecutionProvider" in _ort.get_available_providers():
                         _paddle_providers = ["OpenVINOExecutionProvider"]
+                        # Note: we deliberately do NOT pass num_of_threads /
+                        # num_streams here. Experiment A (2026-04-24) tested
+                        # num_of_threads=LAYOUT_ONNX_THREADS + num_streams=1
+                        # hoping to cap OV thread oversubscription under
+                        # c≥16. It backfired — c=8 layout went 3.23s → 8.21s
+                        # (2.5× regression) with only a 13% improvement at
+                        # c=24. OV's unpinned default does something smarter
+                        # than a fixed small pool (likely shares threads
+                        # across sessions or ramps up under load). See
+                        # docs/omnidoc-2026-04-24-paddle-ov-shipment.md for
+                        # the full experiment record.
                         _paddle_provider_opts = [{"device_type": "CPU"}]
                     else:
                         print(
