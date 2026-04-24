@@ -203,6 +203,20 @@ Fix shipped as §8 `LAYOUT_PREFIX_PIN=true`: `runtime_app.py` monkey-patches `Pa
 
 At c ≥ 16 the patch is flat (the 37 k-token KV cache on the 8 GB card thrashes under 100+ concurrent regions, evicting the prefix before reuse). On the 16 GB T4 target cache is ~8× bigger and the win should carry further.
 
+## Also shipped (memory tradeoff — end-of-session)
+
+`SGL_MEM_FRACTION_STATIC=0.95 → 0.83`. Shrinks the static KV-cache reservation from 37 710 tokens to 24 298 tokens (−35 %) and frees ~1 GB into SGLang's dynamic pool (1.26 GB → 2.21 GB free). Three effects on the fresh matrix:
+
+| c | 0.95 + prefix-pin | **0.83 + prefix-pin** | delta |
+|:-:|:-:|:-:|:-:|
+| 8 | rps 0.57, mean 11.55 s | **rps 0.63, mean 11.03 s** | +11 % rps |
+| 16 | rps 0.16, mean 38.9 s | 0.15, 37.1 s | flat |
+| 32 | **crashed SGLang mid-run** | **rps 0.22, mean 62 s, 0 err** | stability unlocked |
+
+The counterintuitive detail: prefix cache hit rate collapsed from 56.5 % to 12.3 % at the smaller cache — but TTFT *still dropped* (6.34 s → 5.58 s). Runtime headroom (more room for spec-decoding buffers, larger effective running batch) beats cache depth on this 8 GB card. On a 16 GB+ target the tradeoff likely inverts: keep both knobs higher and the cache win and the headroom win compound instead of trading.
+
+**Full session improvement at c=8**: pre-session rps 0.31 → final rps 0.63 = **2.0×** on identical seed/page sample. Plus c=32 now runs cleanly instead of crashing.
+
 ## Attempted (and rolled back this session)
 
 ### Experiment A — explicit OV thread pin via `provider_options` (reverted)

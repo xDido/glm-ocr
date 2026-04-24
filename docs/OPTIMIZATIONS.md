@@ -247,6 +247,27 @@ Default prompts (kept short to minimize prefill tokens, literal-identical across
 
 **Root cause in glmocr upstream**: this is a two-line fix if done at the `PageLoader` level — swap the image and text `content.append` order, and expose a default prompt mapping. Worth filing upstream. Our monkey-patch is the least-invasive path given we wanted to ship now without waiting on a glmocr release.
 
+### 9. `SGL_MEM_FRACTION_STATIC=0.83` — trade KV cache for dynamic headroom on 8 GB cards
+
+**Shipped 2026-04-24.** `SGL_MEM_FRACTION_STATIC=0.95` had SGLang reserve 95 % of the 3060 Ti's 8 GB for static allocations (model weights + KV cache + captured cuda graphs), leaving only ~1.26 GB of dynamic memory for activations, spec-decoding draft buffers, and per-request scratch. That margin is too thin for anything past `c=16`:
+
+- Matrix sweep at c=24 n=50 crashed SGLang mid-run with `HealthWatchdog: OCR service at sglang:30000 is no longer available` and auto-restart (session report "SGLang stability note").
+- c=32 never completed under 0.95 — same crash pattern every time.
+
+Dropping to `0.83` frees ~1 GB into the dynamic pool at the cost of shrinking the KV cache from **37 710 → 24 298 tokens** (−35 %). Measured impact (all under `LAYOUT_PREFIX_PIN=true`, same 20-page seed, same paddle2onnx + OV EP stack):
+
+| c | 0.95 | 0.83 | Δ |
+|:-:|:-:|:-:|:-:|
+| 8 | rps 0.57, mean 11.55 s | **rps 0.63, mean 11.03 s** | **+11 %** |
+| 16 | rps 0.16, mean 38.9 s | rps 0.15, mean 37.1 s | flat (noise) |
+| 32 | **crashed SGLang** | **rps 0.22, mean 62 s, 0 err** | **stability unlocked** |
+
+**Counter-intuitive finding**: the prefix-cache hit rate collapsed from 56 % → 12 % when the KV cache shrank (24 k tokens can't hold the prefix under 100+ concurrent regions). But TTFT *still improved* from 6.34 s → 5.58 s. The dynamic-pool headroom buys more than the cache loses — larger effective running batch, less spec-decoding pressure on the pool, fewer cache-eviction stalls. This is a hardware-specific tradeoff: on an 8 GB card with `max_running_requests=64`, runtime working memory wins over cache depth.
+
+**On the 16 GB AWS T4 target this tradeoff likely inverts.** With 8× more VRAM headroom the static fraction can safely go back to 0.90–0.95 because the dynamic pool has absolute GB to spare; at that point the prefix cache can grow to ~200 k tokens, which should hold the prefix across even c=64+ workloads, and the §8 prefix-pin win compounds instead of flattening. Re-tune both knobs together when the deployment target changes.
+
+**Rollback:** `SGL_MEM_FRACTION_STATIC=0.95` in `.env`, restart sglang. Zero code changes. Note that rolling back on this hardware will re-introduce the c ≥ 24 SGLang crash.
+
 ---
 
 ## Rejected — documented so you don't re-try them without a new hypothesis
