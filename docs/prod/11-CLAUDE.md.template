@@ -56,7 +56,6 @@ LAYOUT_ONNX_THREADS=2
 LAYOUT_BATCH_ENABLED=true
 LAYOUT_BATCH_MAX=8            # don't exceed 8 — caused c=64 disconnects
 LAYOUT_BATCH_WINDOW_MS=20
-LAYOUT_ASYNC=false            # FastAPI sidecar didn't help; see memory
 SGLANG_HOST=127.0.0.1         # always local — sigv4-proxy sidecar
 SGLANG_PORT=30000
 
@@ -82,7 +81,7 @@ Distilled from `memory/` + `docs/OPTIMIZATIONS.md`. Full context in `docs/prod/r
 
 3. **DocLayout-YOLO is NOT faster on this CPU.** Despite public benchmarks claiming 3× — those were GPU. On Zen3/Cascade-Lake CPU, YOLO is 3× *slower* at imgsz=1024. Don't swap detectors without re-running `docker/cpu/tests/probe_doclayout_yolo.py` on the prod Fargate vCPU class.
 
-4. **FastAPI async sidecar is net-worse than gunicorn.** Removes the gthread back-pressure; c=40+ triggers HealthWatchdog because SGLang saturates. Leave `LAYOUT_ASYNC=false`.
+4. **FastAPI async sidecar was rejected and removed (2026-04-25).** The image used to ship a uvicorn sidecar gated on `LAYOUT_ASYNC=true`; removing gunicorn's gthread back-pressure made c=40+ trigger HealthWatchdog and c=64 trigger ServerDisconnectedError. The flag, the FastAPI/uvicorn deps, and `async_app.py` are gone. Don't re-add without a new hypothesis — LitServe/RayServe hit the same CPU-kernel ceiling.
 
 5. **CUDA IPC Transport is gated by VRAM.** Fails on 8 GB dev card (33 OOMs). Plumbing is in the container; try enabling on 16 GB g4dn after first-ship smoke. If it OOMs there too, disable.
 

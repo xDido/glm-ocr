@@ -50,7 +50,6 @@ PROMPT_TEXT=OCR:               # see §11 — replace verbose default task promp
 PROMPT_TABLE=Table:            # 3-token stubs. Shrinks per-region prefix footprint in
 PROMPT_FORMULA=Formula:        # RadixCache. Combines with §10 for the compound win;
                                # watch eastmoney-style dense-text pages for regression.
-LAYOUT_ASYNC=false             # FastAPI sidecar didn't reliably improve
 
 # --- CPU container sizing ---
 CPU_WORKERS=4                  # gunicorn processes
@@ -375,7 +374,7 @@ Rolled back. Likely causes: opset-18 fallback from onnxscript (requested 17), an
 
 Over 2 averaged runs: only c=24 rps +11% (inside the ±15–25% single-run noise envelope); c=32 regressed -16% with 12 avg failures; c=12 tails widened. The async boundary doesn't actually unblock anything on this workload because `pipeline.process` is GIL-bound under the hood — `asyncio.to_thread` just trampolines into the same pool gthread would have used.
 
-Left in the repo behind `LAYOUT_ASYNC=true` in case the workload shape changes enough for asyncio to pay off.
+Removed from the image on 2026-04-25: the `LAYOUT_ASYNC` flag, `docker/cpu/async_app.py`, the entrypoint sidecar block, and the `fastapi`/`uvicorn[standard]` pip deps are all gone. Re-introducing the experiment now requires real plumbing, not a `.env` flip — intentional friction so it isn't re-run lightly.
 
 ### `CPU_THREADS=32` (was 16)
 

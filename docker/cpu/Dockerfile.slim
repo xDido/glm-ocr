@@ -53,9 +53,7 @@ RUN pip install \
       "prometheus-client>=0.19" \
       "onnxruntime-openvino>=1.24" \
       "onnx>=1.16" \
-      "onnxscript>=0.1" \
-      "fastapi>=0.100,<1" \
-      "uvicorn[standard]>=0.30,<1"
+      "onnxscript>=0.1"
 
 COPY export_layout_onnx.py /app/export_layout_onnx.py
 
@@ -63,7 +61,6 @@ COPY wsgi.py /app/wsgi.py
 COPY runtime_app.py /app/runtime_app.py
 COPY layout_postprocess.py /app/layout_postprocess.py
 COPY layout_paddle2onnx.py /app/layout_paddle2onnx.py
-COPY async_app.py /app/async_app.py
 COPY gunicorn_conf.py /app/gunicorn_conf.py
 COPY config.yaml.template /app/config.yaml.template
 COPY config.layout-off.template /app/config.layout-off.template

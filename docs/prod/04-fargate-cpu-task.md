@@ -63,7 +63,6 @@ containerDefinitions:
       LAYOUT_POSTPROC: "numpy"
       LAYOUT_GRAPH: "raw"
       LAYOUT_COMPILE: "false"
-      LAYOUT_ASYNC: "false"
       LAYOUT_BATCH_ENABLED: "true"
       LAYOUT_BATCH_MAX: "8"
       LAYOUT_BATCH_WINDOW_MS: "20"

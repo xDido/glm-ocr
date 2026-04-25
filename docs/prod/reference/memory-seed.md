@@ -32,7 +32,7 @@ When explaining numbers, show trends and context (baseline, noise band) not just
 
 **Why:** the user's judgment on what's worth trying may differ from mine, and measurement is cheap.
 
-**How to apply:** `LAYOUT_ASYNC`, `LAYOUT_POSTPROC`, `LAYOUT_GRAPH`, `LAYOUT_COMPILE` are all env-flag rollbacks shipped this way — kept or rejected on measurement, not opinion.
+**How to apply:** `LAYOUT_POSTPROC`, `LAYOUT_GRAPH`, `LAYOUT_COMPILE` are env-flag rollbacks shipped this way — kept or rejected on measurement, not opinion. (`LAYOUT_ASYNC` was added the same way and removed on 2026-04-25 once the rejection was conclusive.)
 
 ---
 
@@ -104,13 +104,15 @@ CUDA IPC Transport (`SGLANG_USE_CUDA_IPC_TRANSPORT=1`) crash-loops on 8 GB dev 3
 
 ---
 
-## Project: FastAPI async sidecar rejected 2026-04-23 (project)
+## Project: FastAPI async sidecar rejected and removed 2026-04-25 (project)
 
-`LAYOUT_ASYNC=true` net-neutral to worse vs gunicorn baseline. Introduced HealthWatchdog 500s at c=40 (34 fails) + ServerDisconnectedError at c=64 (11 fails). Running-count peaks unchanged (9–11 vs baseline 9–16) — confirms HTTP admission isn't the lever.
+`LAYOUT_ASYNC=true` was net-neutral to worse vs the gunicorn baseline. Introduced HealthWatchdog 500s at c=40 (34 fails) + ServerDisconnectedError at c=64 (11 fails). Running-count peaks unchanged (9–11 vs baseline 9–16) — confirms HTTP admission isn't the lever.
 
-**Why it broke:** async removes gunicorn's implicit `CPU_WORKERS × CPU_THREADS = 64` gthread back-pressure. SGLang saturated past its comfort threshold.
+**Why it broke:** async removed gunicorn's implicit `CPU_WORKERS × CPU_THREADS = 64` gthread back-pressure. SGLang saturated past its comfort threshold.
 
-**How to apply in prod:** keep `LAYOUT_ASYNC=false`. Don't spend time on LitServe / RayServe; they hit the same CPU-kernel ceiling.
+**Status:** the `LAYOUT_ASYNC` flag, the FastAPI/uvicorn pip deps, `docker/cpu/async_app.py`, and the entrypoint sidecar block were all removed on 2026-04-25 to keep the production image lean. The historical conclusion stands.
+
+**How to apply in prod:** don't re-add a FastAPI/uvicorn sidecar. Don't spend time on LitServe / RayServe; they hit the same CPU-kernel ceiling.
 
 ---
 

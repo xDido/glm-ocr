@@ -30,7 +30,6 @@ LAYOUT_ONNX_THREADS=2          # saturates 8-core cgroup: 4 workers x 2 ORT = 8
 LAYOUT_BATCH_ENABLED=true      # cross-request layout coalescer
 LAYOUT_BATCH_MAX=8             # >8 causes c=64 ServerDisconnectedError
 LAYOUT_BATCH_WINDOW_MS=20
-LAYOUT_ASYNC=false             # FastAPI sidecar net-worse vs gunicorn
 
 # --- CPU container sizing ---
 CPU_WORKERS=4                  # gunicorn processes
@@ -108,7 +107,7 @@ All other values **carry over unchanged**. Do not re-derive. If you think a valu
 | `LAYOUT_BATCH_MAX=8` | >8 caused c=64 disconnects in dev measurements |
 | `LAYOUT_POSTPROC=numpy` (not torch) | Torch path is slower; numpy path has bit-parity validated |
 | `LAYOUT_GRAPH=raw` (not fused) | Fused regressed at c=24/32 in dev; kept the flag for future |
-| `LAYOUT_ASYNC=false` | Async sidecar tested — net-worse + introduced c=40 failures |
+| ~~`LAYOUT_ASYNC`~~ (removed 2026-04-25) | Async sidecar was tested and removed; c=40 HealthWatchdog + c=64 ServerDisconnectedError. Don't re-add without new hypothesis |
 | `SGL_CONTEXT_LENGTH >= 8432` | Hard floor: glmocr sends `max_tokens=8192`; SGLang strictly enforces `prompt + max_tokens <= context_length` |
 | `SGLANG_HOST=127.0.0.1` | sigv4-proxy sidecar assumes loopback; public SageMaker URL would bypass signing + 403 |
 

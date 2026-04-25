@@ -77,7 +77,6 @@ services:
     restart: unless-stopped
     ports:
       - "${GLMOCR_PORT:-5002}:5002"
-      - "${ASYNC_PORT:-5003}:5003"
     environment:
       CPU_WORKERS: ${CPU_WORKERS}
       CPU_THREADS: ${CPU_THREADS}
@@ -145,11 +144,6 @@ services:
       LAYOUT_BATCH_ENABLED: ${LAYOUT_BATCH_ENABLED:-false}
       LAYOUT_BATCH_MAX: ${LAYOUT_BATCH_MAX:-4}
       LAYOUT_BATCH_WINDOW_MS: ${LAYOUT_BATCH_WINDOW_MS:-20}
-      # Optional async FastAPI sidecar (LAYOUT_ASYNC=true starts uvicorn
-      # on ASYNC_PORT alongside gunicorn). Rolled back — kept behind flag.
-      LAYOUT_ASYNC: ${LAYOUT_ASYNC:-false}
-      ASYNC_PORT: ${ASYNC_PORT:-5003}
-      ASYNC_WORKERS: ${ASYNC_WORKERS:-4}
       HF_HOME: /root/.cache/huggingface
       HF_TOKEN: ${HF_TOKEN}
       SGLANG_HOST: ${SGLANG_HOST}
