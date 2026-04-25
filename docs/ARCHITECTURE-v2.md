@@ -7,7 +7,6 @@
 | **Last updated** | 2026-04-25 |
 | **Owner** | GLM-OCR platform team |
 | **Predecessor** | `docs/ARCHITECTURE.md` (v1, file layout and deployment shape) |
-| **Companion** | `docs/OPTIMIZATIONS.md` (rationale for each tuning knob) |
 
 ## TL;DR
 
@@ -153,7 +152,7 @@ Gunicorn master (pid 1) calls `socket(), bind(), listen()` on 0.0.0.0:5002 and t
 
 ### 1.3 gthread worker acceptance
 
-Worker class `gthread` is required (see `OPTIMIZATIONS.md` supporting-knob Section 5). The alternatives all fail in this stack:
+Worker class `gthread` is required. The alternatives all fail in this stack:
 
 - `sync` would dedicate one entire worker to one request at a time. With 4 workers, max in-flight is 4, so at c=8 half of all requests would block on `accept()`.
 - `gevent` and `eventlet` monkey-patch stdlib threading, which breaks PyTorch and ONNX Runtime's C-level thread pools. Their TBB/OpenMP kernels assume OS threads, not greenlets, and silently misbehave under monkey-patching.
@@ -179,7 +178,7 @@ This runs **once per worker at import time**, well before the first request arri
 
 ### 2.1 Route dispatch
 
-Flask's Werkzeug routing maps `POST /glmocr/parse` to `glmocr/server.py:75 @app.route("/glmocr/parse", methods=["POST"])`. The `prometheus-flask-exporter` middleware wraps the handler to record `flask_http_request_duration_seconds` histogram buckets keyed by `url_rule + method + status` (see OPTIMIZATIONS.md Section 5 for why the shared-tmpfs multiproc dir matters across workers).
+Flask's Werkzeug routing maps `POST /glmocr/parse` to `glmocr/server.py:75 @app.route("/glmocr/parse", methods=["POST"])`. The `prometheus-flask-exporter` middleware wraps the handler to record `flask_http_request_duration_seconds` histogram buckets keyed by `url_rule + method + status`. A shared-tmpfs Prometheus multiproc directory is required because each gunicorn worker is its own process and metrics must be aggregated across them.
 
 ### 2.2 `def parse()` — body validation
 
@@ -452,7 +451,7 @@ content = [
 - With image-first ordering, every region's prefix consists of unique image tokens, yielding a 0% cache hit rate.
 - With text-first ordering, the prompt tokens (`"Transcribe the text..."` plus the chat-template wrapper) are identical across all regions, enabling cache hits.
 
-Measured impact: **12% → 56% prefix-cache hit rate**, with TTFT cut roughly in half at c=8. See `OPTIMIZATIONS.md` Section 8 for the full rollout history.
+Measured impact: **12% → 56% prefix-cache hit rate**, with TTFT cut roughly in half at c=8.
 
 ### 6.2 Base64 encoding
 
@@ -477,7 +476,7 @@ POST http://sglang:30000/v1/chat/completions
 
 ### 6.4 Retry logic
 
-`OCRClient` has a built-in retry loop. Configuration: `retry_max_attempts: 2`, exponential backoff 0.5–8 s, retries on HTTP 429 / 500 / 502 / 503 / 504. Under SGLang overload this fires; if SGLang is still unhealthy on the third attempt, the request returns empty content. This is one of the silent-empty failure paths described in Section 10.1: the HTTP envelope is 200 OK, but `markdown_result=""`. Load drivers must therefore assert on response body content, not just HTTP status. See `OPTIMIZATIONS.md` "Driver body-content assertion" for the mitigation plan.
+`OCRClient` has a built-in retry loop. Configuration: `retry_max_attempts: 2`, exponential backoff 0.5–8 s, retries on HTTP 429 / 500 / 502 / 503 / 504. Under SGLang overload this fires; if SGLang is still unhealthy on the third attempt, the request returns empty content. This is one of the silent-empty failure paths described in Section 10.1: the HTTP envelope is 200 OK, but `markdown_result=""`. Load drivers must therefore assert on response body content, not just HTTP status.
 
 ---
 
@@ -659,7 +658,7 @@ Three load-bearing invariants:
 2. **Actual GPU compute accounts for ~5%** of wall time. The GPU is idle or queue-blocked for the remainder.
 3. **Prefix caching is the largest latency lever.** Every percentage point of cache hit translates directly to less prefill compute. The current 12–56% hit rate (load-dependent) has significant headroom.
 
-At c=16, queue depth roughly doubles and TTFT climbs to ~13 s, while decode remains at ~0.5 s. See `OPTIMIZATIONS.md` Section 8 for the measurement methodology.
+At c=16, queue depth roughly doubles and TTFT climbs to ~13 s, while decode remains at ~0.5 s.
 
 ---
 
@@ -673,7 +672,7 @@ The most dangerous failure class: HTTP 200 with `markdown_result=""`. Three know
 - **SGLang unavailable or refusing connections.** The internal `OCRClient` retry loop exhausts and returns empty content rather than propagating an error.
 - **Layout detects zero regions.** A legitimate edge case for near-blank pages.
 
-All three are indistinguishable to a load driver that only checks HTTP status. Drivers must assert on response body content (`len(markdown_result) > 0`) as a non-negotiable invariant. See `OPTIMIZATIONS.md` "Driver body-content assertion" for the rollout plan.
+All three are indistinguishable to a load driver that only checks HTTP status. Drivers must assert on response body content (`len(markdown_result) > 0`) as a non-negotiable invariant.
 
 ### 10.2 Timeouts
 
@@ -703,11 +702,11 @@ A performance pathology rather than a hard failure. When concurrent requests evi
 
 | Topic | Primary reference |
 |---|---|
-| Paddle2ONNX adapter | `docker/cpu/layout_paddle2onnx.py` + `OPTIMIZATIONS.md` Section 6 |
-| OpenVINO Execution Provider wiring | `docker/cpu/runtime_app.py:595-635` + `OPTIMIZATIONS.md` Section 7 |
-| Prefix-pin monkey-patch | `docker/cpu/runtime_app.py:549-597` + `OPTIMIZATIONS.md` Section 8 |
-| Memory-fraction tradeoff | `.env:SGL_MEM_FRACTION_STATIC` + `OPTIMIZATIONS.md` Section 9 |
-| Rejected optimization paths | `OPTIMIZATIONS.md` "Rejected" section + `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
+| Paddle2ONNX adapter | `docker/cpu/layout_paddle2onnx.py` |
+| OpenVINO Execution Provider wiring | `docker/cpu/runtime_app.py:595-635` |
+| Prefix-pin monkey-patch | `docker/cpu/runtime_app.py:549-597` |
+| Memory-fraction tradeoff | `.env:SGL_MEM_FRACTION_STATIC` |
+| Rejected optimization paths | `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
 | Experiment log | `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
 | File-by-file walkthrough | `docs/ARCHITECTURE.md` (v1) |
 | Matrix-noise calibration methodology | Internal load-test playbook |
@@ -810,7 +809,7 @@ flowchart LR
     class C,D,E,F,G many
 ```
 
-At c=8 the CPU container is nowhere near its hard caps (8/64 gthreads, 112/2048 aiohttp connections). The downstream SGLang running-batch cap of 64 is hit at c ≈ 5 pages-in-flight, since each page fans out to ~14 regions. **SGLang's scheduler is the binding constraint, not any CPU-side slot count.** Every optimization in `OPTIMIZATIONS.md` Sections 6–9 either reduces SGLang queue depth (prefix-pin, memory-fraction) or makes layout faster so that regions arrive at SGLang in smaller bursts, allowing the queue more time to drain between bursts.
+At c=8 the CPU container is nowhere near its hard caps (8/64 gthreads, 112/2048 aiohttp connections). The downstream SGLang running-batch cap of 64 is hit at c ≈ 5 pages-in-flight, since each page fans out to ~14 regions. **SGLang's scheduler is the binding constraint, not any CPU-side slot count.** Effective optimizations therefore either reduce SGLang queue depth (prefix-pin, memory-fraction tuning) or make layout faster so that regions arrive at SGLang in smaller bursts, allowing the queue more time to drain between bursts.
 
 ---
 
@@ -939,6 +938,6 @@ This document is intended to stay in sync with the running production stack. Whe
 1. Update Section 0.1 (slot inventory) with the new value.
 2. Update the relevant phase section.
 3. Re-render Mermaid diagrams using `mmdc -i docs/ARCHITECTURE-v2.md -o docs/diagrams/arch-v2.svg -e svg` and check that all 9 diagrams render.
-4. If a measurement (TTFT, hit rate, RPS) changes by more than 10%, update Section 9 and the cross-reference in `OPTIMIZATIONS.md`.
+4. If a measurement (TTFT, hit rate, RPS) changes by more than 10%, update Section 9.
 
 For questions on any specific path or to flag drift between this document and shipped reality, contact the GLM-OCR platform team.
