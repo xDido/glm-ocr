@@ -38,10 +38,8 @@ Engineers familiar with Docker, Flask, and Python concurrency who need to unders
 - [7. The SGLang GPU side](#7-the-sglang-gpu-side)
 - [8. Response assembly back on the CPU container](#8-response-assembly-back-on-the-cpu-container)
 - [9. Per-stage latency budget at c=8](#9-per-stage-latency-budget-at-c8)
-- [10. Failure modes](#10-failure-modes)
-- [11. Cross-reference map](#11-cross-reference-map)
-- [12. Threading model — quick recap](#12-threading-model--quick-recap)
-- [13. Appendix: Layout inference — CPU vs GPU placement](#13-appendix-layout-inference--cpu-vs-gpu-placement)
+- [10. Threading model — quick recap](#10-threading-model--quick-recap)
+- [11. Appendix: Layout inference — CPU vs GPU placement](#11-appendix-layout-inference--cpu-vs-gpu-placement)
 
 ---
 
@@ -476,7 +474,7 @@ POST http://sglang:30000/v1/chat/completions
 
 ### 6.4 Retry logic
 
-`OCRClient` has a built-in retry loop. Configuration: `retry_max_attempts: 2`, exponential backoff 0.5–8 s, retries on HTTP 429 / 500 / 502 / 503 / 504. Under SGLang overload this fires; if SGLang is still unhealthy on the third attempt, the request returns empty content. This is one of the silent-empty failure paths described in Section 10.1: the HTTP envelope is 200 OK, but `markdown_result=""`. Load drivers must therefore assert on response body content, not just HTTP status.
+`OCRClient` has a built-in retry loop. Configuration: `retry_max_attempts: 2`, exponential backoff 0.5–8 s, retries on HTTP 429 / 500 / 502 / 503 / 504. Under SGLang overload this fires; if SGLang is still unhealthy on the third attempt, the request returns empty content with HTTP 200. Load drivers must therefore assert on response body content (`len(markdown_result) > 0`), not just HTTP status.
 
 ---
 
@@ -662,58 +660,7 @@ At c=16, queue depth roughly doubles and TTFT climbs to ~13 s, while decode rema
 
 ---
 
-## 10. Failure modes
-
-### 10.1 Silent empty-markdown
-
-The most dangerous failure class: HTTP 200 with `markdown_result=""`. Three known root causes:
-
-- **Layout ONNX crashes mid-batch.** The `node_view_320` Reshape bug on the torch-exported graph; resolved by the Paddle2ONNX migration described in Section 5.
-- **SGLang unavailable or refusing connections.** The internal `OCRClient` retry loop exhausts and returns empty content rather than propagating an error.
-- **Layout detects zero regions.** A legitimate edge case for near-blank pages.
-
-All three are indistinguishable to a load driver that only checks HTTP status. Drivers must assert on response body content (`len(markdown_result) > 0`) as a non-negotiable invariant.
-
-### 10.2 Timeouts
-
-| Knob | Bound |
-|---|---|
-| `OCR_REQUEST_TIMEOUT=60` | Each CPU → SGLang HTTP call. |
-| `OCR_RETRY_MAX=2` | Up to 3 total attempts per region. |
-| `GUNICORN_TIMEOUT=480` | The entire `/glmocr/parse` call end-to-end. |
-
-If SGLang is fully unavailable, each region can spend up to `3 × 60 = 180 s` waiting before the handler gives up. Combined with the 20 ms layout batch window, this can cascade into many pages' worth of regions timing out together. The `_health_watchdog` thread mitigates this by polling SGLang's `/health` endpoint and proactively aborting in-flight work if health checks fail for more than N seconds.
-
-### 10.3 SGLang crashes and OOMs
-
-On the 8 GB development card at `SGL_MEM_FRACTION_STATIC=0.95`, SGLang previously crashed mid-run at c ≥ 24 (OOM on the dynamic pool). Resolved by dropping to `0.83` (Section 9). The CPU-side `_health_watchdog` detects this within 5–10 s and surfaces the event in logs. SGLang auto-restarts via Docker's `restart: unless-stopped` policy, re-captures CUDA graphs (~10 s), rebuilds the KV cache, and resumes serving — but all in-flight requests at the time of the crash are lost.
-
-### 10.4 gunicorn worker hangs
-
-If a worker hits a deadlock inside PIL or numpy (a historical bug in some versions), `gunicorn --max-requests N` recycles the worker after N requests regardless. `GUNICORN_TIMEOUT` provides a separate per-request deadlock bound. `faulthandler` is registered on `SIGTERM` and `SIGUSR1`, so a stuck worker can be introspected with `kill -SIGUSR1 <pid>` for a Python-level stack dump.
-
-### 10.5 KV cache thrash
-
-A performance pathology rather than a hard failure. When concurrent requests evict each other's prefix K/V entries, the prefix-cache hit rate collapses (observed: 56% → 12% when moving from `mem_fraction=0.95` to `0.83`). This does not surface as an error; it manifests as climbing TTFT. The canonical signal is the `sglang:realtime_tokens_total{mode="prefill_cache"}` counter relative to `mode="prefill_compute"`.
-
----
-
-## 11. Cross-reference map
-
-| Topic | Primary reference |
-|---|---|
-| Paddle2ONNX adapter | `docker/cpu/layout_paddle2onnx.py` |
-| OpenVINO Execution Provider wiring | `docker/cpu/runtime_app.py:595-635` |
-| Prefix-pin monkey-patch | `docker/cpu/runtime_app.py:549-597` |
-| Memory-fraction tradeoff | `.env:SGL_MEM_FRACTION_STATIC` |
-| Rejected optimization paths | `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
-| Experiment log | `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
-| File-by-file walkthrough | `docs/ARCHITECTURE.md` (v1) |
-| Matrix-noise calibration methodology | Internal load-test playbook |
-
----
-
-## 12. Threading model — quick recap
+## 10. Threading model — quick recap
 
 **CPU container at c=8:**
 
@@ -789,7 +736,7 @@ flowchart TD
 
 The system is **stateful per worker** (aiohttp pools, ORT sessions, `ld.process` monkey-patches) and **stateless across workers** (no shared memory between gunicorn workers beyond the Prometheus multiproc directory). A gunicorn worker restart loses its local state, but not request history (which is held in Prometheus).
 
-### 12.1 How a slot count propagates through the stack
+### 10.1 How a slot count propagates through the stack
 
 A single `/glmocr/parse` request at c=8 occupies concurrency as follows:
 
@@ -813,15 +760,15 @@ At c=8 the CPU container is nowhere near its hard caps (8/64 gthreads, 112/2048 
 
 ---
 
-## 13. Appendix: Layout inference — CPU vs GPU placement
+## 11. Appendix: Layout inference — CPU vs GPU placement
 
 This appendix compares the current production placement (PP-DocLayoutV3 on a dedicated CPU tier) against co-locating layout inference on the same NVIDIA GPU that hosts SGLang. The choice materially shapes deployment topology, capacity, and cost.
 
-### 13.1 The decision in one paragraph
+### 11.1 The decision in one paragraph
 
 PP-DocLayoutV3 is a Conv-dominated DETR-family detector (~76% of forward-pass wall time is convolutional kernels). It is therefore a natural candidate for GPU acceleration — a T4-class GPU runs the same forward pass 5–10× faster than a modern CPU. The catch is that the GPU in the GLM-OCR deployment is already hosting SGLang at high VRAM and SM utilization, so co-locating layout taxes the resource that the deployment exists to maximize. The right answer depends on a single workload property: **the average number of regions detected per page** (fan-out factor).
 
-### 13.2 Side-by-side comparison
+### 11.2 Side-by-side comparison
 
 | Dimension | CPU tier (current production) | GPU co-location |
 |---|---|---|
@@ -836,21 +783,21 @@ PP-DocLayoutV3 is a Conv-dominated DETR-family detector (~76% of forward-pass wa
 | Cost per inference | ~0.1× of GPU equivalent | full GPU instance-minute |
 | Failure isolation | layout failures contained to CPU tier | layout OOM / kernel error can take down the whole GPU node |
 
-### 13.3 GPU layout — performance and constraints in detail
+### 11.3 GPU layout — performance and constraints in detail
 
 **The raw speedup is real.** PP-DocLayoutV3's forward pass is a 4-stage Conv backbone (HRNet-style) feeding a transformer decoder with 300 object queries. On a T4 at FP16 via ONNX Runtime's CUDA EP, the Conv stages run in cuDNN-optimized kernels at ~3–5× the throughput of MKLDNN on AVX-512 CPUs, and the decoder MatMuls run in cuBLAS at similar gains. Total wall time drops to 20–40 ms per single-image forward, versus 200–400 ms on Fargate-class CPUs.
 
 **The cost is shared with SGLang.** GLM-OCR's SGLang server runs at `SGL_MEM_FRACTION_STATIC=0.83` and reaches a sustained running batch of 11–16 (peak 64). Adding a layout model to the same device requires:
 
 1. Reserving ~600–900 MB of VRAM for the model and its activations.
-2. Reducing `SGL_MEM_FRACTION_STATIC` from 0.83 to ~0.78, which shrinks the KV cache from ~24,298 tokens to ~21,000 tokens. Per Section 10.5, KV cache thrash already constrains TTFT at the current size; further reduction degrades prefix-cache hit rate.
+2. Reducing `SGL_MEM_FRACTION_STATIC` from 0.83 to ~0.78, which shrinks the KV cache from ~24,298 tokens to ~21,000 tokens. KV cache thrash already constrains TTFT at the current size (the prefix-cache hit rate dropped from 56% to 12% when the previous 0.95 → 0.83 reduction was made); further reduction degrades hit rate again.
 3. Sharing the SM array. Layout's Conv stage is GPU-compute-heavy and arrives in bursts (one call per page, not per region). When a layout call lands during an active SGLang decode step, the SGLang step stalls until layout's stream completes, producing visible p99 spikes.
 
 The compute gain (per-call) and the capacity loss (concurrent throughput) therefore work against each other.
 
 **MPS or stream-based isolation is technically possible** — NVIDIA Multi-Process Service can partition the SM array, and CUDA streams provide preemptable scheduling. Both add operational complexity, and neither solves the VRAM problem.
 
-### 13.4 CPU layout — performance and constraints in detail
+### 11.4 CPU layout — performance and constraints in detail
 
 **The current production placement.** Layout runs on a dedicated CPU container, currently colocated with the Flask front end in `glmocr-cpu`. With the Paddle2ONNX backend and OpenVINO Execution Provider, forward times are:
 
@@ -872,7 +819,7 @@ The 4× spread between hardware classes is the dominant variable. Production dep
 
 **Trade-off:** added network hop (Fargate → GPU instance, typically 1–3 ms intra-VPC) and the operational overhead of a second service.
 
-### 13.5 Architectural diagrams
+### 11.5 Architectural diagrams
 
 ```mermaid
 flowchart LR
@@ -895,7 +842,7 @@ flowchart LR
     class cl2,cb1 gpu
 ```
 
-### 13.6 Decision matrix
+### 11.6 Decision matrix
 
 | Workload property | Favors CPU tier | Favors GPU co-location |
 |---|---|---|
@@ -908,36 +855,3 @@ flowchart LR
 | Sensitivity to SGLang p99 spikes | ✅ | |
 | Cost-optimization is primary | ✅ | |
 
-### 13.7 Recommendation for the current deployment
-
-For the current GLM-OCR production stack — g4dn.2xlarge-class GPU instance, OmniDocBench-like document mix with mean 14.3 regions per page — **keep layout on the dedicated CPU tier**.
-
-Reasoning:
-
-1. **SGLang's running-batch cap is already the binding constraint** (Sections 7.4 and 9). The 5–10× per-call layout speedup from GPU placement is offset by reduced SGLang capacity, and on this workload the reduction directly increases TTFT. Net throughput is roughly neutral or slightly negative.
-2. **Fan-out is high.** At 14.3 regions per page, layout fires once and the regions then occupy SGLang for ~12 s of wall time per request. Layout is not the latency bottleneck of an individual request; reducing it from 300 ms to 30 ms shaves ~2% off end-to-end wall time at best.
-3. **Cost.** Adding GPU layout pushes capacity planning toward more GPU instances, the most expensive resource in the deployment.
-4. **Failure isolation.** A layout pathology (graph error, OOM, runaway thread pool) is contained to a smaller blast radius on the CPU tier.
-
-**The case for re-evaluating** would be a workload shift toward single-region documents (passports, IDs, single-field receipts) where SGLang fan-out collapses to 1 call per page. In that regime, SGLang stops being the binding constraint, GPU SM utilization drops, and the GPU has spare capacity to absorb layout. In that scenario, GPU co-location wins on raw latency.
-
-**Sanity check before any migration.** Benchmark the candidate layout placement against a 100-page OmniDocBench slice at production concurrency, asserting on response body content per Section 10.1, and confirm:
-
-- p95 layout wall time meets the per-request budget.
-- SGLang `sglang:max_running_requests` and TTFT are unchanged or improved.
-- KV cache hit rate is within 5 percentage points of the pre-migration baseline.
-
-Without all three, do not migrate.
-
----
-
-## Maintenance
-
-This document is intended to stay in sync with the running production stack. When making changes that affect any concurrency parameter, scheduler policy, or pipeline structure:
-
-1. Update Section 0.1 (slot inventory) with the new value.
-2. Update the relevant phase section.
-3. Re-render Mermaid diagrams using `mmdc -i docs/ARCHITECTURE-v2.md -o docs/diagrams/arch-v2.svg -e svg` and check that all 9 diagrams render.
-4. If a measurement (TTFT, hit rate, RPS) changes by more than 10%, update Section 9.
-
-For questions on any specific path or to flag drift between this document and shipped reality, contact the GLM-OCR platform team.
