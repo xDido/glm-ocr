@@ -1,83 +1,141 @@
 # GLM-OCR Architecture v2 — End-to-End Request Lifecycle
 
-**Scope.** v1 of this document (`docs/ARCHITECTURE.md`) described the file layout and deployment shape. v2 goes deeper: a single HTTP request's complete journey from the client's TCP socket through every thread, every kernel, every cache layer, and back. Written after the 2026-04-24 shipments (Paddle2ONNX backend §6, OpenVINO EP §7, prefix-pin §8, `SGL_MEM_FRACTION_STATIC=0.83` §9 in `docs/OPTIMIZATIONS.md`). Cross-references into `OPTIMIZATIONS.md` are noted inline.
+| | |
+|---|---|
+| **Status** | Published |
+| **Version** | v2.0 |
+| **Last updated** | 2026-04-25 |
+| **Owner** | GLM-OCR platform team |
+| **Predecessor** | `docs/ARCHITECTURE.md` (v1, file layout and deployment shape) |
+| **Companion** | `docs/OPTIMIZATIONS.md` (rationale for each tuning knob) |
 
-**Audience.** You already know Docker and Flask. You want to know what happens between `curl localhost:5002/glmocr/parse` and the JSON coming back.
+## TL;DR
+
+This document traces a single `POST /glmocr/parse` request from the client's TCP socket through every thread, queue, and cache layer in the GLM-OCR stack, and back. It covers two containers: a CPU-bound Flask + gunicorn front end that runs document layout detection, and a GPU-bound SGLang server that performs per-region vision-language OCR.
+
+Three takeaways drive every design choice in the system:
+
+1. **The CPU container's hard concurrency ceiling is `CPU_WORKERS × CPU_THREADS = 64` simultaneous HTTP requests**, fanning out to up to `OCR_MAX_WORKERS = 32` per-region calls each. The aiohttp connection pool (2048) is sized to be exactly `64 × 32`, so no request ever waits for a connection.
+2. **SGLang's running-batch cap (64) is the system's binding constraint**, not any CPU-side limit. At c=8 concurrent requests, ~112 region calls are in flight and ~96 of them are queued at any moment.
+3. **Actual GPU compute accounts for ~5% of end-to-end wall time**; the remainder is queue wait, prefill, and CPU-side layout inference.
+
+Section 0.1 below is a single-page slot-and-thread inventory that anyone debugging concurrency in this system should read first.
+
+## Audience
+
+Engineers familiar with Docker, Flask, and Python concurrency who need to understand what happens between `curl localhost:5002/glmocr/parse` and the JSON response.
+
+## Table of contents
+
+- [0. Top-down overview](#0-top-down-overview)
+  - [0.1 Thread and slot inventory](#01-thread-and-slot-inventory)
+  - [0.2 Master flowchart](#02-master-flowchart)
+- [1. Network and TCP ingress](#1-network-and-tcp-ingress)
+- [2. Request entry: Flask routing and handler](#2-request-entry-flask-routing-and-handler)
+- [3. The three-worker pipeline](#3-the-three-worker-pipeline)
+- [4. Data-loading worker (Stage 1)](#4-data-loading-worker-stage-1)
+- [5. Layout worker (Stage 2)](#5-layout-worker-stage-2)
+- [6. Recognition worker (Stage 3)](#6-recognition-worker-stage-3)
+- [7. The SGLang GPU side](#7-the-sglang-gpu-side)
+- [8. Response assembly back on the CPU container](#8-response-assembly-back-on-the-cpu-container)
+- [9. Per-stage latency budget at c=8](#9-per-stage-latency-budget-at-c8)
+- [10. Failure modes](#10-failure-modes)
+- [11. Cross-reference map](#11-cross-reference-map)
+- [12. Threading model — quick recap](#12-threading-model--quick-recap)
 
 ---
 
 ## 0. Top-down overview
 
-```
-                       CLIENT
-                          │  HTTP POST /glmocr/parse  {"images":[url,...]}
-                          ▼
-┌────────────────────── glmocr-cpu (Docker, cgroup: 12 vCPU / 24 GB) ──────────────────────┐
-│                                                                                          │
-│  Linux TCP stack  →  Docker userland proxy on :5002  →  gunicorn master (pid 1)          │
-│                                                          │ dispatches to one of 4        │
-│                                                          │ gthread workers via accept()  │
-│                                                          ▼                               │
-│  gunicorn worker (pid 12-15)  —  one Flask WSGI app per worker, shared nothing           │
-│    │                                                                                     │
-│    ├─ Flask routing  →  @app.route("/glmocr/parse")  in  glmocr/server.py:75             │
-│    │                                                                                     │
-│    ├─ pipeline.process() is a generator; spins up three daemon threads per request:      │
-│    │     ┌─────────────┐  page queue   ┌──────────────┐  region queue  ┌──────────────┐  │
-│    │     │ data-loading│──────────────▶│  layout      │───────────────▶│  recognition │  │
-│    │     │  worker     │ (bounded)     │  worker      │ (bounded)      │  worker      │  │
-│    │     └─────────────┘               └──────────────┘                └──────────────┘  │
-│    │         PDF→PIL                    ONNX inference                   ThreadPool of   │
-│    │         URL fetch                  (Paddle2ONNX +                   OCR_MAX_WORKERS │
-│    │                                    ORT + OV EP)                     aiohttp sessions│
-│    │                                                                                     │
-│    └─ + _health_watchdog thread polls SGLang /health                                     │
-│                                                                                          │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
-                          │                                     │
-                          │ 14 parallel OCR requests per page   │ layout: CPU only
-                          │ via aiohttp connection pool         │
-                          ▼                                     
-┌─────────────────────── glmocr-sglang (Docker, GPU passthrough) ──────────────────────────┐
-│                                                                                          │
-│  HTTP 30000  →  uvicorn  →  OpenAI-compatible /v1/chat/completions                       │
-│    │                                                                                     │
-│    ├─ Chat template renders {"role":"user","content":[text, image]} to flat tokens       │
-│    ├─ RadixCache lookup: does this token prefix exist in the KV cache already?           │
-│    │     (prefix-pin §8 targets this specifically)                                       │
-│    ├─ Scheduler (LPM policy) places request into running batch                           │
-│    ├─ Prefill (chunked, 8192 tokens/chunk) computes K/V for new tokens                   │
-│    ├─ Decode loop:                                                                       │
-│    │     • bs ≤ 8   →   CUDA graph replay (fast)                                         │
-│    │     • bs >  8   →   eager execution (slow fallback)                                 │
-│    │     • speculative: EAGLE/NEXTN draft model generates 4 tokens, target verifies      │
-│    ├─ Token stream out → tokenizer decode → text                                         │
-│    ▼                                                                                     │
-│  HTTP 200 {"choices":[{"message":{"content":"..."}}]}                                    │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
-                          ▲
-                          │ response stream
-                          │
-┌────────────────────── back on glmocr-cpu ────────────────────────────────────────────────┐
-│                                                                                          │
-│  recognition worker merges per-region text  →  result_formatter builds markdown  →       │
-│  pipeline.process() yields PipelineResult  →  Flask handler jsonify()  →  WSGI response  │
-│                                                                                          │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-                       CLIENT receives {"json_result":[...], "markdown_result":"..."}
-```
+The system is two containers connected over an HTTP loopback:
 
-End-to-end wall-clock at c=8 on the shipped stack: **~11 s per request** for a typical OmniDocBench page (14 detected regions). The breakdown below allocates every millisecond.
+- **`glmocr-cpu`** — Flask + gunicorn front end. Resolves input URLs, runs CPU-side layout detection (Paddle2ONNX + ONNX Runtime + OpenVINO Execution Provider), and fans each detected region out to the GPU container as a separate VLM call.
+- **`glmocr-sglang`** — SGLang server with GPU passthrough, exposing an OpenAI-compatible `POST /v1/chat/completions` endpoint that performs per-region OCR using the GLM-OCR vision-language model.
+
+End-to-end wall time on the current configuration at c=8 concurrency is **~16.5 s per request** for a typical OmniDocBench page (mean 14.3 detected regions). Section 9 allocates that budget down to the millisecond.
+
+### 0.1 Thread and slot inventory
+
+Every concurrency parameter in one place. **Slots** is the hard cap each stage can hold; **at c=8** is the measured or computed utilization at the reference working load (8 concurrent client requests).
+
+| Layer | Parameter | Source | Slots | At c=8 usage |
+|---|---|---|---|---|
+| Kernel | TCP listen backlog | gunicorn default | 2048 | <1% |
+| CPU container | gunicorn workers | `CPU_WORKERS` | **4** procs | 4/4 resident |
+| Per gunicorn worker | gthread request slots | `CPU_THREADS` | **16** per worker | ~2 busy per worker |
+| Container total | max concurrent HTTP | = workers × gthreads | **64** gthreads | ~8 busy |
+| Per in-flight request | pipeline daemon threads | `pipeline.py:140-172` | **3** (+1 watchdog) | always all 3 |
+| Per request | page queue depth | `_page_maxsize` | 2×`CPU_WORKERS`·n_pages | usually 0 |
+| Per request | region queue depth | `_region_maxsize` | 2×`CPU_WORKERS`·mean_regions | 0-14 typical |
+| Per request | recognition fan-out | `OCR_MAX_WORKERS` | **32** thread pool | ~14 busy (14 regions/page) |
+| Container | aiohttp connection pool | `OCR_CONN_POOL` | **2048** conns | ~112 in-flight |
+| Per ORT session | intra-op kernel threads | `LAYOUT_ONNX_THREADS` | **3** | dynamic |
+| Per ORT session | OpenMP threads | `OMP_NUM_THREADS` | **1** | bounded |
+| Per ORT session | MKL BLAS threads | `MKL_NUM_THREADS` | **1** | bounded |
+| Layout batcher | coalesce batch size | `LAYOUT_BATCH_MAX` | **8** pages | <batch typical |
+| Layout batcher | coalesce wait window | `LAYOUT_BATCH_WINDOW_MS` | **20** ms | wall-time tax |
+| OV EP | CPU plugin thread pool | OV default (shared) | global, ~N_cores | shared across workers |
+| GPU container | uvicorn workers | SGLang default | 1 async | saturated by design |
+| SGLang scheduler | running batch cap | `SGL_MAX_RUNNING_REQUESTS` | **64** | peaks 11-16 |
+| SGLang scheduler | waiting queue | unbounded | ∞ | ~96-100 queued at c=8 |
+| SGLang prefill | chunked prefill tokens | `SGL_CHUNKED_PREFILL_SIZE` | **8192** tok/chunk | typical prompt = 1 chunk |
+| SGLang decode | CUDA graph batch cap | `SGL_CUDA_GRAPH_MAX_BS` | **8** | peak 11-16 overflows to eager |
+| SGLang KV cache | total tokens | derived from `SGL_MEM_FRACTION_STATIC=0.83` | **~24,298** tokens | load-dependent |
+| SGLang speculative | draft tokens / step | `SGL_SPEC_NUM_DRAFT_TOKENS` | **4** | sniped on mismatch |
+| SGLang speculative | lookahead steps | `SGL_SPEC_NUM_STEPS` | **3** | content-dependent |
+
+**Rule of thumb.** The inbound ceiling is `CPU_WORKERS × CPU_THREADS = 64` simultaneous requests. Each request fans out to `OCR_MAX_WORKERS = 32` region calls. A single container can therefore generate up to `64 × 32 = 2048` in-flight region requests — exactly the aiohttp pool size, by construction. This is the oversubscription ceiling; nothing in the stack can exceed it.
+
+### 0.2 Master flowchart
+
+```mermaid
+flowchart TB
+    client["Client<br/>POST /glmocr/parse"]
+
+    subgraph cpu["CPU container — 12 vCPU / 24 GB"]
+      direction TB
+      tcp["kernel TCP :5002<br/>backlog 2048"]
+      gm["gunicorn master<br/>1 proc, supervisor"]
+
+      subgraph workers["gunicorn workers × 4 &nbsp;&nbsp;(64 gthread slots total)"]
+        direction TB
+        th["16 gthread slots per worker"]
+
+        subgraph req["per in-flight request"]
+          direction LR
+          t1["data-loading<br/>daemon thread"]
+          t2["layout daemon<br/>ORT session<br/>intra_op=3"]
+          t3["recognition daemon<br/>ThreadPool(32)"]
+          t1 -->|"page queue<br/>bounded"| t2
+          t2 -->|"region queue<br/>bounded"| t3
+        end
+        th --> req
+      end
+    end
+
+    subgraph gpu["GPU container — sglang"]
+      direction TB
+      uvi["uvicorn :30000<br/>1 async worker"]
+      sch["scheduler (lpm)<br/>running cap 64<br/>actual peak 11-16"]
+      kvc["KV cache ~24k tok<br/>RadixCache prefix tree"]
+      compute["Prefill + Decode<br/>CUDA graph bs≤8<br/>+ speculative (4 drafts)"]
+    end
+
+    client --> tcp --> gm --> workers
+    t3 -.->|"aiohttp pool<br/>limit=2048<br/>~112 in-flight at c=8"| uvi
+    uvi --> sch --> kvc
+    sch --> compute --> kvc
+    compute -.->|tokens| uvi
+    uvi -.->|HTTP 200| t3
+```
 
 ---
 
-## 1. Network + TCP ingress
+## 1. Network and TCP ingress
 
 ### 1.1 Client → Docker published port
 
-Container `glmocr-cpu` publishes 5002 via `docker-compose.yml: ports: ["5002:5002"]`. Docker Desktop's VPNKit (on Windows/Mac) or iptables DNAT rules (on Linux) forward `host:5002 → container:5002`. This adds ~0.1 ms of NAT overhead per request on Linux, more on Windows (hence the bigger `docker run --rm -v` benchmark discrepancy we see vs bare-metal numbers).
+Container `glmocr-cpu` publishes 5002 via `docker-compose.yml: ports: ["5002:5002"]`. Docker Desktop's VPNKit (on Windows/macOS) or iptables DNAT rules (on Linux) forward `host:5002 → container:5002`. NAT overhead is ~0.1 ms per request on Linux and noticeably higher on Windows, which accounts for the gap between containerized and bare-metal benchmarks on Windows hosts.
 
 ### 1.2 gunicorn master socket
 
@@ -94,17 +152,25 @@ Gunicorn master (pid 1) calls `socket(), bind(), listen()` on 0.0.0.0:5002 and t
 
 ### 1.3 gthread worker acceptance
 
-Worker class `gthread` is critical (see OPTIMIZATIONS.md supporting-knob §5):
+Worker class `gthread` is required (see `OPTIMIZATIONS.md` supporting-knob §5). The alternatives all fail in this stack:
 
-- `sync` would dedicate one entire worker to one request at a time — with 4 workers, max in-flight = 4. At `c=8` half our requests block.
-- `gevent`/`eventlet` monkey-patch stdlib threading, which breaks PyTorch and ONNX Runtime's C-level thread pools. Their TBB/OpenMP kernels assume OS threads, not greenlets.
-- `gthread` uses a pool of `--threads 16` OS threads per worker. `accept()` returns in a thread, the thread runs the WSGI app synchronously for that request, then returns to the pool. Max in-flight per worker = 16; across the container = **64 concurrent requests**.
+- `sync` would dedicate one entire worker to one request at a time. With 4 workers, max in-flight is 4, so at c=8 half of all requests would block on `accept()`.
+- `gevent` and `eventlet` monkey-patch stdlib threading, which breaks PyTorch and ONNX Runtime's C-level thread pools. Their TBB/OpenMP kernels assume OS threads, not greenlets, and silently misbehave under monkey-patching.
+- `gthread` uses a pool of `--threads 16` OS threads per worker. `accept()` returns in a thread, the thread runs the WSGI app synchronously for that request, then returns to the pool. Max in-flight per worker is 16; across the container, **64 concurrent requests**.
 
-In our config at c=8 each of 4 workers gets ~2 concurrent requests on average, well under the 16-thread cap.
+At c=8, each of 4 workers handles ~2 concurrent requests on average, well under the 16-thread cap.
 
 ### 1.4 WSGI adapter
 
-`wsgi.py` is a one-liner: `from glmocr.server import create_app; from glmocr.config import load_config; app = create_app(load_config("/app/config.yaml"))`. This runs **once per worker at import time**, well before the first request — it's how all the pipeline state gets initialized (threads, ORT sessions, aiohttp pools, model weights) before the worker is added to the accept pool.
+`wsgi.py` is a one-liner:
+
+```python
+from glmocr.server import create_app
+from glmocr.config import load_config
+app = create_app(load_config("/app/config.yaml"))
+```
+
+This runs **once per worker at import time**, well before the first request arrives. All pipeline state — daemon threads, ORT sessions, aiohttp pools, model weights — is initialized here, before the worker is added to the gunicorn accept pool.
 
 ---
 
@@ -146,13 +212,39 @@ Note the handler receives image **URLs**, not base64 blobs. A URL can be `file:/
 
 ### 2.4 `pipeline.process(request_data)` — generator call
 
-Here's where the magic starts. `pipeline.process` is a **generator** (`glmocr/pipeline/pipeline.py:108`) — calling it returns an iterator without running any work yet. The handler forces execution with `list(pipeline.process(...))`. Each yielded value is one `PipelineResult` = one input page's OCR.
+`pipeline.process` is a **generator** defined at `glmocr/pipeline/pipeline.py:108`. Calling it returns an iterator without running any work; execution is forced by the handler via `list(pipeline.process(...))`. Each yielded value is one `PipelineResult`, corresponding to one input page's OCR output.
 
 ---
 
 ## 3. The three-worker pipeline
 
+**Slots at this phase:** 3 daemon threads per request + 1 health watchdog. Two bounded queues between them. No locks beyond Python's `queue.Queue` internals.
+
 `pipeline.process()` is the orchestration core. It launches three daemon threads per request and emits results via the generator protocol.
+
+```mermaid
+flowchart LR
+    gt["gthread<br/>(1 of 64)"] --> gen["pipeline.process()<br/>generator"]
+    gen --> t1["data-loading<br/>daemon thread"]
+    gen --> t2["layout<br/>daemon thread"]
+    gen --> t3["recognition<br/>daemon thread"]
+    gen --> hw["_health_watchdog<br/>daemon (polls SGLang /health)"]
+
+    t1 -- "put (unit_id, PIL image)" --> pq[("page queue<br/>Queue(maxsize=_page_maxsize)")]
+    pq -- "get" --> t2
+    t2 -- "put (unit_id, region)<br/>×N regions/page" --> rq[("region queue<br/>Queue(maxsize=_region_maxsize)")]
+    rq -- "get" --> t3
+
+    t3 --> emit["_emit_results →<br/>yield PipelineResult"]
+    emit --> gt
+
+    classDef daemon fill:#e8f4f8,stroke:#4a8ab8
+    classDef queue fill:#fff4e0,stroke:#c08030
+    class t1,t2,t3,hw daemon
+    class pq,rq queue
+```
+
+Bounded queues provide back-pressure: when the layout stage is slow, the data-loading thread's `put()` blocks, preventing memory from ballooning with pending work. The only effectively unbounded resource downstream is the aiohttp connection pool (2048 connections), sized to exceed the worst-case product `CPU_THREADS × OCR_MAX_WORKERS = 512` with a 4× safety margin.
 
 ```python
 # pipeline.py:140-172 (paraphrased)
@@ -173,17 +265,17 @@ finally:
     t1.join(timeout=10); t2.join(timeout=10); t3.join(timeout=10)
 ```
 
-**Why three threads instead of inline synchronous code?** Because each stage has a different CPU/IO shape:
+**Why three threads instead of inline synchronous code?** Each stage has a different CPU/IO shape:
 
-| stage | bottleneck | contention |
+| Stage | Bottleneck | Contention |
 |---|---|---|
 | data-loading | IO (URL fetch or PDF rasterize) | GIL-light |
-| layout | CPU (ORT+OV kernels, releases GIL during C calls) | burstier |
+| layout | CPU (ORT + OV kernels, releases GIL during C calls) | burstier |
 | recognition | IO (HTTP to SGLang) | many parallel aiohttp |
 
-Running them as a pipeline lets the stages overlap: while layout runs on page N, the loader already fetched page N+1 and recognition is already OCR'ing page N-1's regions. Bounded queues (`page_maxsize`, `region_maxsize`) provide back-pressure so a slow stage can't infinity-accumulate work behind it.
+Running them as a pipeline lets the stages overlap: while layout runs on page N, the loader has already fetched page N+1, and recognition is already OCR-ing page N-1's regions. Bounded queues (`page_maxsize`, `region_maxsize`) prevent a slow stage from accumulating unbounded work behind it.
 
-All three threads run **inside the same gthread** that accepted the request. They share memory. On a single `/glmocr/parse` call with one image, the data-loading work is trivial, so you mainly see t2 (layout) and t3 (recognition) serialized per page — but across concurrent requests multiple pipelines run simultaneously, and t2 from request A can overlap t3 from request B.
+All three threads run **inside the same gthread** that accepted the request and share memory. On a single-image `/glmocr/parse` call the data-loading work is trivial, so mainly the layout and recognition stages serialize per page. Across concurrent requests, multiple pipelines run simultaneously, and the layout stage of request A can overlap with the recognition stage of request B.
 
 ---
 
@@ -200,7 +292,7 @@ All three threads run **inside the same gthread** that accepted the request. The
 
 ### 4.2 PDF rasterization
 
-PDF pages are rasterized to PIL images at a configurable DPI (default 200). `pdfium2` is a C library with Python bindings — it releases the GIL during rendering, so concurrent data-loading workers across requests actually benefit from multi-core. For our current OmniDocBench workload all inputs are pre-rasterized `.png`/`.jpg`, so this path is dormant.
+PDF pages are rasterized to PIL images at a configurable DPI (default 200). `pdfium2` is a C library with Python bindings; it releases the GIL during rendering, so concurrent data-loading workers across requests benefit from multi-core scaling. For the OmniDocBench reference workload, all inputs are pre-rasterized `.png` / `.jpg` and this path is dormant.
 
 ### 4.3 PIL open and enqueue
 
@@ -208,21 +300,21 @@ For images: `PIL.Image.open(bytes)` creates a lazy handle (no pixel decode yet).
 
 ### 4.4 Page queue
 
-A `queue.Queue(maxsize=page_maxsize)`. When the downstream layout worker is slow, `put()` blocks and the loader thread idles. Default `_page_maxsize` is typically 2×workers × n_pages_per_pdf; at our single-image workload this queue never backs up.
+A `queue.Queue(maxsize=page_maxsize)`. When the downstream layout worker is slow, `put()` blocks and the loader thread idles. Default `_page_maxsize` is typically `2 × workers × n_pages_per_pdf`; on the single-image reference workload this queue never backs up.
 
 ---
 
-## 5. Layout worker (Stage 2) — the star
+## 5. Layout worker (Stage 2)
 
-This is where our 2026-04-24 shipments live. The layout worker pulls a `(unit_id, page)` from the page queue, runs the detector, pushes one-or-more `(unit_id, region)` tuples onto the region queue.
+The layout worker pulls a `(unit_id, page)` tuple from the page queue, runs the detector, and pushes one or more `(unit_id, region)` tuples onto the region queue. This stage hosts most of the v2 optimization work (Paddle2ONNX backend, OpenVINO Execution Provider, prefix-pin patches).
 
-Runtime dispatch is built at gunicorn worker startup via `install_pipeline_gauges(app)` in `docker/cpu/runtime_app.py:540-750`. At import time, `runtime_app.py` examines `LAYOUT_VARIANT` and `LAYOUT_BACKEND` env vars and **monkey-patches** `ld.process` (where `ld = pipeline.layout_detector`) to replace glmocr's default torch-eager path with one of three optimized implementations:
+Runtime dispatch is built at gunicorn worker startup via `install_pipeline_gauges(app)` in `docker/cpu/runtime_app.py:540-750`. At import time, `runtime_app.py` examines the `LAYOUT_VARIANT` and `LAYOUT_BACKEND` environment variables and **monkey-patches** `ld.process` (where `ld = pipeline.layout_detector`) to replace glmocr's default torch-eager path with one of three implementations:
 
-1. `LAYOUT_VARIANT=paddle2onnx` → Paddle2ONNX + ORT + optionally OV EP (§6/§7)
-2. `LAYOUT_BACKEND=onnx + LAYOUT_POSTPROC=numpy` → torch-exported ONNX + numpy post-proc (older path)
-3. Default → upstream torch eager (slowest; used as fallback if above two fail)
+1. `LAYOUT_VARIANT=paddle2onnx` → Paddle2ONNX + ORT + (optionally) OpenVINO Execution Provider. This is the production path.
+2. `LAYOUT_BACKEND=onnx + LAYOUT_POSTPROC=numpy` → torch-exported ONNX with numpy post-processing (legacy path, retained as fallback).
+3. Default → upstream torch eager (slowest; used only if the above two fail to initialize).
 
-In the shipped config all four gunicorn workers take path (1). Let's trace it.
+In the production configuration, all four gunicorn workers take path (1). The remainder of this section traces that path step by step.
 
 ### 5.1 PIL → pixel tensor (`layout_paddle2onnx.py:_preprocess_batch`)
 
@@ -234,7 +326,7 @@ arr = arr.transpose(2, 0, 1)                         # HWC → CHW
 return np.stack(batch, axis=0)                       # (B, 3, 800, 800)
 ```
 
-The `/255` is critical — `config.json` declares `norm_type=none` but Paddle's C++ loader actually does `/255` before `NormalizeImage` sees the tensor. Without it, max detection score is 0.014 (nothing passes threshold). This was a real session bug before it became a comment.
+The `/255` step is essential. `config.json` declares `norm_type=none`, but Paddle's C++ loader applies `/255` before `NormalizeImage` ever sees the tensor. Without this, the maximum detection score is 0.014 — below threshold, so no regions are emitted. This produces a silent-empty-output failure that is indistinguishable at the HTTP layer from a successful response on a blank page.
 
 ### 5.2 3-input feed construction (`_build_session_inputs`)
 
@@ -246,13 +338,13 @@ Paddle2ONNX expects three inputs:
 | `im_shape` | `(B, 2)` float32 | original `[H, W]` per image |
 | `scale_factor` | `(B, 2)` float32 | nominally `(H_orig/800, W_orig/800)` |
 
-The `scale_factor` input is effectively a no-op in this export — the graph ignores it. We pass the "correct" values anyway for semantic cleanliness, but the output boxes come back in **800² space** and the adapter rescales them to original image space manually (see §6 coord-space gotcha).
+The `scale_factor` input is effectively a no-op in this export; the graph ignores it. The adapter passes semantically correct values anyway, but output boxes come back in **800² coordinate space** and are manually rescaled to original image space downstream (see §5.5).
 
 ### 5.3 ORT session invocation
 
-`sess.run(None, feed)` is a single C call into ONNX Runtime. Python's GIL is **released** for the duration — which is why multiple concurrent requests can actually run layout in parallel on different worker gthreads.
+`sess.run(None, feed)` is a single C-level call into ONNX Runtime. Python's GIL is **released** for the duration, which is what allows multiple concurrent requests to run layout in parallel across worker gthreads.
 
-What happens inside:
+Inside the call:
 
 ```
 ┌─ onnxruntime.InferenceSession.run() ─────────────────────────────────────┐
@@ -269,15 +361,15 @@ What happens inside:
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-At c=8 with 4 workers × 3 intra-op threads (via `LAYOUT_ONNX_THREADS=3`), this call takes ~0.8-1.2 s per single-image forward (measured by `scripts/bench_paddle_ep.py`). The **unpinned OV default** uses what appears to be a shared global thread pool across sessions, which scales better than a fixed per-session pool (we verified this the hard way — see session report's "Experiment A").
+At c=8 with 4 workers × 3 intra-op threads (via `LAYOUT_ONNX_THREADS=3`), this call takes 0.8–1.2 s per single-image forward pass (measured by `scripts/bench_paddle_ep.py`). The **unpinned OV default** uses a shared global thread pool across sessions, which empirically scales better than a fixed per-session pool under the production worker count.
 
 Output is a tuple of three numpy arrays:
 
-| output | shape | meaning |
+| Output | Shape | Meaning |
 |---|---|---|
-| `fetch_name_0` | `(N_det, 7)` float32 | detection table: `[class_id, score, x1, y1, x2, y2, extra]`, ragged across batch |
-| `fetch_name_1` | `(B,)` int32 | per-image detection counts (how to un-ragged `fetch_name_0`) |
-| `fetch_name_2` | `(N_det, 200, 200)` int32 | mask tensors (unused by our adapter — we build rectangular polygons from boxes instead) |
+| `fetch_name_0` | `(N_det, 7)` float32 | Detection table: `[class_id, score, x1, y1, x2, y2, extra]`, ragged across batch. |
+| `fetch_name_1` | `(B,)` int32 | Per-image detection counts; used to un-ragged `fetch_name_0`. |
+| `fetch_name_2` | `(N_det, 200, 200)` int32 | Mask tensors. Unused by the current adapter, which builds rectangular polygons directly from boxes. |
 
 ### 5.4 Ragged → per-image regrouping
 
@@ -293,28 +385,30 @@ sy = h_orig / 800.0
 x1, y1, x2, y2 = dets[:,2]*sx, dets[:,3]*sy, dets[:,4]*sx, dets[:,5]*sy
 ```
 
-Also builds a rectangular `polygon_points` per detection (corners of the box), and synthesizes `order_seq` as `arange(N)` — Paddle2ONNX doesn't have glmocr's DETR reading-order head, so downstream reading-order is just the model's natural output order (not a semantic reading order, but stable).
+It also builds a rectangular `polygon_points` per detection (the box corners) and synthesizes `order_seq` as `arange(N)`. The Paddle2ONNX export does not include glmocr's DETR reading-order head, so downstream reading order is the model's natural output order — stable, but not semantically optimized for multi-column layouts.
 
 ### 5.6 NMS and label routing
 
-Hands off to the shared `np_apply_layout_postprocess` in `layout_postprocess.py` (reused from the torch path). This does:
+Control passes to the shared `np_apply_layout_postprocess` function in `layout_postprocess.py` (reused from the torch path). It performs:
 
 - **NMS** with `iou_same=0.6, iou_diff=0.98` — aggressive within a class, permissive between classes.
-- **Oversized-image filter** — a detection labeled `image` occupying >82/93 % of page area (orientation-dependent) is dropped (heuristic against spurious whole-page detections).
-- **Unclip** (optional, off by default).
-- **Merge_bboxes_mode** (off by default).
+- **Oversized-image filter** — detections labeled `image` occupying more than 82–93 % of page area (orientation-dependent) are dropped, as a heuristic against spurious whole-page detections.
+- **Unclip** — optional, off by default.
+- **Merge_bboxes_mode** — off by default.
 
-Then `paddle_to_all_results` maps the class IDs through glmocr's native `id2label` (captured at startup — **not** Paddle's config.json mapping, which uses more granular names that would miss glmocr's routing table; see §6 id2label gotcha). Output is JSON blocks with `bbox_2d` normalized to 0-1000 per-image coords (not original pixels — another subtle point that had me chasing ghosts for 20 min).
+`paddle_to_all_results` then maps class IDs through glmocr's native `id2label`, captured at startup — **not** through Paddle's `config.json` mapping, which uses more granular names that would miss glmocr's routing table. The output is JSON blocks with `bbox_2d` normalized to 0–1000 per-image coordinates rather than original pixel coordinates; downstream consumers must rescale accordingly.
 
 ### 5.7 Region emission
 
-For each detection that survives post-proc, the layout worker pushes a region tuple onto the region queue. A typical OmniDocBench page yields **12-20 regions**, mostly `text` with occasional `table`, `formula`, `footer`. Our measured mean is 14.3 regions/page at c=8.
+For each detection that survives post-processing, the layout worker pushes a region tuple onto the region queue. A typical OmniDocBench page yields **12–20 regions**, mostly `text`, with occasional `table`, `formula`, and `footer`. The measured mean is **14.3 regions per page at c=8**.
 
 ---
 
-## 6. Recognition worker (Stage 3) — the fan-out
+## 6. Recognition worker (Stage 3)
 
-`recognition_worker` pulls `(unit_id, region, task_type)` tuples from the region queue. Per-region:
+**Slots at this phase:** 1 orchestrator thread, `OCR_MAX_WORKERS=32` ThreadPool slots, and up to 2048 aiohttp connections from the shared pool. Per page, ~14 regions fire concurrently.
+
+`recognition_worker` pulls `(unit_id, region, task_type)` tuples from the region queue. For each region:
 
 1. Crop the region out of the original PIL image using the box coords.
 2. Call `page_loader.build_request_from_image(crop, task_type)` to build an OpenAI-compatible request.
@@ -322,9 +416,28 @@ For each detection that survives post-proc, the layout worker pushes a region tu
 
 The ThreadPoolExecutor is the **intra-request** fan-out — all 14 regions of a single page fire concurrently to SGLang.
 
-### 6.1 Request construction with prefix-pin (§8)
+```mermaid
+flowchart LR
+    page["page from<br/>layout stage"] --> reg_worker["recognition<br/>daemon thread"]
+    reg_worker -->|"submit per region"| tpe{{"ThreadPoolExecutor<br/>max_workers=32"}}
+    tpe --> r1["region 1<br/>crop + b64"]
+    tpe --> r2["region 2<br/>crop + b64"]
+    tpe --> r3["region 3"]
+    tpe --> rN["... region N<br/>(mean N=14.3)"]
+    r1 & r2 & r3 & rN -- "aiohttp<br/>ClientSession<br/>pool limit=2048" --> sglang["SGLang<br/>/v1/chat/completions"]
+    sglang --> merge["result_formatter<br/>merge in order<br/>→ markdown"]
 
-This is where the 2026-04-24 monkey-patch lives. `runtime_app.py:549-597` replaces `PageLoader.build_request_from_image` at worker startup with:
+    classDef slot fill:#e8f4f8,stroke:#4a8ab8
+    classDef pool fill:#fff4e0,stroke:#c08030
+    class tpe pool
+    class r1,r2,r3,rN slot
+```
+
+At **c=8 concurrent requests × 14 regions = 112 in-flight SGLang calls**. The aiohttp pool at 2048 has ~18× headroom; the binding bottleneck is SGLang's 64-slot running batch downstream, not this fan-out.
+
+### 6.1 Request construction with prefix-pin
+
+`runtime_app.py:549-597` replaces `PageLoader.build_request_from_image` at worker startup with:
 
 ```python
 content = [
@@ -333,7 +446,12 @@ content = [
 ]
 ```
 
-**Text first, image second.** This is the opposite of upstream glmocr. It matters because SGLang's RadixCache only dedupes on **leftmost common tokens** — with image-first, every region's prefix is different image tokens → 0 % cache hit. With text-first, the prompt tokens ("Transcribe the text..." + chat template wrapper) are identical across regions → cache hit. Measured win: 12 % → 56 % hit rate, TTFT cut in half at c=8.
+**Text first, image second** — the inverse of upstream glmocr's order. This matters because SGLang's RadixCache deduplicates only on **leftmost common tokens**:
+
+- With image-first ordering, every region's prefix consists of unique image tokens, yielding a 0% cache hit rate.
+- With text-first ordering, the prompt tokens (`"Transcribe the text..."` plus the chat-template wrapper) are identical across all regions, enabling cache hits.
+
+Measured impact: **12% → 56% prefix-cache hit rate**, with TTFT cut roughly in half at c=8. See `OPTIMIZATIONS.md §8` for the full rollout history.
 
 ### 6.2 Base64 encoding
 
@@ -358,13 +476,45 @@ POST http://sglang:30000/v1/chat/completions
 
 ### 6.4 Retry logic
 
-`OCRClient` has a built-in retry loop (from glmocr config: `retry_max_attempts: 2`, exponential backoff 0.5-8 s, retries on 429/500/502/503/504). Under SGLang overload this fires, and on the 3rd attempt if SGLang is still unhealthy the request comes back empty — **this is the silent-empty path that fooled load drivers before solution (b) was queued** (see OPTIMIZATIONS.md "Driver body-content assertion" Queued entry).
+`OCRClient` has a built-in retry loop. Configuration: `retry_max_attempts: 2`, exponential backoff 0.5–8 s, retries on HTTP 429 / 500 / 502 / 503 / 504. Under SGLang overload this fires; if SGLang is still unhealthy on the third attempt, the request returns empty content. This is one of the silent-empty failure paths described in §10.1: the HTTP envelope is 200 OK, but `markdown_result=""`. Load drivers must therefore assert on response body content, not just HTTP status. See `OPTIMIZATIONS.md` "Driver body-content assertion" for the mitigation plan.
 
 ---
 
 ## 7. The SGLang GPU side
 
-Now we leave the CPU container and enter `glmocr-sglang`. This container has GPU passthrough (`deploy.resources.reservations.devices` with `capabilities: [gpu]` in compose).
+**Slots at this phase:** 1 uvicorn async worker, 1 scheduler thread, running-batch cap 64 (actual peak 11–16), KV cache ~24,298 tokens, CUDA graphs pre-captured for batch sizes 1–8. This is where every CPU-side thread in the stack eventually converges.
+
+Past this point the request leaves `glmocr-cpu` and enters `glmocr-sglang`, which has GPU passthrough configured via `deploy.resources.reservations.devices` with `capabilities: [gpu]` in `docker-compose.yml`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant rec as CPU: recognition<br/>ThreadPool slot
+    participant uvi as uvicorn :30000
+    participant tok as Tokenizer thread
+    participant rc as RadixCache<br/>(prefix tree)
+    participant sch as Scheduler (lpm)<br/>running cap 64
+    participant gpu as GPU: Prefill+Decode
+
+    rec->>uvi: POST /v1/chat/completions<br/>(text-first + image_url)
+    uvi->>tok: render Jinja chat template
+    tok->>rc: check leftmost N tokens
+    rc-->>sch: hit rate ~56% post-prefix-pin
+    sch->>sch: enqueue → waiting queue<br/>(~96 queued at c=8)
+    Note over sch: wait until slot in running batch<br/>~5.5 s queue time at c=8
+    sch->>gpu: prefill (chunked 8192 tok)
+    Note over gpu: new K/V written to KV cache<br/>skips cached prefix tokens
+    loop decode token-by-token
+      alt running_batch ≤ 8
+        gpu->>gpu: CUDA graph replay (~8-12 ms/batch)
+      else running_batch > 8
+        gpu->>gpu: eager kernel launches (3-5× slower)
+      end
+      Note right of gpu: speculative: 4 draft tokens × 3 steps<br/>per outer step
+    end
+    gpu-->>uvi: tokens (non-streaming buffer)
+    uvi-->>rec: HTTP 200 {"choices":[{"message":{"content":...}}]}
+```
 
 ### 7.1 uvicorn → OpenAI-compatible handler
 
@@ -372,30 +522,36 @@ SGLang serves a FastAPI app via uvicorn on :30000. `POST /v1/chat/completions` h
 
 ### 7.2 Tokenization + chat template
 
-The tokenizer (from `zai-org/GLM-OCR`) renders the message list via its Jinja chat template. For our prefix-pin request:
+The tokenizer (shipped with `zai-org/GLM-OCR`) renders the message list via its Jinja chat template. For the prefix-pin request shape, the rendered token stream begins:
 
 ```
 <|begin_of_sentence|><|start_of_role|>user<|end_of_role|>Transcribe the text in the image.<image><|end_of_role|>...
 ```
 
-The `<image>` token is a placeholder; the VLM's vision encoder replaces it with the actual image token embeddings at prefill time. Tokenization is fast (~0.1 ms), CPU-side, and critically produces a **deterministic token sequence for the prompt prefix** — this is what makes prefix caching work.
+The `<image>` token is a placeholder; the vision-language model's vision encoder substitutes the actual image token embeddings at prefill time. Tokenization is fast (~0.1 ms), CPU-side, and produces a **deterministic token sequence for the prompt prefix** — the property that makes prefix caching effective.
 
 ### 7.3 RadixCache lookup
 
-Before scheduling, SGLang's `TokenToKVPoolAllocator` checks whether the leftmost N tokens of this sequence already have K/V computed and in the KV cache. The cache is a **radix tree** keyed on token sequences, so if our prompt prefix has been seen before, the first ~20-30 tokens of prefill are SKIPPED — `prefill_cache` counter increments, `prefill_compute` stays flat.
+Before scheduling, SGLang's `TokenToKVPoolAllocator` checks whether the leftmost N tokens of this sequence already have K/V computed and resident in the KV cache. The cache is a **radix tree** keyed on token sequences, so if the prompt prefix has been seen before, the first ~20–30 tokens of prefill are skipped: the `prefill_cache` counter increments, while `prefill_compute` stays flat.
 
-Measured at c=8 post-prefix-pin: 56.5 % of prefill tokens are cache hits, 12.3 % post-0.83-mem (see §9 — smaller KV cache thrashes harder).
+Measured cache-hit rates at c=8:
+
+- Post-prefix-pin (§6.1): **56.5%** of prefill tokens.
+- Post-0.83 mem-fraction reduction (§9): **12.3%** — a smaller KV cache thrashes harder under concurrent regional fan-out.
 
 ### 7.4 Scheduler
 
-`SGL_SCHEDULE_POLICY=lpm` (Longest-Prefix-Match) — preferred over `fcfs` because at our workload it clusters requests with the same prompt prefix, increasing cache reuse. `fcfs` regressed rps 16-28 % at c=12/24 in earlier memory (`project_sgl_schedule_policy`). The scheduler maintains:
+`SGL_SCHEDULE_POLICY=lpm` (Longest-Prefix-Match) is preferred over `fcfs` because, on this workload, it clusters requests with the same prompt prefix and increases cache reuse. Benchmarks have shown `fcfs` regresses RPS by 16–28% at c=12/24 on the production stack. The scheduler maintains:
 
-- **running batch** — requests currently being decoded; capped by `SGL_MAX_RUNNING_REQUESTS=64`.
-- **waiting queue** — requests that arrived but haven't been batched yet.
+- **Running batch** — requests currently being decoded, capped by `SGL_MAX_RUNNING_REQUESTS=64`.
+- **Waiting queue** — requests that have arrived but not yet been admitted to the running batch.
 
-At c=8 with 112 regions in-flight competing for the 64-cap running batch, most regions spend 10+ seconds in the waiting queue before being scheduled. This is the **TTFT component** in our per-region metrics.
+At c=8 with 112 regions in flight competing for the 64-slot running batch, most regions spend 10+ seconds in the waiting queue before being scheduled. This wait time dominates the **TTFT** (time-to-first-token) component of per-region metrics.
 
-Under `SGL_MEM_FRACTION_STATIC=0.83` the KV cache holds 24,298 tokens total; at c=8 with ~300 concurrent tokens per region × 16+ concurrent regions, that's tight. Under `0.95` it was 37,710 tokens (larger cache but less dynamic memory for activations, which caused crashes at c≥24).
+KV cache sizing tradeoff:
+
+- `SGL_MEM_FRACTION_STATIC=0.83` — KV cache holds 24,298 tokens total. At c=8 with ~300 concurrent tokens per region across 16+ concurrent regions, this is tight but stable.
+- `SGL_MEM_FRACTION_STATIC=0.95` — KV cache holds 37,710 tokens (larger cache, higher hit rate), but leaves insufficient dynamic memory for activations and OOMs at c ≥ 24.
 
 ### 7.5 Prefill
 
@@ -406,27 +562,28 @@ New token K/V (those not found in RadixCache) go through **chunked prefill** —
 - Combined sequence runs through the transformer stack (attention + MLP × N layers).
 - K/V for all positions is written to the KV cache.
 
-The compute here is attention-heavy, ~1-2 s for a 600-token new prefill on the 3060 Ti when the GPU isn't queue-bound.
+Prefill is attention-heavy compute. A 600-token fresh prefill takes ~1–2 s on the development-grade GPU (NVIDIA RTX 3060 Ti, 8 GB) when the GPU is not queue-bound. Production hardware will scale this proportionally.
 
 ### 7.6 Decode loop
 
-Once prefill is done, SGLang enters the decode loop. Every step generates one token per request in the running batch. On each step:
+Once prefill is complete, SGLang enters the decode loop. Each step generates one token per request in the running batch. There are two execution paths:
 
-**Fast path — CUDA graphs** (`SGL_CUDA_GRAPH_MAX_BS=8` default): pre-captured CUDA graphs for batch sizes 1..8 replay in ~8-12 ms per batch. This is the typical case for our c≤8 working concurrency.
+- **Fast path — CUDA graphs.** With `SGL_CUDA_GRAPH_MAX_BS=8` (the default), pre-captured CUDA graphs for batch sizes 1–8 replay in ~8–12 ms per batch. This is the typical case at c ≤ 8.
+- **Slow path — eager execution.** When the running batch exceeds 8, graph replay misses and execution falls back to per-op `torch.cuda` kernel launches — roughly 3–5× slower. The running batch on this workload peaks at 11–16, so some decode steps land on the slow path.
 
-**Slow path — eager execution** (when running_batch > 8): graph replay misses, falls back to `torch.cuda` kernel launches per-op. ~3-5× slower. Per `project_gpu_utilization_2026_04_23` memory, running batch peaks at 11-16 on our workload — so some decode steps hit the slow path. This is an unshipped optimization: bumping `SGL_CUDA_GRAPH_MAX_BS=16` would cover the peak but adds ~200-400 MB of graph memory, which on the 8 GB card at 0.83 mem fraction is a tight fit. Not shipped, but documented.
+Raising `SGL_CUDA_GRAPH_MAX_BS=16` would cover the observed peak but adds ~200–400 MB of graph memory. On the 8 GB development card at `mem_fraction=0.83` this fit is too tight; the optimization is documented but not currently shipped.
 
-**Speculative decoding** (`SGL_SPECULATIVE=true, SGL_SPEC_ALGORITHM=NEXTN`): EAGLE-style draft model predicts `SGL_SPEC_NUM_STEPS=3` tokens ahead; target model verifies all 3 in one forward pass. Success rate depends on content predictability — for repetitive text it's 2-2.5× speedup, for dense formulas it can actually slow things down. On GLM-OCR's doc text it seems net-positive (memory note: "MTP already effectively on (NEXTN→EAGLE alias)"). The `SGL_SPEC_EAGLE_TOPK=1, SGL_SPEC_NUM_DRAFT_TOKENS=4` knobs tune the branching factor.
+**Speculative decoding** is enabled via `SGL_SPECULATIVE=true` and `SGL_SPEC_ALGORITHM=NEXTN`. An EAGLE-style draft model predicts `SGL_SPEC_NUM_STEPS=3` tokens ahead; the target model verifies all three in a single forward pass. Effectiveness varies with content predictability — repetitive text yields a 2–2.5× speedup, while dense formula content can actually regress. On GLM-OCR document text the net effect is positive. The `SGL_SPEC_EAGLE_TOPK=1` and `SGL_SPEC_NUM_DRAFT_TOKENS=4` knobs tune the branching factor.
 
-Actual decode throughput on our 3060 Ti: **~0.5 s per region** (measured via SGLang's `e2e_request_latency_seconds_sum - time_to_first_token_seconds_sum` delta). That's the real GPU work. Everything above 0.5 s in per-region wall time is queue wait (see ARCHITECTURE-v2 §8 budget below).
+Measured decode throughput on the development hardware: **~0.5 s per region** (computed as `sglang:e2e_request_latency_seconds_sum − sglang:time_to_first_token_seconds_sum`). This represents actual GPU work; any per-region wall time beyond ~0.5 s is queue wait, per the budget in §9.
 
 ### 7.7 Token streaming out
 
-Tokens are streamed through SGLang's output processor: detokenize, apply any stop strings, buffer into the response. The OpenAI-compatible endpoint can stream via SSE, but our CPU client uses non-streaming mode — SGLang buffers the full response then returns `{"choices":[{"message":{"content":"..."}}]}`.
+Tokens flow through SGLang's output processor: detokenization, stop-string handling, then buffering into the response. The OpenAI-compatible endpoint can stream via SSE, but the CPU client uses non-streaming mode — SGLang buffers the full response and returns `{"choices":[{"message":{"content":"..."}}]}`.
 
 ---
 
-## 8. Back to the CPU container: response assembly
+## 8. Response assembly back on the CPU container
 
 ### 8.1 OCRClient receives per-region text
 
@@ -434,9 +591,15 @@ Tokens are streamed through SGLang's output processor: detokenize, apply any sto
 
 ### 8.2 Result formatter
 
-As each region completes, `result_formatter.py` threads it back into the page's result. For regions labeled `text`, the text goes into markdown as-is. For `formula`, it's wrapped in `$$...$$`. For `table`, the model is expected to output HTML `<table>` tags verbatim (GLM-OCR is trained to produce this). Headers become `## ...`, footers/page-numbers are appended at the end.
+As each region completes, `result_formatter.py` threads it back into the page's result:
 
-Final markdown is a concatenation in reading order — which, because our Paddle2ONNX adapter synthesizes `order_seq` as the model's natural output order rather than a true reading-order head, is sometimes subtly suboptimal on multi-column layouts. Acceptable tradeoff for the batching correctness win.
+- `text` regions → markdown as-is.
+- `formula` regions → wrapped in `$$...$$`.
+- `table` regions → emitted as HTML `<table>` (GLM-OCR is trained to produce this format directly).
+- Headers → `## ...`.
+- Footers and page-numbers → appended at the end.
+
+The final markdown is concatenated in reading order. Because the Paddle2ONNX adapter synthesizes `order_seq` as the model's natural output order rather than running glmocr's DETR reading-order head, multi-column layouts may produce subtly suboptimal ordering. This is an accepted tradeoff in exchange for the batching correctness gained from the Paddle2ONNX export.
 
 ### 8.3 PipelineResult yield
 
@@ -448,9 +611,27 @@ Back in `server.py:_build_response` → `jsonify()` → WSGI app returns. Gunico
 
 ---
 
-## 9. Per-stage latency budget at c=8 (measured, shipped stack)
+## 9. Per-stage latency budget at c=8
 
-For one 20-page burst at c=8 (n=20 seed=42):
+**Measured on the production stack.** This section attributes every millisecond of wall time to a specific slot from §0.1 or queue from §3.
+
+```mermaid
+pie showData
+    title Per-request wall time at c=8 (16.5 s mean)
+    "Recognition / SGLang (TTFT+decode)" : 73
+    "Layout stage (serial, ORT+OV)" : 20
+    "Other (preprocess, dispatch, serialize)" : 7
+```
+
+```mermaid
+pie showData
+    title Per-region wall time inside SGLang (6.6 s)
+    "Queue wait in scheduler" : 83
+    "Prefill (compute + cache-skipped)" : 12
+    "Decode (actual token generation)" : 5
+```
+
+Detailed breakdown for one 20-page burst at c=8 (n=20, seed=42):
 
 ```
 16.5 s  per request (client-measured mean)
@@ -473,66 +654,68 @@ For one 20-page burst at c=8 (n=20 seed=42):
 
 Three load-bearing invariants:
 
-1. **Layout is the CPU bottleneck**, but at 20 % it's not the binding bottleneck — SGLang queue wait is.
-2. **Actual GPU compute is ~5 %** of wall time. The GPU mostly waits.
-3. **Prefix caching is the big latency lever** — every % of cache hit shaves directly off prefill. Our current 12-56 % hit rate (varies with load) has significant headroom.
+1. **Layout is the CPU bottleneck**, but at ~20% of wall time it is not the binding system-wide bottleneck — SGLang queue wait is.
+2. **Actual GPU compute accounts for ~5%** of wall time. The GPU is idle or queue-blocked for the remainder.
+3. **Prefix caching is the largest latency lever.** Every percentage point of cache hit translates directly to less prefill compute. The current 12–56% hit rate (load-dependent) has significant headroom.
 
-At c=16 the queue depth roughly doubles and TTFT climbs to ~13 s, but actual decode stays ~0.5 s. See OPTIMIZATIONS.md §8 and the session report for measurements.
+At c=16, queue depth roughly doubles and TTFT climbs to ~13 s, while decode remains at ~0.5 s. See `OPTIMIZATIONS.md §8` for the measurement methodology.
 
 ---
 
-## 10. Failure modes and how they surface
+## 10. Failure modes
 
 ### 10.1 Silent empty-markdown
 
-Most dangerous class of failure — HTTP 200 with `markdown_result=""`. Three known causes:
+The most dangerous failure class: HTTP 200 with `markdown_result=""`. Three known root causes:
 
-- Layout ONNX crashes mid-batch (the `node_view_320` Reshape bug on the torch export; fixed in §6).
-- SGLang unavailable / refuses connection → glmocr's internal `OCRClient` retry exhausts, returns empty.
-- Layout detects 0 regions (edge case for almost-blank pages; legitimately empty).
+- **Layout ONNX crashes mid-batch.** The `node_view_320` Reshape bug on the torch-exported graph; resolved by the Paddle2ONNX migration described in §5.
+- **SGLang unavailable or refusing connections.** The internal `OCRClient` retry loop exhausts and returns empty content rather than propagating an error.
+- **Layout detects zero regions.** A legitimate edge case for near-blank pages.
 
-All three look identical to a naive load driver that only checks status code. The shipped drivers still have this hole — see OPTIMIZATIONS.md "Driver body-content assertion" Queued.
+All three are indistinguishable to a load driver that only checks HTTP status. Drivers must assert on response body content (`len(markdown_result) > 0`) as a non-negotiable invariant. See `OPTIMIZATIONS.md` "Driver body-content assertion" for the rollout plan.
 
 ### 10.2 Timeouts
 
-- `OCR_REQUEST_TIMEOUT=60` bounds each CPU→SGLang HTTP call.
-- `OCR_RETRY_MAX=2` allows up to 3 total attempts per region.
-- `GUNICORN_TIMEOUT=480` bounds the whole `/glmocr/parse` call end-to-end from the outside.
+| Knob | Bound |
+|---|---|
+| `OCR_REQUEST_TIMEOUT=60` | Each CPU → SGLang HTTP call. |
+| `OCR_RETRY_MAX=2` | Up to 3 total attempts per region. |
+| `GUNICORN_TIMEOUT=480` | The entire `/glmocr/parse` call end-to-end. |
 
-If SGLang is truly down, the handler takes up to 3 × 60 = 180 s before giving up per region. Under the 20 ms layout batch window, this can cascade into multiple pages' worth of regions timing out together. Mitigated by the `_health_watchdog` thread which proactively aborts all in-flight work if SGLang `/health` goes non-200 for > N seconds.
+If SGLang is fully unavailable, each region can spend up to `3 × 60 = 180 s` waiting before the handler gives up. Combined with the 20 ms layout batch window, this can cascade into many pages' worth of regions timing out together. The `_health_watchdog` thread mitigates this by polling SGLang's `/health` endpoint and proactively aborting in-flight work if health checks fail for more than N seconds.
 
-### 10.3 SGLang crashes / OOMs
+### 10.3 SGLang crashes and OOMs
 
-On the 8 GB dev card at `SGL_MEM_FRACTION_STATIC=0.95`, c≥24 used to crash SGLang mid-run (OOM on the dynamic pool). Fixed by dropping to 0.83 (§9). The `_health_watchdog` on the CPU side detects this within 5-10 s and surfaces it in logs. SGLang auto-restarts (Docker `restart: unless-stopped`), re-captures CUDA graphs (~10 s), rebuilds KV cache, and resumes — but all in-flight requests die.
+On the 8 GB development card at `SGL_MEM_FRACTION_STATIC=0.95`, SGLang previously crashed mid-run at c ≥ 24 (OOM on the dynamic pool). Resolved by dropping to `0.83` (§9). The CPU-side `_health_watchdog` detects this within 5–10 s and surfaces the event in logs. SGLang auto-restarts via Docker's `restart: unless-stopped` policy, re-captures CUDA graphs (~10 s), rebuilds the KV cache, and resumes serving — but all in-flight requests at the time of the crash are lost.
 
 ### 10.4 gunicorn worker hangs
 
-If a worker hits a deadlock inside PIL or numpy (historical bug in some versions), the `gunicorn --max-requests N` setting will recycle the worker after N requests regardless. Set via `GUNICORN_TIMEOUT` separately for per-request deadlocks. `faulthandler` is registered on `SIGTERM/SIGUSR1` so a stuck worker can be introspected via `kill -SIGUSR1 <pid>`.
+If a worker hits a deadlock inside PIL or numpy (a historical bug in some versions), `gunicorn --max-requests N` recycles the worker after N requests regardless. `GUNICORN_TIMEOUT` provides a separate per-request deadlock bound. `faulthandler` is registered on `SIGTERM` and `SIGUSR1`, so a stuck worker can be introspected with `kill -SIGUSR1 <pid>` for a Python-level stack dump.
 
 ### 10.5 KV cache thrash
 
-Not a failure per se, but a performance pathology. When many concurrent requests evict each other's prefix K/V, prefix-cache hit rate crashes (we saw 56 % → 12 % going from 0.95 mem to 0.83). This doesn't surface as an error — it surfaces as climbing TTFT. The `sglang:realtime_tokens_total{mode="prefill_cache"}` counter is the canonical signal.
+A performance pathology rather than a hard failure. When concurrent requests evict each other's prefix K/V entries, the prefix-cache hit rate collapses (observed: 56% → 12% when moving from `mem_fraction=0.95` to `0.83`). This does not surface as an error; it manifests as climbing TTFT. The canonical signal is the `sglang:realtime_tokens_total{mode="prefill_cache"}` counter relative to `mode="prefill_compute"`.
 
 ---
 
-## 11. Cross-reference map (where to find what)
+## 11. Cross-reference map
 
-| topic | deep-dive in |
+| Topic | Primary reference |
 |---|---|
 | Paddle2ONNX adapter | `docker/cpu/layout_paddle2onnx.py` + `OPTIMIZATIONS.md §6` |
-| OV EP wiring | `docker/cpu/runtime_app.py:595-635` + `OPTIMIZATIONS.md §7` |
+| OpenVINO Execution Provider wiring | `docker/cpu/runtime_app.py:595-635` + `OPTIMIZATIONS.md §7` |
 | Prefix-pin monkey-patch | `docker/cpu/runtime_app.py:549-597` + `OPTIMIZATIONS.md §8` |
-| Mem-fraction tradeoff | `.env:SGL_MEM_FRACTION_STATIC` + `OPTIMIZATIONS.md §9` |
-| Rejected paths & why | `OPTIMIZATIONS.md Rejected` section + `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
-| Session experiment log | `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
-| Matrix-noise calibration | auto-memory `feedback_matrix_noise.md` |
-| File-by-file tour | `docs/ARCHITECTURE.md` (v1) |
+| Memory-fraction tradeoff | `.env:SGL_MEM_FRACTION_STATIC` + `OPTIMIZATIONS.md §9` |
+| Rejected optimization paths | `OPTIMIZATIONS.md` "Rejected" section + `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
+| Experiment log | `docs/omnidoc-2026-04-24-paddle-ov-shipment.md` |
+| File-by-file walkthrough | `docs/ARCHITECTURE.md` (v1) |
+| Matrix-noise calibration methodology | Internal load-test playbook |
 
 ---
 
 ## 12. Threading model — quick recap
 
-**Per CPU container at c=8**:
+**CPU container at c=8:**
 
 ```
 4 gunicorn workers × 16 gthreads = 64 max concurrent request-handling threads
@@ -544,11 +727,34 @@ Not a failure per se, but a performance pathology. When many concurrent requests
 At c=8: ~8 gthreads busy, ~24 daemon threads per pipeline active,
         ~112 aiohttp requests in-flight to SGLang, ~300 Python threads total.
 
-Inside each layout call: OV CPU plugin spawns its own MKLDNN thread pool,
-effectively shared across concurrent sessions (unpinned default).
+Inside each layout call: the OV CPU plugin spawns its own MKLDNN thread pool,
+effectively shared across concurrent sessions (the unpinned default).
 ```
 
-**SGLang side**:
+```mermaid
+flowchart TD
+    container["CPU container<br/>cgroup: 12 vCPU / 24 GB"]
+    container --> master["gunicorn master<br/>(1 proc, supervisor)"]
+    master --> w["gunicorn worker × 4"]
+    w --> gth["16 gthread slots per worker<br/>= 64 slots container-wide"]
+    gth --> req["one request = one gthread"]
+    req --> t1["data-loading daemon"]
+    req --> t2["layout daemon"]
+    req --> t3["recognition daemon"]
+    req --> hw["_health_watchdog daemon"]
+    t2 --> ort["ORT InferenceSession<br/>intra_op_num_threads=3"]
+    ort --> ov["OV CPU plugin<br/>shared MKLDNN pool<br/>(global across workers)"]
+    t3 --> tpe["ThreadPoolExecutor<br/>max_workers=32"]
+    tpe --> aio["shared aiohttp ClientSession<br/>TCPConnector(limit=2048)"]
+    aio -.->|HTTP| sg["→ SGLang"]
+
+    classDef cap fill:#fef3c7,stroke:#b45309
+    classDef daemon fill:#e8f4f8,stroke:#4a8ab8
+    class gth,tpe,aio cap
+    class t1,t2,t3,hw daemon
+```
+
+**SGLang container:**
 
 ```
 1 uvicorn worker (async) handles all HTTP requests
@@ -557,11 +763,63 @@ effectively shared across concurrent sessions (unpinned default).
   → GPU compute is single-process, single-device
 
 Running batch cap 64, actual peak 11-16 (CPU-layout-limited arrival rate).
-KV cache 24 k tokens total at 0.83 mem fraction.
+KV cache ~24,298 tokens total at SGL_MEM_FRACTION_STATIC=0.83.
 ```
 
-The whole system is stateful-per-worker (aiohttp pools, ORT sessions, ld.process monkey-patches) and stateless-across-workers (no shared memory between gunicorn workers beyond the Prometheus multiproc dir). A gunicorn worker restart loses its local state but not request history.
+```mermaid
+flowchart TD
+    sgc["SGLang container<br/>GPU passthrough"]
+    sgc --> uvi["uvicorn :30000<br/>1 async worker"]
+    uvi --> tok["tokenizer thread<br/>(sync, ~0.1 ms)"]
+    tok --> rc["RadixCache lookup<br/>prefix tree"]
+    rc --> sch["scheduler thread<br/>(lpm policy)"]
+    sch --> rb["running batch<br/>cap=64, peak=11-16"]
+    sch --> wq["waiting queue<br/>unbounded, ~96 at c=8"]
+    rb --> gpu["GPU worker<br/>(single-device)"]
+    gpu --> pf["prefill: chunked 8192 tok"]
+    gpu --> dec["decode loop<br/>CUDA graphs bs≤8<br/>+ speculative (4 drafts × 3 steps)"]
+    dec --> kv["KV cache<br/>~24,298 tokens<br/>(at mem_fraction=0.83)"]
+    pf --> kv
+
+    classDef cap fill:#fef3c7,stroke:#b45309
+    classDef gpu_node fill:#fde2e2,stroke:#c33
+    class rb,kv cap
+    class gpu,pf,dec gpu_node
+```
+
+The system is **stateful per worker** (aiohttp pools, ORT sessions, `ld.process` monkey-patches) and **stateless across workers** (no shared memory between gunicorn workers beyond the Prometheus multiproc directory). A gunicorn worker restart loses its local state, but not request history (which is held in Prometheus).
+
+### 12.1 How a slot count propagates through the stack
+
+A single `/glmocr/parse` request at c=8 occupies concurrency as follows:
+
+```mermaid
+flowchart LR
+    A["1 TCP connection"]
+    A --> B["1 of 64 gthreads"]
+    B --> C["3 daemon threads<br/>(loader, layout, recognition)"]
+    C --> D["1 of 3 ORT intra-op threads<br/>(shared with other sessions)"]
+    C --> E["up to 32 ThreadPool slots<br/>for region fan-out"]
+    E --> F["~14 of 2048 aiohttp conns<br/>(one per region)"]
+    F --> G["~14 of 64 SGLang running batch<br/>(may wait in queue)"]
+
+    classDef one fill:#dcfce7,stroke:#166534
+    classDef many fill:#fef3c7,stroke:#b45309
+    class A,B one
+    class C,D,E,F,G many
+```
+
+At c=8 the CPU container is nowhere near its hard caps (8/64 gthreads, 112/2048 aiohttp connections). The downstream SGLang running-batch cap of 64 is hit at c ≈ 5 pages-in-flight, since each page fans out to ~14 regions. **SGLang's scheduler is the binding constraint, not any CPU-side slot count.** Every optimization in `OPTIMIZATIONS.md` §6–§9 either reduces SGLang queue depth (prefix-pin, memory-fraction) or makes layout faster so that regions arrive at SGLang in smaller bursts, allowing the queue more time to drain between bursts.
 
 ---
 
-**End.** If a piece of the path is still opaque after reading this, grep the referenced file:line, or add a new section and file a PR — this doc is meant to stay in sync with shipped reality, not lead it.
+## Maintenance
+
+This document is intended to stay in sync with the running production stack. When making changes that affect any concurrency parameter, scheduler policy, or pipeline structure:
+
+1. Update §0.1 (slot inventory) with the new value.
+2. Update the relevant phase section.
+3. Re-render Mermaid diagrams using `mmdc -i docs/ARCHITECTURE-v2.md -o docs/diagrams/arch-v2.svg -e svg` and check that all 9 diagrams render.
+4. If a measurement (TTFT, hit rate, RPS) changes by more than 10%, update §9 and the cross-reference in `OPTIMIZATIONS.md`.
+
+For questions on any specific path or to flag drift between this document and shipped reality, contact the GLM-OCR platform team.
