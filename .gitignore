@@ -25,3 +25,6 @@ eval/predictions/
 results/
 docs.zip
 
+# Confluence-paste derivative of ARCHITECTURE-v2.md (mermaid blocks → SVG refs)
+docs/ARCHITECTURE-v2-confluence.md
+
