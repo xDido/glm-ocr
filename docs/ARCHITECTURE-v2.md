@@ -3,10 +3,11 @@
 | | |
 |---|---|
 | **Status** | Published |
-| **Version** | v2.0 |
-| **Last updated** | 2026-04-25 |
+| **Version** | v2.1 |
+| **Last updated** | 2026-04-27 |
 | **Owner** | GLM-OCR platform team |
 | **Predecessor** | `docs/ARCHITECTURE.md` (v1, file layout and deployment shape) |
+| **Changes vs v2.0** | Numbers refreshed to the Step 1.5 ship: `OCR_MAX_TOKENS=2048` admission cap + `SGL_CUDA_GRAPH_MAX_BS=32` decode coverage + `SGL_MEM_FRACTION_STATIC=0.87` KV. Running batch peak rose from 11-16 → 55-63. New §9.2 compares to vanilla-glmocr baseline. |
 
 ## TL;DR
 
@@ -15,8 +16,8 @@ This document traces a single `POST /glmocr/parse` request from the client's TCP
 Three takeaways drive every design choice in the system:
 
 1. **The CPU container's hard concurrency ceiling is `CPU_WORKERS × CPU_THREADS = 64` simultaneous HTTP requests**, fanning out to up to `OCR_MAX_WORKERS = 32` per-region calls each. The aiohttp connection pool (2048) is sized to be exactly `64 × 32`, so no request ever waits for a connection.
-2. **SGLang's running-batch cap (64) is the system's binding constraint**, not any CPU-side limit. At c=8 concurrent requests, ~112 region calls are in flight and ~96 of them are queued at any moment.
-3. **Actual GPU compute accounts for ~5% of end-to-end wall time**; the remainder is queue wait, prefill, and CPU-side layout inference.
+2. **SGLang's running batch peaks at 55-63 in production** (Step 1.5 config). The running ceiling itself isn't the gate — KV-pool admission accounting is. Lowering `OCR_MAX_TOKENS` from glmocr's default 8192 to 2048 quadrupled the sustainable running batch on this 8 GB hardware.
+3. **At c=24 the per-region time decomposes ~82 % SGLang queue wait / 11 % prefill / 5 % decode / 2 % overhead.** Decode itself is fast (33 ms mean / 97 ms p99 inter-token, on CUDA graph fast path). The binding bottleneck is queue depth, not compute.
 
 Section 0.1 below is a single-page slot-and-thread inventory that anyone debugging concurrency in this system should read first.
 
@@ -50,35 +51,36 @@ The system is two containers connected over an HTTP loopback:
 - **`glmocr-cpu`** — Flask + gunicorn front end. Resolves input URLs, runs CPU-side layout detection (Paddle2ONNX + ONNX Runtime + OpenVINO Execution Provider), and fans each detected region out to the GPU container as a separate VLM call.
 - **`glmocr-sglang`** — SGLang server with GPU passthrough, exposing an OpenAI-compatible `POST /v1/chat/completions` endpoint that performs per-region OCR using the GLM-OCR vision-language model.
 
-End-to-end wall time on the current configuration at c=8 concurrency is **~16.5 s per request** for a typical OmniDocBench page (mean 14.3 detected regions). Section 9 allocates that budget down to the millisecond.
+End-to-end wall time at c=24 concurrency (the production sweet spot) is **mean 53 s, p50 40 s** per request for a typical OmniDocBench page (mean 14.3 detected regions). At c=12, mean is 26 s / p50 17 s. Section 9 allocates that budget down to the millisecond.
 
 ### 0.1 Thread and slot inventory
 
-Every concurrency parameter in one place. **Slots** is the hard cap each stage can hold; **at c=8** is the measured or computed utilization at the reference working load (8 concurrent client requests).
+Every concurrency parameter in one place. **Slots** is the hard cap each stage can hold; **at c=24** is the measured or computed utilization at the production sweet spot.
 
-| Layer | Parameter | Source | Slots | At c=8 usage |
+| Layer | Parameter | Source | Slots | At c=24 usage |
 |---|---|---|---|---|
 | Kernel | TCP listen backlog | gunicorn default | 2048 | <1% |
 | CPU container | gunicorn workers | `CPU_WORKERS` | **4** procs | 4/4 resident |
-| Per gunicorn worker | gthread request slots | `CPU_THREADS` | **16** per worker | ~2 busy per worker |
-| Container total | max concurrent HTTP | = workers × gthreads | **64** gthreads | ~8 busy |
+| Per gunicorn worker | gthread request slots | `CPU_THREADS` | **16** per worker | ~6 busy per worker |
+| Container total | max concurrent HTTP | = workers × gthreads | **64** gthreads | ~24 busy |
 | Per in-flight request | pipeline daemon threads | `pipeline.py:140-172` | **3** (+1 watchdog) | always all 3 |
 | Per request | page queue depth | `_page_maxsize` | 2×`CPU_WORKERS`·n_pages | usually 0 |
 | Per request | region queue depth | `_region_maxsize` | 2×`CPU_WORKERS`·mean_regions | 0-14 typical |
 | Per request | recognition fan-out | `OCR_MAX_WORKERS` | **32** thread pool | ~14 busy (14 regions/page) |
-| Container | aiohttp connection pool | `OCR_CONN_POOL` | **2048** conns | ~112 in-flight |
-| Per ORT session | intra-op kernel threads | `LAYOUT_ONNX_THREADS` | **3** | dynamic |
+| **Per region** | **completion-token cap sent to SGLang** | `OCR_MAX_TOKENS` | **2048** | shrinks SGLang per-slot KV reservation 4× vs glmocr default 8192 |
+| Container | aiohttp connection pool | `OCR_CONN_POOL` | **2048** conns | ~336 in-flight (24 × 14) |
+| Per ORT session | intra-op kernel threads | `LAYOUT_ONNX_THREADS` | **1** | dynamic |
 | Per ORT session | OpenMP threads | `OMP_NUM_THREADS` | **1** | bounded |
 | Per ORT session | MKL BLAS threads | `MKL_NUM_THREADS` | **1** | bounded |
 | Layout batcher | coalesce batch size | `LAYOUT_BATCH_MAX` | **8** pages | <batch typical |
 | Layout batcher | coalesce wait window | `LAYOUT_BATCH_WINDOW_MS` | **20** ms | wall-time tax |
 | OV EP | CPU plugin thread pool | OV default (shared) | global, ~N_cores | shared across workers |
 | GPU container | uvicorn workers | SGLang default | 1 async | saturated by design |
-| SGLang scheduler | running batch cap | `SGL_MAX_RUNNING_REQUESTS` | **64** | peaks 11-16 |
-| SGLang scheduler | waiting queue | unbounded | ∞ | ~96-100 queued at c=8 |
-| SGLang prefill | chunked prefill tokens | `SGL_CHUNKED_PREFILL_SIZE` | **8192** tok/chunk | typical prompt = 1 chunk |
-| SGLang decode | CUDA graph batch cap | `SGL_CUDA_GRAPH_MAX_BS` | **8** | peak 11-16 overflows to eager |
-| SGLang KV cache | total tokens | derived from `SGL_MEM_FRACTION_STATIC=0.83` | **~24,298** tokens | load-dependent |
+| SGLang scheduler | running batch cap | `SGL_MAX_RUNNING_REQUESTS` | **64** | **peaks 55–63 (mean ~32)** |
+| SGLang scheduler | waiting queue | unbounded | ∞ | ~180–390 queued at c=24 |
+| SGLang prefill | chunked prefill tokens | `SGL_CHUNKED_PREFILL_SIZE` | **8192** tok/chunk | covers typical region prompt in 1 chunk |
+| SGLang decode | CUDA graph batch cap | `SGL_CUDA_GRAPH_MAX_BS` | **32** | covers running 1–32 fast path; running 33–63 falls to eager briefly |
+| SGLang KV cache | total tokens | derived from `SGL_MEM_FRACTION_STATIC=0.87` | **~28,619** tokens | load-dependent |
 | SGLang speculative | draft tokens / step | `SGL_SPEC_NUM_DRAFT_TOKENS` | **4** | sniped on mismatch |
 | SGLang speculative | lookahead steps | `SGL_SPEC_NUM_STEPS` | **3** | content-dependent |
 
@@ -114,13 +116,13 @@ flowchart TB
     subgraph gpu["GPU container — sglang"]
       direction TB
       uvi["uvicorn :30000<br/>1 async worker"]
-      sch["scheduler (lpm)<br/>running cap 64<br/>actual peak 11-16"]
-      kvc["KV cache ~24k tok<br/>RadixCache prefix tree"]
-      compute["Prefill + Decode<br/>CUDA graph bs≤8<br/>+ speculative (4 drafts)"]
+      sch["scheduler (lpm)<br/>running cap 64<br/>actual peak 55-63"]
+      kvc["KV cache ~28.6k tok<br/>RadixCache prefix tree"]
+      compute["Prefill + Decode<br/>CUDA graph bs≤32<br/>+ speculative (4 drafts)"]
     end
 
     client --> tcp --> gm --> workers
-    t3 -.->|"aiohttp pool<br/>limit=2048<br/>~112 in-flight at c=8"| uvi
+    t3 -.->|"aiohttp pool<br/>limit=2048<br/>~336 in-flight at c=24"| uvi
     uvi --> sch --> kvc
     sch --> compute --> kvc
     compute -.->|tokens| uvi
@@ -535,7 +537,7 @@ Before scheduling, SGLang's `TokenToKVPoolAllocator` checks whether the leftmost
 Measured cache-hit rates at c=8:
 
 - Post-prefix-pin (Section 6.1): **56.5%** of prefill tokens.
-- Post-0.83 mem-fraction reduction (Section 9): **12.3%** — a smaller KV cache thrashes harder under concurrent regional fan-out.
+- At c=24 with running 55-63 sustained: cache hit rate is workload-dependent and varies between **30 % and 56 %** depending on document mix and request interleaving. The current `SGL_MEM_FRACTION_STATIC=0.87` (≈28,619 tokens) leaves room for the radix tree to retain more prefix entries than the 0.83 setting did.
 
 ### 7.4 Scheduler
 
@@ -544,12 +546,16 @@ Measured cache-hit rates at c=8:
 - **Running batch** — requests currently being decoded, capped by `SGL_MAX_RUNNING_REQUESTS=64`.
 - **Waiting queue** — requests that have arrived but not yet been admitted to the running batch.
 
-At c=8 with 112 regions in flight competing for the 64-slot running batch, most regions spend 10+ seconds in the waiting queue before being scheduled. This wait time dominates the **TTFT** (time-to-first-token) component of per-region metrics.
+The admission gate is **per-slot KV reservation**: each pending request reserves `prompt_tokens + max_tokens` worth of KV space worst-case. Lowering `OCR_MAX_TOKENS` from glmocr's default 8192 to **2048** (Section 6.4) cut per-slot reservation roughly 4×, which is what allows the running batch to sustain 55-63 in-flight on a KV pool that previously could only hold 11-16.
+
+At c=24 with ~336 regions in flight competing for the 55-63 sustained running slots, most regions spend ~17 s in the waiting queue before being scheduled. This wait time dominates the **TTFT** (time-to-first-token) component of per-region metrics — see §9.
 
 KV cache sizing tradeoff:
 
-- `SGL_MEM_FRACTION_STATIC=0.83` — KV cache holds 24,298 tokens total. At c=8 with ~300 concurrent tokens per region across 16+ concurrent regions, this is tight but stable.
-- `SGL_MEM_FRACTION_STATIC=0.95` — KV cache holds 37,710 tokens (larger cache, higher hit rate), but leaves insufficient dynamic memory for activations and OOMs at c ≥ 24.
+- `SGL_MEM_FRACTION_STATIC=0.83` (previous ship) — KV cache held 24,298 tokens. Combined with the old 8192 max_tokens cap, running batch was bound at 11-16.
+- `SGL_MEM_FRACTION_STATIC=0.87` (Step 1.5 ship) — KV cache holds 28,619 tokens. Combined with `OCR_MAX_TOKENS=2048`, running batch peak rose to 55-63.
+- `SGL_MEM_FRACTION_STATIC=0.90` — KV cache holds 32,252 tokens (+12.7%), running peak rose another ~5 % to ~63 — but available VRAM during cuda-graph capture drops to 0.11 GB. Tested OK in 500 requests but margin is razor-thin; not currently shipped.
+- `SGL_MEM_FRACTION_STATIC=0.95` — KV cache held 37,710 tokens, but leaves insufficient dynamic memory for activations and OOMs at c ≥ 24.
 
 ### 7.5 Prefill
 
@@ -566,14 +572,14 @@ Prefill is attention-heavy compute. A 600-token fresh prefill takes ~1–2 s on 
 
 Once prefill is complete, SGLang enters the decode loop. Each step generates one token per request in the running batch. There are two execution paths:
 
-- **Fast path — CUDA graphs.** With `SGL_CUDA_GRAPH_MAX_BS=8` (the default), pre-captured CUDA graphs for batch sizes 1–8 replay in ~8–12 ms per batch. This is the typical case at c ≤ 8.
-- **Slow path — eager execution.** When the running batch exceeds 8, graph replay misses and execution falls back to per-op `torch.cuda` kernel launches — roughly 3–5× slower. The running batch on this workload peaks at 11–16, so some decode steps land on the slow path.
+- **Fast path — CUDA graphs.** With `SGL_CUDA_GRAPH_MAX_BS=32` (Step 1.5 ship), pre-captured CUDA graphs for batch sizes 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32 replay in ~8-12 ms per batch. **This covers the running batch's typical operating band (32-58 mean)**, so most decode steps land on the fast path.
+- **Slow path — eager execution.** When the running batch exceeds 32, graph replay misses and execution falls back to per-op `torch.cuda` kernel launches — roughly 3-5× slower. With Step 1.5's running peak of 55-63, some peak-burst decode steps land on the slow path; this shows up as inter-token p99 climbing from 73-97 ms (clean fast path) to 150-180 ms at c=40+.
 
-Raising `SGL_CUDA_GRAPH_MAX_BS=16` would cover the observed peak but adds ~200–400 MB of graph memory. On the 8 GB development card at `mem_fraction=0.83` this fit is too tight; the optimization is documented but not currently shipped.
+Raising `SGL_CUDA_GRAPH_MAX_BS=64` would cover the entire observed running range but adds ~600-1000 MB of graph memory; tested and crashed with `CUDA error: out of memory` on the 8 GB dev card. `bs=32` is the practical ceiling on this hardware.
 
-**Speculative decoding** is enabled via `SGL_SPECULATIVE=true` and `SGL_SPEC_ALGORITHM=NEXTN`. An EAGLE-style draft model predicts `SGL_SPEC_NUM_STEPS=3` tokens ahead; the target model verifies all three in a single forward pass. Effectiveness varies with content predictability — repetitive text yields a 2–2.5× speedup, while dense formula content can actually regress. On GLM-OCR document text the net effect is positive. The `SGL_SPEC_EAGLE_TOPK=1` and `SGL_SPEC_NUM_DRAFT_TOKENS=4` knobs tune the branching factor.
+**Speculative decoding** is enabled via `SGL_SPECULATIVE=true` and `SGL_SPEC_ALGORITHM=NEXTN`. An EAGLE-style draft model predicts `SGL_SPEC_NUM_STEPS=3` tokens ahead; the target model verifies all three in a single forward pass. Effectiveness varies with content predictability — repetitive text yields a 2-2.5× speedup, while dense formula content can actually regress. On GLM-OCR document text the net effect is positive. The `SGL_SPEC_EAGLE_TOPK=1` and `SGL_SPEC_NUM_DRAFT_TOKENS=4` knobs tune the branching factor.
 
-Measured decode throughput on the development hardware: **~0.5 s per region** (computed as `sglang:e2e_request_latency_seconds_sum − sglang:time_to_first_token_seconds_sum`). This represents actual GPU work; any per-region wall time beyond ~0.5 s is queue wait, per the budget in Section 9.
+Measured decode throughput at c=24, running 32-58: **inter-token mean 33 ms, p99 97 ms** (per `sglang:inter_token_latency_seconds`). Per-region decode totals roughly **1 s** at typical OCR output length (~30 tokens × 33 ms). Any per-region wall time beyond ~1 s is queue wait + prefill, per the budget in Section 9.
 
 ### 7.7 Token streaming out
 
@@ -609,60 +615,185 @@ Back in `server.py:_build_response` → `jsonify()` → WSGI app returns. Gunico
 
 ---
 
-## 9. Per-stage latency budget at c=8
+## 9. Per-stage latency budget — c=12 and c=24
 
-**Measured on the production stack.** This section attributes every millisecond of wall time to a specific slot from Section 0.1 or queue from Section 3.
+**Measured on the Step 1.5 production stack** (`loadtest/results/STEP1.5-CUDA_GRAPH_32-bottleneck-report.md`). This section attributes every millisecond of wall time to a specific slot from Section 0.1 or queue from Section 3. **c=12 is the lightly-loaded operating regime** (queue moderate, peak 164); **c=24 is the production sweet spot** (queue deeper, peak 383). Comparing the two reveals which stages scale gracefully and which become hard bottlenecks under load.
 
-```mermaid
-pie showData
-    title Per-request wall time at c=8 (16.5 s mean)
-    "Recognition / SGLang (TTFT+decode)" : 73
-    "Layout stage (serial, ORT+OV)" : 20
-    "Other (preprocess, dispatch, serialize)" : 7
-```
+### 9.1 c=12 — light-load operating point (mean 26 s, p50 17 s)
 
 ```mermaid
 pie showData
-    title Per-region wall time inside SGLang (6.6 s)
-    "Queue wait in scheduler" : 83
-    "Prefill (compute + cache-skipped)" : 12
-    "Decode (actual token generation)" : 5
+    title Per-request wall time at c=12 (26 s mean)
+    "Recognition / SGLang (queue + prefill + decode)" : 86
+    "Layout stage (serial, ORT+OV)" : 13
+    "Other (preprocess, dispatch, serialize)" : 1
 ```
 
-Detailed breakdown for one 20-page burst at c=8 (n=20, seed=42):
+```mermaid
+pie showData
+    title Per-region wall time inside SGLang at c=12 (7.8 s)
+    "Queue wait in scheduler" : 48
+    "Prefill (compute + cache-skipped)" : 38
+    "Decode (30 ms/tok × ~27 tok)" : 10
+    "Network + crop + b64 + JSON" : 4
+```
+
+Detailed breakdown at c=12 (Prometheus histograms, run `omnidoc-20260426-115540`):
 
 ```
-16.5 s  per request (client-measured mean)
-├── 3.3 s   layout stage (serial)                      ~20 %
-│     ├── 0.05 s  PIL preprocess + build ORT feed
-│     ├── ~0.8 s  ORT + OV EP forward (amortized if batched)
-│     ├── ~0.05 s numpy NMS + postproc
-│     └── ~2.4 s  waiting for prior layout call to return (batch window)
+25,652 ms per request (client-measured mean — bench p50 16,638 ms, p99 146,040 ms)
+├── 3,378 ms   layout stage (serial)                     ~13 %
+│     ├──   50 ms  PIL preprocess + build ORT feed
+│     ├──  ~800 ms ORT + OV EP forward (amortized if batched)
+│     ├──   ~50 ms numpy NMS + postproc
+│     └── ~2,478 ms waiting for prior layout call (batch window)
 │
-├── 12.0 s  recognition stage wall (parallel 14 regions @ OCR_MAX_WORKERS=32)   ~73 %
-│     Per-region (mean over 14 × 8 concurrent = 112 in-flight regions):
-│     ├── ~6.3 s  TTFT (queue wait + prefill on SGLang)     ~90 % of region time
-│     │         Decomposes further into:
-│     │         - queue wait: ~5.5 s  (the binding factor)
-│     │         - prefill:    ~0.8 s  (varies with cache-hit %)
-│     └── ~0.3 s  decode (actual GPU token generation)      ~5 %
+├── 22,000 ms recognition stage wall (parallel 14 regions @ OCR_MAX_WORKERS=32)  ~86 %
+│     Per-region (mean over 14 × 12 concurrent = ~168 in-flight regions):
+│     ├──  3,736 ms  queue wait in SGLang scheduler              48 % of region time
+│     ├──  2,922 ms  SGLang prefill (TTFT − queue)               38 % (cache-hit-dependent)
+│     ├──    813 ms  SGLang decode (30 ms/tok × ~27 tok)         10 % — CUDA graph fast path
+│     └──    287 ms  aiohttp/Python glue                          4 %
 │
-└── ~1.2 s  other (preprocess, dispatch, serialization)                       ~7 %
+└── ~270 ms    other (preprocess, dispatch, serialization)       ~1 %
 ```
+
+Underlying Prometheus histograms (per-region, ms):
+
+| Phase | mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| OCR region call (CPU→SGL→back) | 7,758 | 6,503 | 26,199 | 30,585 |
+| SGLang E2E | 7,471 | 5,960 | 19,323 | 39,776 |
+| Queue wait | 3,736 | 3,372 | 9,559 | 12,841 |
+| TTFT (prefill+1st token) | 6,658 | 5,682 | 18,240 | 30,434 |
+| Inter-token latency | **30** | 25 | 73 | **96** |
+
+SGLang state at c=12 (Prometheus, step=1 s): running peak **56**, mean **31.8**, queue peak **164**, queue mean **42**.
 
 Three load-bearing invariants:
 
-1. **Layout is the CPU bottleneck**, but at ~20% of wall time it is not the binding system-wide bottleneck — SGLang queue wait is.
-2. **Actual GPU compute accounts for ~5%** of wall time. The GPU is idle or queue-blocked for the remainder.
-3. **Prefix caching is the largest latency lever.** Every percentage point of cache hit translates directly to less prefill compute. The current 12–56% hit rate (load-dependent) has significant headroom.
+1. **SGLang queue wait is the dominant per-region cost** — 48 % at c=12. Less stark than at c=24 (82 %) because the queue is shallower, but still the largest single phase. Prefill is the next contributor at 38 %, sensitive to RadixCache hit rate.
+2. **Decode is fast and stable.** Step 1.5's `SGL_CUDA_GRAPH_MAX_BS=32` cap covers the running batch's hot band (peak 56, mean 32), so inter-token p99 stays at 96 ms. Without this cap, the same running batch would use eager kernels at ~250-1000 ms p99 inter-token.
+3. **Layout dropped from #2 bottleneck to a minor contributor** (13 %). The Paddle2ONNX + OpenVINO EP migration cut its mean wall time, and even at the lightly-loaded c=12 the recognition stage dwarfs layout.
 
-At c=16, queue depth roughly doubles and TTFT climbs to ~13 s, while decode remains at ~0.5 s.
+### 9.2 c=24 — production sweet spot (mean 53 s, p50 40 s)
+
+```mermaid
+pie showData
+    title Per-request wall time at c=24 (53 s mean)
+    "Recognition / SGLang (queue + prefill + decode)" : 84
+    "Layout stage (serial, ORT+OV)" : 14
+    "Other (preprocess, dispatch, serialize)" : 2
+```
+
+```mermaid
+pie showData
+    title Per-region wall time inside SGLang at c=24 (21 s)
+    "Queue wait in scheduler" : 82
+    "Prefill (compute + cache-skipped)" : 11
+    "Decode (33 ms/tok × ~30 tok)" : 5
+    "Network + crop + b64 + JSON" : 2
+```
+
+Detailed breakdown at c=24 (Prometheus histograms, run `omnidoc-20260426-115540`):
+
+```
+52,827 ms per request (client-measured mean — bench p50 39,769 ms, p99 234,671 ms)
+├── 7,530 ms   layout stage (serial)                     ~14 %
+│     ├──   50 ms  PIL preprocess + build ORT feed
+│     ├──  ~800 ms ORT + OV EP forward (amortized if batched)
+│     ├──   ~50 ms numpy NMS + postproc
+│     └── 6,630 ms waiting for prior layout call (queue at p95 = 20 s)
+│
+├── 44,000 ms recognition stage wall (parallel 14 regions @ OCR_MAX_WORKERS=32)  ~84 %
+│     Per-region (mean over 14 × 24 concurrent = ~336 in-flight regions):
+│     ├── 17,218 ms  queue wait in SGLang scheduler              82 % of region time
+│     ├──  2,413 ms  SGLang prefill (TTFT − queue)               11 % (cache-hit-dependent)
+│     ├──  1,019 ms  SGLang decode (33 ms/tok × ~30 tok)          5 % — CUDA graph fast path
+│     └──    296 ms  aiohttp/Python glue                          2 %
+│
+└── ~1,300 ms  other (preprocess, dispatch, serialization)       ~2 %
+```
+
+Underlying Prometheus histograms (per-region, ms):
+
+| Phase | mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| OCR region call (CPU→SGL→back) | 20,946 | 20,985 | 52,534 | 59,312 |
+| SGLang E2E | 20,650 | 18,633 | 38,884 | 64,473 |
+| Queue wait | 17,218 | 17,535 | 34,804 | 38,961 |
+| TTFT (prefill+1st token) | 19,631 | 18,128 | 37,844 | 39,797 |
+| Inter-token latency | **33** | 29 | 76 | **97** |
+
+SGLang state at c=24 (Prometheus, step=1 s): running peak **58**, mean **31.4**, queue peak **383**, queue mean **180**.
+
+### 9.3 What the c=12 → c=24 jump tells you
+
+The same Step 1.5 stack, two operating points:
+
+| Quantity | c=12 | c=24 | Δ |
+|---|---:|---:|---:|
+| Per-request mean wall | 25,652 ms | 52,827 ms | **+2.06×** (sublinear: 2× concurrency, 2× wall) |
+| Per-request p50 | 16,638 ms | 39,769 ms | +2.39× |
+| Per-region SGLang E2E | 7,471 ms | 20,650 ms | **+2.76×** |
+| Queue wait per region | 3,736 ms | 17,218 ms | **+4.61×** ← the dominant scaling factor |
+| Prefill compute per region | 2,922 ms | 2,413 ms | **−17 %** (better cache reuse at deeper queue) |
+| Decode per region | 813 ms | 1,019 ms | +25 % (more concurrent decode work) |
+| Inter-token p99 | 96 ms | 97 ms | flat ← Step 1.5 CUDA graph cap holds |
+| Layout forward mean | 3,378 ms | 7,530 ms | +2.23× (CPU layout queue grows too) |
+| Running batch peak | 56 | 58 | flat — SGLang already at admit ceiling |
+| Queue peak | 164 | 383 | +2.34× — queue absorbs the additional concurrency |
+| Throughput (rps) | 0.452 | 0.417 | −8 % |
+
+**Three readings:**
+
+1. **Queue wait is the single phase that grows non-linearly with c.** It's 48 % of per-region time at c=12 and **82 %** at c=24. Every other phase grows ~linearly or actually shrinks (prefill benefits from cache reuse). If you cap CPU concurrency at c=24 you get most of the throughput at acceptable tail latency; pushing past that just deepens the queue without proportionate throughput gain.
+2. **Step 1.5's CUDA graph cap holds across both regimes.** Inter-token p99 stays at 96-97 ms despite running batch sustained at 56-58. Without `SGL_CUDA_GRAPH_MAX_BS=32`, decode would fall to eager kernels and inter-token p99 would be 250-1000 ms.
+3. **The running batch peak doesn't grow from c=12 to c=24.** SGLang is already at its KV-pool admit ceiling at c=12 — additional client concurrency just queues. This is the signature of a saturated system; the gain from this point on must come from making each region cheaper (smaller image tokens, higher cache hit, smaller `max_tokens`), not from admitting more.
+
+At c=64 the HealthWatchdog cascades — SGLang's `/health` endpoint stalls under deep prefill backlog. **c=40 is the practical ceiling on this 8 GB hardware.**
+
+### 9.4 Step 1.5 vs vanilla GLM-OCR — what the §6-§12 work actually buys
+
+The `vanilla-glmocr` branch strips every customization in §6-§12 plus several SGLang env flags, leaving only operational floors (`mem_fraction_static=0.87`, `context_length=24576`) and the model card's recommended speculative decoding. It runs glmocr's torch-eager layout, image-first content order, glmocr's default `max_tokens=8192`, and SGLang's built-in scheduler defaults (`max_running_requests=48`, `chunked_prefill_size=2048`, `cuda_graph_max_bs=8`, schedule policy `fcfs`).
+
+Both runs use identical hardware, OmniDocBench seed=42 pool, `MATRIX_TOTAL=100`, and `MATRIX_WARMUP=8`. Reports: `loadtest/results/STEP1.5-vs-VANILLA-comparison.md`.
+
+| c | vanilla ok | vanilla rps | vanilla mean | vanilla p50 | **Step 1.5 ok** | **Step 1.5 rps** | **Step 1.5 mean** | **Step 1.5 p50** | Δ rps |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 100 | 0.284 | 39,121 | 28,631 | **100** | **0.452** | **25,652** | **16,638** | **+59 %** |
+| 24 | 100 | 0.280 | 80,347 | 68,819 | **100** | **0.417** | **52,827** | **39,769** | **+49 %** |
+| 32 | 83 | 0.213 | 109,849 | 100,869 | **98** | **0.414** | **66,562** | **47,032** | **+94 %** |
+| 40 | 100 | 0.309 | 107,357 | 104,594 | **100** | **0.358** | 98,991 | **87,063** | **+16 %** |
+| 64 | 95 | 0.265 | 170,128 | 171,944 | 29 | 0.183 | (collapsed) | — | vanilla wins this level only |
+
+```mermaid
+pie showData
+    title Step 1.5 vs vanilla — c=24 mean latency comparison (ms)
+    "Step 1.5 (52,827 ms)" : 52827
+    "Vanilla (80,347 ms)" : 80347
+```
+
+**Where the gain comes from** (running batch comparison at c=24):
+
+| Trial | vanilla running peak | vanilla mean | **Step 1.5 running peak** | **Step 1.5 mean** |
+|---|---:|---:|---:|---:|
+| c=12 | 28 | 12.5 | **56** | **31.8** |
+| c=24 | 27 | 15.9 | **58** | **31.4** |
+| c=32 | 25 | 14.2 | **55** | **30.8** |
+| c=40 | 28 | 17.7 | **59** | **36.1** |
+
+Step 1.5 sustains roughly 2× the in-GPU running batch across the whole sweep. That extra concurrent decode work is the source of the throughput advantage. Vanilla's running batch is admission-capped at ~28 because SGLang's default `max_running_requests=48` minus speculative-decoding draft slots leaves only that many effective slots for user requests, AND glmocr's default `max_tokens=8192` reservation crowds out additional admissions on the 28,619-token KV pool.
+
+**Single biggest individual lever** — repeat measurement showed `SGL_CHUNKED_PREFILL_SIZE=8192` alone (vs SGLang's default 2048) accounts for roughly half of Step 1.5's gain at c=12 (vanilla 60 s → +chunked-prefill 38 s → +full §6-§12 26 s). The other half comes from the compounded effect of `OCR_MAX_TOKENS=2048` (admission ceiling), `SGL_CUDA_GRAPH_MAX_BS=32` (decode fast path), `LAYOUT_VARIANT=paddle2onnx + OpenVINO EP` (faster layout), `LAYOUT_PREFIX_PIN=true` (RadixCache reuse), `LAYOUT_BATCH_ENABLED=true` (cross-request layout coalescer), and `PAGE_LOADER_MAX_PIXELS=262144` (smaller image tokens).
+
+**c=64 caveat.** Vanilla survives c=64 (95/100 ok, 0.265 rps) where Step 1.5 cascades (29/100 ok). This is **stability via slowness**, not robustness — vanilla's running cap of ~28 means it never reaches the saturation point that triggers Step 1.5's HealthWatchdog cascade. If your production traffic includes uncapped c=48-64 bursts you cannot admission-control upstream, vanilla is the safer choice. For the typical c=12-40 operating range, Step 1.5 is strictly better.
 
 ---
 
 ## 10. Threading model — quick recap
 
-**CPU container at c=8:**
+**CPU container at c=24:**
 
 ```
 4 gunicorn workers × 16 gthreads = 64 max concurrent request-handling threads
@@ -671,8 +802,8 @@ At c=16, queue depth roughly doubles and TTFT climbs to ~13 s, while decode rema
   → the recognition thread uses a ThreadPoolExecutor(OCR_MAX_WORKERS=32)
   → each of those 32 pool threads holds an aiohttp Session connection (from pool of 2048)
 
-At c=8: ~8 gthreads busy, ~24 daemon threads per pipeline active,
-        ~112 aiohttp requests in-flight to SGLang, ~300 Python threads total.
+At c=24: ~24 gthreads busy, ~72 daemon threads per pipeline active,
+        ~336 aiohttp requests in-flight to SGLang, ~600 Python threads total.
 
 Inside each layout call: the OV CPU plugin spawns its own MKLDNN thread pool,
 effectively shared across concurrent sessions (the unpinned default).
@@ -709,8 +840,8 @@ flowchart TD
   → scheduler thread runs the running-batch loop
   → GPU compute is single-process, single-device
 
-Running batch cap 64, actual peak 11-16 (CPU-layout-limited arrival rate).
-KV cache ~24,298 tokens total at SGL_MEM_FRACTION_STATIC=0.83.
+Running batch cap 64, actual peak 55-63 (admission-bound on KV pool).
+KV cache ~28,619 tokens total at SGL_MEM_FRACTION_STATIC=0.87.
 ```
 
 ```mermaid
@@ -720,12 +851,12 @@ flowchart TD
     uvi --> tok["tokenizer thread<br/>(sync, ~0.1 ms)"]
     tok --> rc["RadixCache lookup<br/>prefix tree"]
     rc --> sch["scheduler thread<br/>(lpm policy)"]
-    sch --> rb["running batch<br/>cap=64, peak=11-16"]
-    sch --> wq["waiting queue<br/>unbounded, ~96 at c=8"]
+    sch --> rb["running batch<br/>cap=64, peak=55-63"]
+    sch --> wq["waiting queue<br/>unbounded, ~180-390 at c=24"]
     rb --> gpu["GPU worker<br/>(single-device)"]
     gpu --> pf["prefill: chunked 8192 tok"]
-    gpu --> dec["decode loop<br/>CUDA graphs bs≤8<br/>+ speculative (4 drafts × 3 steps)"]
-    dec --> kv["KV cache<br/>~24,298 tokens<br/>(at mem_fraction=0.83)"]
+    gpu --> dec["decode loop<br/>CUDA graphs bs≤32<br/>+ speculative (4 drafts × 3 steps)"]
+    dec --> kv["KV cache<br/>~28,619 tokens<br/>(at mem_fraction=0.87)"]
     pf --> kv
 
     classDef cap fill:#fef3c7,stroke:#b45309
@@ -738,17 +869,17 @@ The system is **stateful per worker** (aiohttp pools, ORT sessions, `ld.process`
 
 ### 10.1 How a slot count propagates through the stack
 
-A single `/glmocr/parse` request at c=8 occupies concurrency as follows:
+A single `/glmocr/parse` request at c=24 occupies concurrency as follows:
 
 ```mermaid
 flowchart LR
     A["1 TCP connection"]
     A --> B["1 of 64 gthreads"]
     B --> C["3 daemon threads<br/>(loader, layout, recognition)"]
-    C --> D["1 of 3 ORT intra-op threads<br/>(shared with other sessions)"]
+    C --> D["1 of 1 ORT intra-op thread<br/>(shared with other sessions)"]
     C --> E["up to 32 ThreadPool slots<br/>for region fan-out"]
     E --> F["~14 of 2048 aiohttp conns<br/>(one per region)"]
-    F --> G["~14 of 64 SGLang running batch<br/>(may wait in queue)"]
+    F --> G["~14 of 55-63 SGLang running batch<br/>(typically waits ~17 s in queue)"]
 
     classDef one fill:#dcfce7,stroke:#166534
     classDef many fill:#fef3c7,stroke:#b45309
@@ -756,7 +887,7 @@ flowchart LR
     class C,D,E,F,G many
 ```
 
-At c=8 the CPU container is nowhere near its hard caps (8/64 gthreads, 112/2048 aiohttp connections). The downstream SGLang running-batch cap of 64 is hit at c ≈ 5 pages-in-flight, since each page fans out to ~14 regions. **SGLang's scheduler is the binding constraint, not any CPU-side slot count.** Effective optimizations therefore either reduce SGLang queue depth (prefix-pin, memory-fraction tuning) or make layout faster so that regions arrive at SGLang in smaller bursts, allowing the queue more time to drain between bursts.
+At c=24 the CPU container is at ~37 % of its hard caps (24/64 gthreads, 336/2048 aiohttp connections). The downstream SGLang running-batch saturates around running 55-63 (admission-bound on KV pool, not on the configured cap of 64). **The binding bottleneck is SGLang's KV-pool admission accounting: each pending region reserves `prompt_tokens + max_tokens` worth of slots, so lowering `OCR_MAX_TOKENS` from glmocr's default 8192 to 2048 quadrupled the sustainable running batch.** Once admission is no longer the gate, queue wait dominates per-region time at c≥24 — and the next-tier optimizations either reduce per-region SGLang residency (prefix-pin → cache hit, smaller image tokens → faster prefill) or accept the queue depth (cap CPU concurrency at c=40).
 
 ---
 

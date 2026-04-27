@@ -596,6 +596,18 @@ def instrument_pipeline(pipeline) -> None:
                 "formula": os.environ.get("PROMPT_FORMULA", "Write the formula in the image as LaTeX."),
             }
 
+            # OCR_MAX_TOKENS caps the per-region completion ceiling sent on
+            # /v1/chat/completions. glmocr's default (self.max_tokens) is
+            # 8192 — far above the realistic per-region output (50–500 tok
+            # text, up to ~2000 tok tables). SGLang's admission accounting
+            # reserves prompt+max_tokens of KV per slot, so an oversized
+            # max_tokens directly squeezes the running-batch ceiling. Cap
+            # only when the env var is set; unset = preserve glmocr default.
+            try:
+                _ocr_max_tokens_cap = int(os.environ.get("OCR_MAX_TOKENS", "0"))
+            except ValueError:
+                _ocr_max_tokens_cap = 0
+
             _orig_build = _PL.build_request_from_image
 
             def _patched_build(self, image, task_type="text"):
@@ -621,9 +633,14 @@ def instrument_pipeline(pipeline) -> None:
                     {"type": "image_url",
                      "image_url": {"url": f"data:image/{self.image_format.lower()};base64,{encoded}"}},
                 ]
+                effective_max_tokens = (
+                    min(self.max_tokens, _ocr_max_tokens_cap)
+                    if _ocr_max_tokens_cap > 0
+                    else self.max_tokens
+                )
                 return {
                     "messages": [{"role": "user", "content": content}],
-                    "max_tokens": self.max_tokens,
+                    "max_tokens": effective_max_tokens,
                     "temperature": self.temperature,
                     "top_p": self.top_p,
                     "top_k": self.top_k,
@@ -632,10 +649,16 @@ def instrument_pipeline(pipeline) -> None:
 
             if _PL.build_request_from_image is not _patched_build:
                 _PL.build_request_from_image = _patched_build
+                _cap_msg = (
+                    f"; max_tokens cap = {_ocr_max_tokens_cap}"
+                    if _ocr_max_tokens_cap > 0
+                    else "; max_tokens cap = (none, glmocr default)"
+                )
                 print(
                     "[prefix] patched PageLoader.build_request_from_image: "
                     "text content first, image second; default prompts "
-                    f"{list(_DEFAULT_TASK_PROMPTS.keys())} "
+                    f"{list(_DEFAULT_TASK_PROMPTS.keys())}"
+                    f"{_cap_msg} "
                     "(set LAYOUT_PREFIX_PIN=false to disable)",
                     flush=True,
                 )

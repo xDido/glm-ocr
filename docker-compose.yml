@@ -94,6 +94,11 @@ services:
       OCR_RETRY_BACKOFF_BASE: ${OCR_RETRY_BACKOFF_BASE}
       OCR_RETRY_BACKOFF_MAX: ${OCR_RETRY_BACKOFF_MAX}
       OCR_CONN_POOL: ${OCR_CONN_POOL}
+      # Per-region completion-token cap; honored by the prefix-pin patch
+      # in runtime_app.py. 0/unset preserves glmocr's 8192 default. Lower
+      # values shrink SGLang's per-slot KV reservation → higher running
+      # batch admit ceiling under tight KV budgets.
+      OCR_MAX_TOKENS: ${OCR_MAX_TOKENS:-0}
       OCR_MODEL_NAME: ${OCR_MODEL_NAME}
       LAYOUT_ENABLED: ${LAYOUT_ENABLED}
       LAYOUT_DEVICE: ${LAYOUT_DEVICE}
@@ -178,8 +183,14 @@ services:
         # in this container; re-add a reservation only if LAYOUT_DEVICE
         # moves back to cuda on a 16 GB+ target.
         limits:
-          cpus: "12"
-          memory: 24G
+          cpus: "10"
+          # 2026-04-27: bumped 24G → 40G to fit 21-worker (gunicorn 2N+1)
+          # experiment. Per-worker steady-state resident is ~1.0–1.2 GB
+          # (Python + torch + transformers + ORT session + aiohttp pool +
+          # JIT-warmed code cache); 21 × 1.1 GB ≈ 23 GB plus baseline +
+          # transient burst hits ~30 GB. 32 GB still OOM-killed 2 workers
+          # under load.
+          memory: 40G
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5002/health || curl -fsS -o /dev/null http://localhost:5002/ || exit 1"]
       interval: 10s
